@@ -1,0 +1,26 @@
+gateway:
+  owner:
+    telegram_chat_id: 1864053991
+  storage:
+    dir: "./data"
+  memory:
+    max_turns: 8
+    max_chars: 12000
+    store: "in_memory"
+  rate_limit:
+    per_user_per_min: 10
+    global_per_min: 30
+  providers:
+    default: "deepseek"
+    deepseek:
+      base_url: "https://api.deepseek.com"
+      model: "deepseek-chat"
+      max_tokens: 800
+      temperature: 0.2
+
+channels:
+  telegram:
+    enabled: true
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    allowlist_mode: "auth"     # owner_only | auth
+    poll_interval_ms: 1500
