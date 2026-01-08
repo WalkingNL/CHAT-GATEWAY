@@ -75,6 +75,9 @@ async function main() {
           chatId: m.chatId,
           userId: m.userId,
           text: m.text,
+          replyText: m.replyText,
+          isGroup: m.isGroup,
+          mentionsBot: m.mentionsBot,
           send: tg.sendMessage.bind(tg),
         });
       } catch (e: any) {

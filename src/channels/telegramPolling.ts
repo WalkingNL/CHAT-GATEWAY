@@ -5,7 +5,14 @@ export interface TelegramCfg {
   poll_interval_ms: number;
 }
 
-export type TelegramMsg = { chatId: string; text: string; userId: string };
+export type TelegramMsg = {
+  chatId: string;
+  text: string;
+  userId: string;
+  replyText: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+};
 
 export class TelegramPolling {
   private offset = 0;
@@ -46,6 +53,11 @@ export class TelegramPolling {
     const json = this.curlJson(url, "GET");
     if (!json?.ok) return [];
 
+    const botUsername = String(process.env.TELEGRAM_BOT_USERNAME || "SoliaNLBot");
+    const mentionToken = botUsername
+      ? (botUsername.startsWith("@") ? botUsername : `@${botUsername}`)
+      : "";
+
     const out: TelegramMsg[] = [];
     for (const u of json.result ?? []) {
       this.offset = Math.max(this.offset, u.update_id + 1);
@@ -54,7 +66,11 @@ export class TelegramPolling {
 
       const chatId = String(m.chat?.id ?? "");
       const userId = String(m.from?.id ?? chatId);
-      out.push({ chatId, userId, text: String(m.text) });
+      const text = String(m.text || "");
+      const replyText = String(m.reply_to_message?.text || "");
+      const isGroup = m.chat?.type !== "private";
+      const mentionsBot = mentionToken ? text.includes(mentionToken) : false;
+      out.push({ chatId, userId, text, replyText, isGroup, mentionsBot });
     }
     return out;
   }

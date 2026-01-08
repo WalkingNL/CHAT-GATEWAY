@@ -1,6 +1,6 @@
 import http from "node:http";
 
-import type { LLMProvider } from "./providers/base.js";
+import type { LLMProvider, ChatMessage } from "./providers/base.js";
 import { TaskStore } from "./task_store.js";
 
 export type InternalApiOpts = {
@@ -159,7 +159,7 @@ export function startInternalApi(opts: InternalApiOpts) {
                 `${JSON.stringify({ ...context, file_snippets: undefined }).slice(0, 6000)}\n\n` +
 
                 `ISSUE:\n${prompt}`;
-            const messages =
+            const messages: ChatMessage[] =
                 stage === "suggest"
                     ? [
                         { role: "system", content: systemSuggest },

@@ -6,6 +6,8 @@ import { loadAuth, saveAuth } from "../auth/store.js";
 import type { LLMProvider, ChatMessage } from "../providers/base.js";
 import { submitTask } from "../internal_client.js";
 
+const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -129,14 +131,91 @@ export async function handleMessage(opts: {
   chatId: string;
   userId: string;
   text: string;
+  replyText?: string;
+  isGroup?: boolean;
+  mentionsBot?: boolean;
   send: (chatId: string, text: string) => Promise<void>;
 }) {
-  const { storageDir, ownerChatId, allowlistMode, chatId, userId, text, send, provider, limiter } = opts;
+  const {
+    storageDir,
+    ownerChatId,
+    allowlistMode,
+    chatId,
+    userId,
+    text,
+    replyText = "",
+    isGroup = false,
+    mentionsBot = false,
+    send,
+    provider,
+    limiter,
+  } = opts;
+  void mentionsBot;
 
   const authState = loadAuth(storageDir, ownerChatId);
   const isOwner = chatId === ownerChatId;
   const allowed = allowlistMode === "owner_only" ? isOwner : authState.allowed.includes(chatId);
   if (!allowed) return;
+
+  const trimmedText = (text || "").trim();
+  const trimmedReplyText = (replyText || "").trim();
+
+  if (!isGroup) {
+    if (trimmedReplyText) {
+      lastAlertByChatId.set(chatId, { ts: Date.now(), rawText: trimmedReplyText });
+    }
+
+    if (trimmedText === "/help" || trimmedText === "help") {
+      await send(chatId, "用法：回复一条告警，然后发“解释一下/？”即可。");
+      return;
+    }
+
+    if (!trimmedText.startsWith("/")) {
+      const rawAlert = trimmedReplyText || lastAlertByChatId.get(chatId)?.rawText || "";
+      if (!rawAlert) {
+        await send(chatId, "请先回复一条告警消息，然后发一句话（如：解释一下）。");
+        return;
+      }
+
+      const ctx = {
+        alert_raw: rawAlert,
+        symbol_context: { same_symbol_recent: "unknown" },
+        market_context: { other_symbols_active: "unknown" },
+      };
+
+      const taskId = `tg_explain_${chatId}_${Date.now()}`;
+
+      await send(chatId, "🧠 我看一下…");
+
+      const prompt =
+        "解释这条告警（facts-only）：\n" +
+        "1) 发生了什么（用人话）\n" +
+        "2) 关键结构特征（如量价背离/稳定币）\n" +
+        "3) 可能原因（推断要写依据+置信度）\n" +
+        "4) 下一步建议看什么（facts-only，不给交易建议）\n" +
+        "禁止：价格预测、买卖建议、无依据故事。\n";
+
+      try {
+        const res = await submitTask({
+          task_id: taskId,
+          stage: "analyze",
+          prompt,
+          context: ctx,
+        });
+
+        if (!res?.ok) {
+          await send(chatId, `解释失败：${res?.error || "unknown"}`);
+          return;
+        }
+
+        await send(chatId, res.summary);
+      } catch (e: any) {
+        await send(chatId, `解释异常：${String(e?.message || e)}`);
+      }
+
+      return;
+    }
+  }
 
   const cmd = parseCommand(text);
 
@@ -289,117 +368,6 @@ export async function handleMessage(opts: {
     saveAuth(storageDir, authState);
     await send(chatId, `deleted ${cmd.id}`);
     appendLedger(storageDir, { ...baseAudit, cmd: "auth_del", target: cmd.id });
-    return;
-  }
-
-  // Rate limit only for LLM commands
-  if (cmd.kind === "ask" || cmd.kind === "analyze" || cmd.kind === "suggest") {
-    if (!limiter.allow(chatId)) {
-      await send(chatId, "rate limited (facts-only)");
-      appendLedger(storageDir, { ...baseAudit, cmd: cmd.kind, rate_limited: true });
-      return;
-    }
-  }
-
-  // ---- /ask: freeform answer ----
-  if (cmd.kind === "ask") {
-    if (!cmd.q) {
-      await send(chatId, "usage: /ask <question>");
-      return;
-    }
-
-    const messages: ChatMessage[] = [
-      { role: "system", content: "You are a rigorous engineering assistant. Facts-only. No predictions. No risky actions." },
-      { role: "user", content: cmd.q },
-    ];
-
-    const t0 = Date.now();
-    let out = "";
-    try {
-      out = await provider.generate({ messages });
-    } catch (e: any) {
-      out = `LLM unavailable: ${String(e?.message || e)}`;
-    }
-    const latency = Date.now() - t0;
-
-    await send(chatId, clip(out, 3500));
-    appendLedger(storageDir, { ...baseAudit, cmd: "ask", latency_ms: latency, out_tail: out.slice(-800) });
-    return;
-  }
-
-  // ---- /analyze: structured facts-only analysis ----
-  if (cmd.kind === "analyze") {
-    if (!cmd.q) {
-      await send(chatId, "usage: /analyze <incident description>");
-      return;
-    }
-
-    const t0 = Date.now();
-    let out = "";
-    try {
-      out = await provider.generate({ messages: buildAnalyzeMessages(cmd.q) });
-    } catch (e: any) {
-      out = `LLM unavailable: ${String(e?.message || e)}`;
-    }
-    const latency = Date.now() - t0;
-
-    const reply = formatAnalyzeReply(out);
-    await send(chatId, reply);
-    appendLedger(storageDir, { ...baseAudit, cmd: "analyze", latency_ms: latency, out_tail: out.slice(-1200) });
-    return;
-  }
-
-  // ---- /suggest: JSON suggestion -> TG summary ----
-  if (cmd.kind === "suggest") {
-    if (!cmd.q) {
-      await send(chatId, "usage: /suggest <incident description>");
-      return;
-    }
-
-    const t0 = Date.now();
-    let raw = "";
-    try {
-      raw = await provider.generate({ messages: buildSuggestMessages(cmd.q) });
-    } catch (e: any) {
-      const msg = `LLM unavailable: ${String(e?.message || e)}`;
-      await send(chatId, msg);
-      appendLedger(storageDir, { ...baseAudit, cmd: "suggest", latency_ms: Date.now() - t0, ok: false, error: msg });
-      return;
-    }
-
-    const latency = Date.now() - t0;
-    const obj = safeJsonParse<SuggestObj>(raw);
-
-    if (!obj) {
-      // Still reply, but indicate failure; keep raw_tail for audit
-      const reply = [
-        "🛠 DeepSeek Suggestion",
-        "",
-        "Result: INVALID (LLM did not return JSON).",
-        "raw_tail:",
-        "```",
-        clip(raw, 1200),
-        "```",
-      ].join("\n");
-
-      await send(chatId, reply);
-      appendLedger(storageDir, { ...baseAudit, cmd: "suggest", latency_ms: latency, ok: false, error: "non_json", raw_tail: raw.slice(-1200) });
-      return;
-    }
-
-    const reply = formatSuggestReply(obj);
-    await send(chatId, clip(reply, 3500));
-
-    appendLedger(storageDir, {
-      ...baseAudit,
-      cmd: "suggest",
-      latency_ms: latency,
-      ok: true,
-      files_touched: obj.files_touched || [],
-      verify_cmds: obj.verify_cmds || [],
-      warnings: obj.warnings || [],
-      patch_tail: String(obj.suggested_patch || "").slice(-800),
-    });
     return;
   }
 
