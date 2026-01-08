@@ -150,15 +150,73 @@ export async function handleMessage(opts: {
     provider,
     limiter,
   } = opts;
-  void mentionsBot;
 
   const authState = loadAuth(storageDir, ownerChatId);
-  const isOwner = chatId === ownerChatId;
-  const allowed = allowlistMode === "owner_only" ? isOwner : authState.allowed.includes(chatId);
-  if (!allowed) return;
+  const ownerUserId = String(process.env.OWNER_TELEGRAM_USER_ID || "");
+  const isOwnerChat = chatId === ownerChatId;
+  const isOwnerUser = ownerUserId ? userId === ownerUserId : false;
+  const isOwner = isOwnerChat || isOwnerUser;
+  const allowed =
+    allowlistMode === "owner_only"
+      ? (isGroup ? isOwnerUser : isOwnerChat)
+      : authState.allowed.includes(chatId) || isOwnerUser;
 
   const trimmedText = (text || "").trim();
   const trimmedReplyText = (replyText || "").trim();
+
+  if (isGroup) {
+    if (!mentionsBot) return;
+
+    if (!trimmedReplyText) {
+      await send(chatId, "请回复一条告警消息再 @我，我才能解释。");
+      return;
+    }
+
+    if (!allowed) {
+      await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      return;
+    }
+
+    const ctx = {
+      alert_raw: trimmedReplyText,
+      symbol_context: { same_symbol_recent: "unknown" },
+      market_context: { other_symbols_active: "unknown" },
+    };
+
+    const taskId = `tg_explain_${chatId}_${Date.now()}`;
+
+    await send(chatId, "🧠 我看一下…");
+
+    const prompt =
+      "解释这条告警（facts-only）：\n" +
+      "1) 发生了什么（用人话）\n" +
+      "2) 关键结构特征（如量价背离/稳定币）\n" +
+      "3) 可能原因（推断要写依据+置信度）\n" +
+      "4) 下一步建议看什么（facts-only，不给交易建议）\n" +
+      "禁止：价格预测、买卖建议、无依据故事。\n";
+
+    try {
+      const res = await submitTask({
+        task_id: taskId,
+        stage: "analyze",
+        prompt,
+        context: ctx,
+      });
+
+      if (!res?.ok) {
+        await send(chatId, `解释失败：${res?.error || "unknown"}`);
+        return;
+      }
+
+      await send(chatId, res.summary);
+    } catch (e: any) {
+      await send(chatId, `解释异常：${String(e?.message || e)}`);
+    }
+
+    return;
+  }
+
+  if (!allowed) return;
 
   if (!isGroup) {
     if (trimmedReplyText) {
