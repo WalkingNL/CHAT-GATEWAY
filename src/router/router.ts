@@ -14,7 +14,6 @@ import type { LoadedConfig } from "../config/types.js";
 import { parseAlertText, LocalFsFactsProvider } from "../facts/index.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
-const DEFAULT_PROJECT_ID = "crypto_agent";
 
 function nowIso() {
   return new Date().toISOString();
@@ -29,24 +28,63 @@ function escapeRegExp(s: string) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function buildExplainContext(rawAlert: string, config?: LoadedConfig) {
-  const parsed = parseAlertText(rawAlert);
-  const anchor = parsed.anchor_ms
-    ? new Date(parsed.anchor_ms).toISOString()
+function resolveProjectId(config?: LoadedConfig): string | null {
+  const envId = String(process.env.GW_DEFAULT_PROJECT_ID || "").trim();
+  if (envId) return envId;
+
+  const policyAny = config?.policy as any;
+  const policyId = typeof policyAny?.default_project_id === "string"
+    ? policyAny.default_project_id.trim()
+    : "";
+  if (policyId) return policyId;
+
+  const projects = config?.projects || {};
+  for (const [id, proj] of Object.entries(projects)) {
+    if (proj && proj.enabled !== false) return id;
+  }
+  const ids = Object.keys(projects);
+  return ids.length ? ids[0] : null;
+}
+
+async function collectFacts(params: {
+  config?: LoadedConfig;
+  project_id: string | null;
+  symbol?: string | null;
+  anchor_ms?: number | null;
+}) {
+  const { config, project_id, symbol, anchor_ms } = params;
+  if (!project_id) return { degraded: true, reason: "project_missing" };
+
+  const anchor = anchor_ms
+    ? new Date(anchor_ms).toISOString()
     : new Date().toISOString();
   const projects = config?.projects || {};
   const factsProvider = new LocalFsFactsProvider(projects);
-  const facts = factsProvider.buildExplainFacts({
-    project_id: DEFAULT_PROJECT_ID,
+  return factsProvider.buildExplainFacts({
+    project_id,
     anchor_ts_utc: anchor,
-    symbol: parsed.symbol || undefined,
+    symbol: symbol || undefined,
     recent_n: 5,
   });
+}
+
+async function buildExplainContext(rawAlert: string, config?: LoadedConfig) {
+  const parsedRaw = parseAlertText(rawAlert);
+  const parsed = parsedRaw.ok ? parsedRaw : null;
+  const projectId = resolveProjectId(config);
+  const facts = parsed
+    ? await collectFacts({
+        config,
+        project_id: projectId,
+        symbol: parsed.symbol,
+        anchor_ms: parsed.anchor_ms,
+      })
+    : { degraded: true, reason: "parse_failed" };
 
   return {
-    project_id: DEFAULT_PROJECT_ID,
+    project_id: projectId,
     alert_raw: rawAlert,
-    alert_parsed: parsed,
+    parsed,
     facts,
   };
 }
@@ -422,7 +460,7 @@ export async function handleMessage(opts: {
         return;
       }
 
-      const ctx = buildExplainContext(trimmedReplyText, config);
+      const ctx = await buildExplainContext(trimmedReplyText, config);
 
       const taskId = `tg_explain_${chatId}_${Date.now()}`;
 
@@ -479,7 +517,7 @@ export async function handleMessage(opts: {
         return;
       }
 
-      const ctx = buildExplainContext(rawAlert, config);
+      const ctx = await buildExplainContext(rawAlert, config);
 
       const taskId = `tg_explain_${chatId}_${Date.now()}`;
 
