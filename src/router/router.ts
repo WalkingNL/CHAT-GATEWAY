@@ -177,6 +177,7 @@ export async function handleMessage(opts: {
     isGroup && mentionsBot && mentionPattern
       ? trimmedText.replace(mentionPattern, "").trim()
       : trimmedText;
+  const isCommand = cleanedText.startsWith("/");
 
   const trimmedReplyText = (replyText || "").trim();
 
@@ -192,10 +193,8 @@ export async function handleMessage(opts: {
   }
 
   if (isGroup) {
-    if (!mentionsBot) return;
-
-    // ---- Group command path: allow commands without reply (still owner/allowlist gated) ----
-    if (cleanedText.startsWith("/")) {
+    // ---- Group command path: allow commands without @bot (still owner/allowlist gated) ----
+    if (isCommand) {
       if (!allowed) {
         await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
         return;
@@ -203,6 +202,8 @@ export async function handleMessage(opts: {
       // fall through to command parsing/dispatch below
     } else {
       // ---- Group explain path: requires reply ----
+      if (!mentionsBot) return;
+
       if (!trimmedReplyText) {
         await send(chatId, "请回复一条告警消息再 @我，我才能解释。");
         return;
@@ -253,7 +254,7 @@ export async function handleMessage(opts: {
     }
   }
 
-  if (!allowed) return;
+  if (!allowed && !isGroup) return;
 
   if (!isGroup) {
     if (trimmedReplyText) {
@@ -265,7 +266,7 @@ export async function handleMessage(opts: {
       return;
     }
 
-    if (!trimmedText.startsWith("/")) {
+    if (!isCommand) {
       const rawAlert = trimmedReplyText || lastAlertByChatId.get(chatId)?.rawText || "";
       if (!rawAlert) {
         await send(chatId, "请先回复一条告警消息，然后发一句话（如：解释一下）。");
