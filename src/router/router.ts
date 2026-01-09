@@ -11,8 +11,10 @@ import type { LLMProvider, ChatMessage } from "../providers/base.js";
 import { submitTask } from "../internal_client.js";
 import { evaluate } from "../config/index.js";
 import type { LoadedConfig } from "../config/types.js";
+import { parseAlertText, LocalFsFactsProvider } from "../facts/index.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
+const DEFAULT_PROJECT_ID = "crypto_agent";
 
 function nowIso() {
   return new Date().toISOString();
@@ -25,6 +27,28 @@ function clip(s: string, n: number) {
 
 function escapeRegExp(s: string) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildExplainContext(rawAlert: string, config?: LoadedConfig) {
+  const parsed = parseAlertText(rawAlert);
+  const anchor = parsed.candle_open_time_ms
+    ? new Date(parsed.candle_open_time_ms).toISOString()
+    : new Date().toISOString();
+  const projects = config?.projects || {};
+  const factsProvider = new LocalFsFactsProvider(projects);
+  const facts = factsProvider.buildExplainFacts({
+    project_id: DEFAULT_PROJECT_ID,
+    anchor_ts_utc: anchor,
+    symbol: parsed.symbol,
+    recent_n: 5,
+  });
+
+  return {
+    project_id: DEFAULT_PROJECT_ID,
+    alert_raw: rawAlert,
+    alert_parsed: parsed,
+    facts,
+  };
 }
 
 function formatAnalyzeReply(out: string): string {
@@ -398,11 +422,7 @@ export async function handleMessage(opts: {
         return;
       }
 
-      const ctx = {
-        alert_raw: trimmedReplyText,
-        symbol_context: { same_symbol_recent: "unknown" },
-        market_context: { other_symbols_active: "unknown" },
-      };
+      const ctx = buildExplainContext(trimmedReplyText, config);
 
       const taskId = `tg_explain_${chatId}_${Date.now()}`;
 
@@ -414,7 +434,9 @@ export async function handleMessage(opts: {
         "2) 关键结构特征（如量价背离/稳定币）\n" +
         "3) 可能原因（推断要写依据+置信度）\n" +
         "4) 下一步建议看什么（facts-only，不给交易建议）\n" +
-        "禁止：价格预测、买卖建议、无依据故事。\n";
+        "禁止：价格预测、买卖建议、无依据故事。\n" +
+        "If facts.window_1h/24h/symbol_recent.ok is true, you MUST reference them. " +
+        "If false, explicitly say what is missing.\n";
 
       try {
         const res = await submitTask({
@@ -457,11 +479,7 @@ export async function handleMessage(opts: {
         return;
       }
 
-      const ctx = {
-        alert_raw: rawAlert,
-        symbol_context: { same_symbol_recent: "unknown" },
-        market_context: { other_symbols_active: "unknown" },
-      };
+      const ctx = buildExplainContext(rawAlert, config);
 
       const taskId = `tg_explain_${chatId}_${Date.now()}`;
 
@@ -473,7 +491,9 @@ export async function handleMessage(opts: {
         "2) 关键结构特征（如量价背离/稳定币）\n" +
         "3) 可能原因（推断要写依据+置信度）\n" +
         "4) 下一步建议看什么（facts-only，不给交易建议）\n" +
-        "禁止：价格预测、买卖建议、无依据故事。\n";
+        "禁止：价格预测、买卖建议、无依据故事。\n" +
+        "If facts.window_1h/24h/symbol_recent.ok is true, you MUST reference them. " +
+        "If false, explicitly say what is missing.\n";
 
       try {
         const res = await submitTask({
