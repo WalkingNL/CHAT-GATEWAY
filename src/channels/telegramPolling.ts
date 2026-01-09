@@ -70,8 +70,23 @@ export class TelegramPolling {
       const text = String(m.text || "");
       const replyText = String(m.reply_to_message?.text || "");
       const isGroup = m.chat?.type !== "private";
+      const entities = Array.isArray(m.entities) ? m.entities : [];
+      const mentionByEntity = mentionToken
+        ? entities.some((e: any) => {
+            if (e?.type === "mention") {
+              if (typeof e.offset !== "number" || typeof e.length !== "number") return false;
+              const slice = text.slice(e.offset, e.offset + e.length);
+              return slice.toLowerCase() === mentionTokenLower;
+            }
+            if (e?.type === "text_mention" && e?.user?.username) {
+              const u = String(e.user.username);
+              return (`@${u}`.toLowerCase() === mentionTokenLower);
+            }
+            return false;
+          })
+        : false;
       const mentionsBot = mentionToken
-        ? text.toLowerCase().includes(mentionTokenLower)
+        ? text.toLowerCase().includes(mentionTokenLower) || mentionByEntity
         : false;
       out.push({ chatId, userId, text, replyText, isGroup, mentionsBot });
     }
