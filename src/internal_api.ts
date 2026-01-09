@@ -146,7 +146,7 @@ export function startInternalApi(opts: InternalApiOpts) {
                 `   --- a/<path>\n` +
                 `   +++ b/<path>\n` +
                 `   @@ ...\n` +
-                `2) Use repo-relative paths ONLY. Never output "/srv/crypto_agent/...".\n` +
+                `2) Use repo-relative paths ONLY. Never output absolute "/srv/...".\n` +
                 `3) The patch MUST be minimal and safe.\n` +
                 `4) If FILE SNIPPETS are provided below for a file, your patch MUST apply to that exact content.\n` +
                 `   If the change is already present, set suggested_patch="" and add warning "already_applied".\n` +
@@ -239,20 +239,20 @@ export function startInternalApi(opts: InternalApiOpts) {
 
                 // ---- enforce repo-relative paths ----
                 const isAbs = (p: string) => p.startsWith("/") || p.includes(":/");
-                const hasSrv = (p: string) => p.includes("/srv/") || p.includes("crypto_agent/");
+                const hasSrv = (p: string) => p.includes("/srv/");
 
                 const badPaths = filesTouched.filter(p => isAbs(p) || hasSrv(p));
                 if (badPaths.length > 0) {
                     warn.push(`files_touched_not_repo_relative: ${badPaths.slice(0, 3).join(", ")}`);
-                    // best-effort strip prefix if it looks like /srv/crypto_agent/<rel>
-                    filesTouched = filesTouched.map(p => p.replace(/^\/srv\/crypto_agent\//, ""));
+                    // best-effort strip /srv/<project>/ prefix to repo-relative
+                    filesTouched = filesTouched.map(p => p.replace(/^\/srv\/[^/]+\//, ""));
                     filesTouched = filesTouched.filter(p => !isAbs(p));
                 }
 
-                const badCmds = verifyCmds.filter(c => c.includes("/srv/crypto_agent") || c.startsWith("cd /srv/crypto_agent"));
+                const badCmds = verifyCmds.filter(c => c.includes("/srv/") || c.startsWith("cd /srv/"));
                 if (badCmds.length > 0) {
                     warn.push("verify_cmds_contains_absolute_paths");
-                    verifyCmds = verifyCmds.map(c => c.replace(/^cd \/srv\/crypto_agent &&\s*/g, "").replace(/\/srv\/crypto_agent\//g, ""));
+                    verifyCmds = verifyCmds.map(c => c.replace(/^cd \/srv\/[^/]+ &&\s*/g, "").replace(/\/srv\/[^/]+\//g, ""));
                 }
 
                 // ---- patch format sanity ----
