@@ -17,6 +17,8 @@ import { writeExplainTrace, writeExplainFeedback } from "../audit/trace_writer.j
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
 const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
+const FEEDBACK_TOO_MANY = ["告警太多", "太多了", "一直在刷", "刷屏", "太吵", "好多告警"];
+const FEEDBACK_TOO_FEW = ["告警太少", "太安静", "没动静", "怎么没告警", "是不是坏了", "系统坏了"];
 
 function nowIso() {
   return new Date().toISOString();
@@ -353,7 +355,27 @@ export async function handleMessage(opts: {
     limiter,
   } = opts;
 
-  const trimmedText = (text || "").trim();
+  const textNorm = (text || "").trim();
+  const hitTooMany = FEEDBACK_TOO_MANY.some((k) => textNorm.includes(k));
+  const hitTooFew = FEEDBACK_TOO_FEW.some((k) => textNorm.includes(k));
+
+  if (hitTooMany || hitTooFew) {
+    await send(chatId, "已收到反馈，正在调整推送策略。");
+
+    appendLedger(storageDir, {
+      ts_utc: nowIso(),
+      channel: "telegram",
+      chat_id: chatId,
+      user_id: userId,
+      kind: "alert_feedback",
+      feedback: hitTooMany ? "too_many" : "too_few",
+      raw: textNorm,
+    });
+
+    return;
+  }
+
+  const trimmedText = textNorm;
   const authState = loadAuth(storageDir, ownerChatId);
   const ownerUserId = String(process.env.OWNER_TELEGRAM_USER_ID || "");
   const isOwnerChat = chatId === ownerChatId;
