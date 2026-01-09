@@ -164,6 +164,18 @@ export async function handleMessage(opts: {
   const trimmedText = (text || "").trim();
   const trimmedReplyText = (replyText || "").trim();
 
+  const trimmed = (text || "").trim();
+  // allow "/whoami" in both private and group (group may include mention)
+  const isWhoami =
+    trimmed === "/whoami" ||
+    trimmed.endsWith(" /whoami") ||
+    trimmed.includes("/whoami");
+
+  if (isWhoami) {
+    await send(chatId, `chatId=${chatId}\nuserId=${userId}\nisGroup=${isGroup}`);
+    return;
+  }
+
   if (isGroup) {
     if (!mentionsBot) return;
 
