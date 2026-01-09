@@ -46,6 +46,22 @@ function resolveProjectId(config?: LoadedConfig): string | null {
   return ids.length ? ids[0] : null;
 }
 
+function getProject(config?: LoadedConfig) {
+  const projectId = resolveProjectId(config);
+  if (!projectId) return null;
+  const proj = (config?.projects || {})[projectId];
+  if (!proj) return null;
+  return { projectId, proj };
+}
+
+function getPm2Names(config: LoadedConfig | undefined, resourceKey: "pm2_logs" | "pm2_ps"): string[] {
+  const p = getProject(config);
+  if (!p) return [];
+  const res: any = (p.proj as any)?.resources?.[resourceKey];
+  const names = Array.isArray(res?.names) ? res.names : [];
+  return names.map((n: any) => String(n)).filter(Boolean);
+}
+
 async function collectFacts(params: {
   config?: LoadedConfig;
   project_id: string | null;
@@ -297,9 +313,11 @@ export async function handleMessage(opts: {
     return `${m}m`;
   };
 
-  const renderPs = () => {
+  const renderPs = (allowedNames: string[]) => {
     const now = Date.now();
-    const rows = pm2Jlist().map((p) => {
+    const rows = pm2Jlist()
+      .filter((p) => !allowedNames.length || allowedNames.includes(p?.name))
+      .map((p) => {
       const name = p?.name || "unknown";
       const status = p?.pm2_env?.status || "unknown";
       const restarts = p?.pm2_env?.restart_time ?? 0;
@@ -321,7 +339,7 @@ export async function handleMessage(opts: {
     return lines.join("\n");
   };
 
-  const renderStatus = () => {
+  const renderStatus = (allowedNames: string[]) => {
     const nowUtc = new Date().toISOString();
     let sha = "unknown";
     try {
@@ -337,11 +355,15 @@ export async function handleMessage(opts: {
       return `${name}=${st}`;
     };
 
+    const names = allowedNames.length ? allowedNames : [];
+    const pm2Line = names.length
+      ? names.map((n) => pick(n)).join(" ")
+      : "(no pm2 names configured)";
     const bits = [
       `✅ status (facts-only)`,
       `- time_utc: ${nowUtc}`,
       `- repo_sha: ${sha}`,
-      `- pm2: ${[pick("crypto-agent"), pick("crypto-dashboard"), pick("chat-gateway")].join(" ")}`,
+      `- pm2: ${pm2Line}`,
     ];
     return bits.join("\n");
   };
@@ -388,31 +410,62 @@ export async function handleMessage(opts: {
     return chunks.join("\n");
   };
 
+  const pm2LogsNames = getPm2Names(config, "pm2_logs");
+  const pm2PsNames = getPm2Names(config, "pm2_ps");
+  const chatType = isGroup ? "group" : "private";
+  const policyOk = config?.meta?.policyOk === true;
+  const evalOps = (capability: string) => evaluate(config, {
+    channel: "telegram",
+    capability,
+    chat_id: chatId,
+    chat_type: chatType,
+    user_id: userId,
+    mention_bot: mentionsBot,
+    has_reply: Boolean(trimmedReplyText),
+  });
+
   if (cleanedText.startsWith("/status")) {
-    if (!allowed) {
-      await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+    const res = evalOps("ops.status");
+    if (res.require?.mention_bot_for_ops && !mentionsBot) return;
+    const isAllowed = policyOk ? res.allowed : allowed;
+    if (!isAllowed) {
+      await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
       return;
     }
-    await send(chatId, renderStatus());
+    await send(chatId, renderStatus(pm2PsNames));
     return;
   }
 
   if (cleanedText.startsWith("/ps")) {
-    if (!allowed) {
-      await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+    const res = evalOps("ops.ps");
+    if (res.require?.mention_bot_for_ops && !mentionsBot) return;
+    const isAllowed = policyOk ? res.allowed : allowed;
+    if (!isAllowed) {
+      await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
       return;
     }
-    await send(chatId, renderPs());
+    await send(chatId, renderPs(pm2PsNames));
     return;
   }
 
   if (cleanedText.startsWith("/logs")) {
-    if (!allowed) {
-      await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+    const res = evalOps("ops.logs");
+    if (res.require?.mention_bot_for_ops && !mentionsBot) return;
+    const isAllowed = policyOk ? res.allowed : allowed;
+    if (!isAllowed) {
+      await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
       return;
     }
     const parts = cleanedText.split(/\s+/).filter(Boolean);
-    const name = parts[1] || "crypto-agent";
+    if (!pm2LogsNames.length) {
+      await send(chatId, "⚠️ 未配置 pm2 日志进程名（manifest: pm2_logs.names）。");
+      return;
+    }
+    const name = parts[1] || pm2LogsNames[0];
+    if (!pm2LogsNames.includes(name)) {
+      await send(chatId, `⚠️ 不允许的进程名：${name}`);
+      return;
+    }
     const lines = parts[2] ? Number(parts[2]) : 80;
     const out = renderLogs(name, lines);
     if (out.length > MAX_LOG_CHARS) {
