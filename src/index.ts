@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { loadConfig } from "./config/loadConfig.js";
+import { loadAllConfig } from "./config/index.js";
 import { TelegramPolling } from "./channels/telegramPolling.js";
 import { DeepSeekProvider } from "./providers/deepseek.js";
 import { RateLimiter } from "./rateLimit/limiter.js";
@@ -11,6 +12,15 @@ process.on("unhandledRejection", (e: any) => console.error("[unhandledRejection]
 
 async function main() {
   const cfg = loadConfig("config.yaml");
+  const loaded = loadAllConfig();
+  console.log("[config]", {
+    policyOk: loaded.meta.policyOk,
+    projectsCount: loaded.meta.projectsCount,
+    project_ids: Object.keys(loaded.projects),
+  });
+  if (loaded.meta.errors.length) {
+    console.warn("[config][WARN]", loaded.meta.errors.join("; "));
+  }
 
   const storageDir = cfg.gateway?.storage?.dir ?? "./data";
   fs.mkdirSync(storageDir, { recursive: true });

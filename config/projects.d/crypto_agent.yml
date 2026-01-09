@@ -1,0 +1,64 @@
+version: 1
+project_id: crypto_agent
+display_name: "Crypto Agent"
+kind: "local_fs"          # local_fs | remote_http | ssh_readonly | s3_object (future)
+enabled: true
+
+# Project root (not in code; configure only here)
+root: "/srv/crypto_agent"
+
+# Project resource declarations: gateway only accesses by resource name
+resources:
+  # Alert facts (context for explanation)
+  alerts_sent_jsonl:
+    type: file_glob
+    base: "data/metrics"
+    glob: "alert_sent_*.jsonl"
+    format: jsonl
+    max_bytes: 400000       # hard cap per read
+    max_lines: 400          # tail window
+    freshness_days: 14
+
+  # Extreme events directory (optional)
+  extreme_events_dir:
+    type: dir_glob
+    base: "data/extreme_events"
+    glob: "*/*.json"
+    max_files: 300
+    freshness_days: 14
+
+  # Runtime logs (pm2)
+  pm2_logs:
+    type: pm2_logs
+    names:
+      - "crypto-agent"
+      - "crypto-dashboard"
+    max_lines: 200
+
+  # Process status
+  pm2_ps:
+    type: pm2_ps
+    names:
+      - "crypto-agent"
+      - "crypto-dashboard"
+      - "chat-gateway"
+
+# Permanent deny list (prevent secrets leakage)
+deny:
+  - "**/.env*"
+  - "**/*secrets*"
+  - "**/*.key"
+  - "**/*.pem"
+  - "**/id_rsa*"
+  - "**/authorized_keys"
+  - "**/config/**/credentials*"
+
+# Default read limits (fallback)
+limits:
+  max_total_bytes: 800000
+  max_total_lines: 800
+  max_total_files: 500
+
+notes:
+  owner: "WalkingNL"
+  purpose: "facts-only alert explanation + ops read-only"
