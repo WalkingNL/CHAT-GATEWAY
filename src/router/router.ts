@@ -205,7 +205,11 @@ export async function handleMessage(opts: {
   // /status, /ps, /logs <pm2_name> [lines]
   // -------------------------------
   const MAX_LINES_DEFAULT = Number(process.env.GW_MAX_LOG_LINES || 200);
-  const MAX_LOG_CHARS = Number(process.env.GW_MAX_LOG_CHARS || 8000);
+  const TELEGRAM_SAFE_MAX = 3500;
+  const MAX_LOG_CHARS = Math.min(
+    Number(process.env.GW_MAX_LOG_CHARS || TELEGRAM_SAFE_MAX),
+    TELEGRAM_SAFE_MAX,
+  );
   const clampLines = (n: number) => {
     if (!Number.isFinite(n) || n <= 0) return 80;
     return Math.min(Math.max(1, Math.floor(n)), MAX_LINES_DEFAULT);
@@ -349,8 +353,16 @@ export async function handleMessage(opts: {
     const name = parts[1] || "crypto-agent";
     const lines = parts[2] ? Number(parts[2]) : 80;
     const out = renderLogs(name, lines);
-    const clipped = out.length > MAX_LOG_CHARS ? out.slice(0, MAX_LOG_CHARS) + "\n...(clipped)" : out;
-    await send(chatId, clipped);
+    if (out.length > MAX_LOG_CHARS) {
+      const head = out.slice(0, Math.max(0, MAX_LOG_CHARS - 40));
+      const msg =
+        `⚠️ 输出过长，已截断到 ${MAX_LOG_CHARS} 字符（上限 ${TELEGRAM_SAFE_MAX}）。\n` +
+        head +
+        "\n...(clipped)";
+      await send(chatId, msg);
+      return;
+    }
+    await send(chatId, out);
     return;
   }
 
