@@ -12,8 +12,11 @@ import { submitTask } from "../internal_client.js";
 import { evaluate } from "../config/index.js";
 import type { LoadedConfig } from "../config/types.js";
 import { parseAlertText, LocalFsFactsProvider } from "../facts/index.js";
+import { routeExplain } from "../explain/router_v1.js";
+import { writeExplainTrace, writeExplainFeedback } from "../audit/trace_writer.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
+const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
 
 function nowIso() {
   return new Date().toISOString();
@@ -103,6 +106,114 @@ async function buildExplainContext(rawAlert: string, config?: LoadedConfig) {
     parsed,
     facts,
   };
+}
+
+function bucketFactor(v?: number | null): string | null {
+  if (typeof v !== "number") return null;
+  if (v < 2) return "<2";
+  if (v < 5) return "2-5";
+  if (v < 10) return "5-10";
+  return ">=10";
+}
+
+function bucketChangePct(v?: number | null): string | null {
+  if (typeof v !== "number") return null;
+  const a = Math.abs(v);
+  if (a < 0.5) return "<0.5";
+  if (a < 1) return "0.5-1";
+  if (a < 3) return "1-3";
+  if (a < 5) return "3-5";
+  return ">=5";
+}
+
+function summarizeFacts(facts: any) {
+  const top1h = facts?.window_1h?.top3 || [];
+  const top24h = facts?.window_24h?.top3 || [];
+  const recent = facts?.symbol_recent?.items;
+  return {
+    top3_1h: Array.isArray(top1h) ? top1h : [],
+    top3_24h: Array.isArray(top24h) ? top24h : [],
+    symbol_recent_count: Array.isArray(recent) ? recent.length : 0,
+  };
+}
+
+async function runExplain(params: {
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  rawAlert: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  config?: LoadedConfig;
+  channel: string;
+  taskIdPrefix: string;
+}) {
+  const { storageDir, chatId, userId, rawAlert, send, config, channel, taskIdPrefix } = params;
+  const t0 = Date.now();
+  const ctx = await buildExplainContext(rawAlert, config);
+  const input = { alert_raw: rawAlert, parsed: ctx.parsed, facts: ctx.facts, mode: channel };
+  const decision = routeExplain(input);
+  const taskId = `${taskIdPrefix}_${chatId}_${Date.now()}`;
+
+  let summary = "";
+  let ok = false;
+  let errCode = "";
+  let latencyMs = 0;
+
+  try {
+    const res = await submitTask({
+      task_id: taskId,
+      stage: "analyze",
+      prompt: decision.prompt,
+      context: { ...ctx, router: { selected_paths: decision.selected_paths } },
+    });
+
+    latencyMs = Number(res?.latency_ms || Date.now() - t0);
+
+    if (!res?.ok) {
+      errCode = res?.error || "unknown";
+      await send(chatId, `解释失败：${errCode}`);
+    } else {
+      ok = true;
+      summary = String(res.summary || "");
+      await send(chatId, summary);
+    }
+  } catch (e: any) {
+    latencyMs = Date.now() - t0;
+    errCode = String(e?.message || e);
+    await send(chatId, `解释异常：${errCode}`);
+  }
+
+  const parsed = ctx.parsed;
+  const trace = {
+    ts_utc: new Date().toISOString(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    project_id: ctx.project_id,
+    alert_features: {
+      symbol: parsed?.symbol ?? null,
+      priority: parsed?.priority ?? null,
+      factor_bucket: bucketFactor(parsed?.factor),
+      change_pct_bucket: bucketChangePct(parsed?.change_pct),
+    },
+    facts_summary: summarizeFacts(ctx.facts),
+    router: { selected_paths: decision.selected_paths },
+    llm: {
+      provider: "internal_api",
+      model: "unknown",
+      latency_ms: latencyMs,
+      ok,
+      err_code: ok ? undefined : errCode || "unknown",
+    },
+    output_meta: {
+      chars: summary.length,
+      truncated: false,
+    },
+    trace_id: taskId,
+  };
+
+  writeExplainTrace(storageDir, trace);
+  lastExplainByChatId.set(chatId, { ts: Date.now(), trace_id: taskId });
 }
 
 function formatAnalyzeReply(out: string): string {
@@ -275,6 +386,23 @@ export async function handleMessage(opts: {
 
   if (isWhoami) {
     await send(chatId, `chatId=${chatId}\nuserId=${userId}\nisGroup=${isGroup}`);
+    return;
+  }
+
+  if (trimmedText === "👍" || trimmedText === "👎") {
+    const last = lastExplainByChatId.get(chatId);
+    if (!last) {
+      await send(chatId, "没有可反馈的解释。");
+      return;
+    }
+    writeExplainFeedback(storageDir, {
+      ts_utc: new Date().toISOString(),
+      trace_id: last.trace_id,
+      chat_id: chatId,
+      user_id: userId,
+      feedback: trimmedText === "👍" ? "up" : "down",
+    });
+    await send(chatId, "已记录反馈。");
     return;
   }
 
@@ -513,40 +641,17 @@ export async function handleMessage(opts: {
         return;
       }
 
-      const ctx = await buildExplainContext(trimmedReplyText, config);
-
-      const taskId = `tg_explain_${chatId}_${Date.now()}`;
-
       await send(chatId, "🧠 我看一下…");
-
-      const prompt =
-        "解释这条告警（facts-only）：\n" +
-        "1) 发生了什么（用人话）\n" +
-        "2) 关键结构特征（如量价背离/稳定币）\n" +
-        "3) 可能原因（推断要写依据+置信度）\n" +
-        "4) 下一步建议看什么（facts-only，不给交易建议）\n" +
-        "禁止：价格预测、买卖建议、无依据故事。\n" +
-        "If facts.window_1h/24h/symbol_recent.ok is true, you MUST reference them. " +
-        "If false, explicitly say what is missing.\n";
-
-      try {
-        const res = await submitTask({
-          task_id: taskId,
-          stage: "analyze",
-          prompt,
-          context: ctx,
-        });
-
-        if (!res?.ok) {
-          await send(chatId, `解释失败：${res?.error || "unknown"}`);
-          return;
-        }
-
-        await send(chatId, res.summary);
-      } catch (e: any) {
-        await send(chatId, `解释异常：${String(e?.message || e)}`);
-      }
-
+      await runExplain({
+        storageDir,
+        chatId,
+        userId,
+        rawAlert: trimmedReplyText,
+        send,
+        config,
+        channel: "telegram",
+        taskIdPrefix: "tg_explain",
+      });
       return;
     }
   }
@@ -570,40 +675,17 @@ export async function handleMessage(opts: {
         return;
       }
 
-      const ctx = await buildExplainContext(rawAlert, config);
-
-      const taskId = `tg_explain_${chatId}_${Date.now()}`;
-
       await send(chatId, "🧠 我看一下…");
-
-      const prompt =
-        "解释这条告警（facts-only）：\n" +
-        "1) 发生了什么（用人话）\n" +
-        "2) 关键结构特征（如量价背离/稳定币）\n" +
-        "3) 可能原因（推断要写依据+置信度）\n" +
-        "4) 下一步建议看什么（facts-only，不给交易建议）\n" +
-        "禁止：价格预测、买卖建议、无依据故事。\n" +
-        "If facts.window_1h/24h/symbol_recent.ok is true, you MUST reference them. " +
-        "If false, explicitly say what is missing.\n";
-
-      try {
-        const res = await submitTask({
-          task_id: taskId,
-          stage: "analyze",
-          prompt,
-          context: ctx,
-        });
-
-        if (!res?.ok) {
-          await send(chatId, `解释失败：${res?.error || "unknown"}`);
-          return;
-        }
-
-        await send(chatId, res.summary);
-      } catch (e: any) {
-        await send(chatId, `解释异常：${String(e?.message || e)}`);
-      }
-
+      await runExplain({
+        storageDir,
+        chatId,
+        userId,
+        rawAlert,
+        send,
+        config,
+        channel: "telegram",
+        taskIdPrefix: "tg_explain",
+      });
       return;
     }
   }

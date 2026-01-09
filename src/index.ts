@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import { loadConfig } from "./config/loadConfig.js";
 import { loadAllConfig } from "./config/index.js";
+import { listPaths } from "./explain/path_registry.js";
+import { registerDefaultPaths } from "./explain/paths/index.js";
 import { TelegramPolling } from "./channels/telegramPolling.js";
 import { DeepSeekProvider } from "./providers/deepseek.js";
 import { RateLimiter } from "./rateLimit/limiter.js";
@@ -13,6 +15,8 @@ process.on("unhandledRejection", (e: any) => console.error("[unhandledRejection]
 async function main() {
   const cfg = loadConfig("config.yaml");
   const loaded = loadAllConfig();
+  registerDefaultPaths();
+  console.log("[explain] paths", listPaths().map(p => p.id));
   console.log("[config]", {
     policyOk: loaded.meta.policyOk,
     projectsCount: loaded.meta.projectsCount,
