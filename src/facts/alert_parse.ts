@@ -1,48 +1,99 @@
 export type ParsedAlert = {
   ok: boolean;
-  symbol?: string;
-  priority?: string;
-  factor?: number;
-  change_pct?: number;
-  candle_open_time_ms?: number;
-  errors?: string[];
+  errors: string[];
+  symbol: string | null;
+  anchor_ms: number | null;
+  priority: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL" | null;
+  factor: number | null;
+  change_pct: number | null;
+  lookback: number | null;
+  candle: "closed" | "open" | null;
 };
 
-export function parseAlertText(alertRaw: string): ParsedAlert {
+function numOrNull(x: any): number | null {
+  const n = typeof x === "number" ? x : Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseMsLike(s: string): number | null {
+  const cleaned = s.replace(/,/g, "").trim();
+  return numOrNull(cleaned);
+}
+
+export function parseAlertText(raw: string): ParsedAlert {
   const errors: string[] = [];
-  const raw = String(alertRaw || "");
+  const text = String(raw || "");
 
-  const symMatch =
-    raw.match(/\b([A-Z0-9]{5,20}USDT|USDCUSDT|USDTUSDC|FDUSDUSDT)\b/) || null;
+  // --- symbol ---
+  // Prefer explicit patterns:
+  // - "[HIGH] 📈 USDCUSDT"
+  // - "📈 USDCUSDT"
+  // - line "- symbol: BTCUSDT" (future)
+  let symbol: string | null = null;
 
-  const symbol = symMatch ? symMatch[1] : undefined;
+  let m = text.match(/📈\s*([A-Z0-9_]{3,30})\b/);
+  if (m?.[1]) symbol = m[1].toUpperCase();
+
+  if (!symbol) {
+    const m2 = text.match(/\b([A-Z0-9]{3,20}(USDT|USDC|FDUSD|BTC|ETH))\b/);
+    if (m2?.[1]) symbol = m2[1].toUpperCase();
+  }
+
   if (!symbol) errors.push("symbol_not_found");
 
-  const prMatch = raw.match(/\[(LOW|MEDIUM|HIGH|CRITICAL)\]/i);
-  const priority = prMatch ? prMatch[1].toUpperCase() : undefined;
+  // --- priority ---
+  let priority: ParsedAlert["priority"] = null;
+  const pm = text.match(/\[(LOW|MEDIUM|HIGH|CRITICAL)\]/i);
+  if (pm?.[1]) priority = pm[1].toUpperCase() as ParsedAlert["priority"];
 
-  const factorMatch = raw.match(/factor:\s*([0-9.]+)/i);
-  const factor = factorMatch ? Number(factorMatch[1]) : undefined;
-  if (factorMatch && !Number.isFinite(factor!)) errors.push("factor_nan");
+  // --- factor ---
+  let factor: number | null = null;
+  const fm = text.match(/factor:\s*([0-9.]+)/i);
+  if (fm?.[1]) {
+    factor = numOrNull(fm[1]);
+    if (factor === null) errors.push("factor_nan");
+  }
 
-  const cpMatch = raw.match(/change_pct:\s*([0-9.\-]+)%/i);
-  const change_pct = cpMatch ? Number(cpMatch[1]) : undefined;
-  if (cpMatch && !Number.isFinite(change_pct!)) errors.push("change_pct_nan");
+  // --- change_pct ---
+  let change_pct: number | null = null;
+  const cm = text.match(/change_pct:\s*([0-9.\-]+)%/i);
+  if (cm?.[1]) {
+    change_pct = numOrNull(cm[1]);
+    if (change_pct === null) errors.push("change_pct_nan");
+  }
 
-  const cotMatch = raw.match(/candle_open_time_ms:\s*([0-9,]+)/i);
-  const candle_open_time_ms = cotMatch
-    ? Number(String(cotMatch[1]).replace(/,/g, ""))
-    : undefined;
+  // --- lookback ---
+  let lookback: number | null = null;
+  const lm = text.match(/lookback:\s*([0-9]+)/i);
+  if (lm?.[1]) {
+    lookback = numOrNull(lm[1]);
+    if (lookback === null) errors.push("lookback_nan");
+  }
 
-  if (cotMatch && !Number.isFinite(candle_open_time_ms!)) errors.push("candle_open_time_ms_nan");
+  // --- candle ---
+  let candle: ParsedAlert["candle"] = null;
+  const cam = text.match(/candle:\s*(closed|open)/i);
+  if (cam?.[1]) candle = cam[1].toLowerCase() as ParsedAlert["candle"];
+
+  // --- anchor_ms ---
+  let anchor_ms: number | null = null;
+  const am = text.match(/candle_open_time_ms:\s*([0-9,]+)/i);
+  if (am?.[1]) {
+    anchor_ms = parseMsLike(am[1]);
+    if (anchor_ms === null) errors.push("candle_open_time_ms_nan");
+  }
+
+  const ok = !!symbol;
 
   return {
-    ok: errors.length === 0 || !!symbol,
+    ok,
+    errors,
     symbol,
+    anchor_ms,
     priority,
     factor,
     change_pct,
-    candle_open_time_ms,
-    errors: errors.length ? errors : undefined,
+    lookback,
+    candle,
   };
 }

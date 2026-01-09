@@ -31,15 +31,15 @@ function escapeRegExp(s: string) {
 
 function buildExplainContext(rawAlert: string, config?: LoadedConfig) {
   const parsed = parseAlertText(rawAlert);
-  const anchor = parsed.candle_open_time_ms
-    ? new Date(parsed.candle_open_time_ms).toISOString()
+  const anchor = parsed.anchor_ms
+    ? new Date(parsed.anchor_ms).toISOString()
     : new Date().toISOString();
   const projects = config?.projects || {};
   const factsProvider = new LocalFsFactsProvider(projects);
   const facts = factsProvider.buildExplainFacts({
     project_id: DEFAULT_PROJECT_ID,
     anchor_ts_utc: anchor,
-    symbol: parsed.symbol,
+    symbol: parsed.symbol || undefined,
     recent_n: 5,
   });
 
