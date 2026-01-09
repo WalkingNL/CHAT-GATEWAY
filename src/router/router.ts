@@ -5,6 +5,8 @@ import { RateLimiter } from "../rateLimit/limiter.js";
 import { loadAuth, saveAuth } from "../auth/store.js";
 import type { LLMProvider, ChatMessage } from "../providers/base.js";
 import { submitTask } from "../internal_client.js";
+import { evaluate } from "../config/index.js";
+import type { LoadedConfig } from "../config/types.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
 
@@ -131,6 +133,7 @@ export async function handleMessage(opts: {
   ownerChatId: string;
   // NOTE: ownerChatId is private chat_id; group owner gating must use OWNER_TELEGRAM_USER_ID
   allowlistMode: "owner_only" | "auth";
+  config?: LoadedConfig;
   provider: LLMProvider;
   limiter: RateLimiter;
   chatId: string;
@@ -145,6 +148,7 @@ export async function handleMessage(opts: {
     storageDir,
     ownerChatId,
     allowlistMode,
+    config,
     chatId,
     userId,
     text,
@@ -201,16 +205,26 @@ export async function handleMessage(opts: {
       }
       // fall through to command parsing/dispatch below
     } else {
-      // ---- Group explain path: requires reply ----
-      if (!mentionsBot) return;
+      // ---- Group explain path: policy-driven gate ----
+      const res = evaluate(config, {
+        channel: "telegram",
+        capability: "alerts.explain",
+        chat_id: chatId,
+        chat_type: "group",
+        user_id: userId,
+        mention_bot: mentionsBot,
+        has_reply: Boolean(trimmedReplyText),
+      });
 
-      if (!trimmedReplyText) {
+      if (res.require?.mention_bot_for_explain && !mentionsBot) return;
+
+      if (res.require?.reply_required_for_explain && !trimmedReplyText) {
         await send(chatId, "请回复一条告警消息再 @我，我才能解释。");
         return;
       }
 
-      if (!allowed) {
-        await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      if (!res.allowed) {
+        await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
         return;
       }
 

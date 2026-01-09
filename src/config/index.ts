@@ -180,3 +180,5 @@ export function evaluatePolicy(input: PolicyInput, policy: PolicyConfig): Policy
     reason: defaultAllowed ? undefined : "not_allowed",
   };
 }
+
+export { evaluate } from "./eval.js";

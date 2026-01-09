@@ -83,3 +83,9 @@ export type PolicyDecision = {
   require?: PolicyRequire;
   reason?: string;
 };
+
+export type LoadedConfig = {
+  policy: PolicyConfig;
+  projects: Record<string, ProjectManifest>;
+  meta: { policyOk: boolean; projectsCount: number; errors: string[] };
+};

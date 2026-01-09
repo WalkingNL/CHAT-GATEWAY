@@ -1,23 +1,12 @@
 version: 1
 enabled: true
 
-# Roles (v1)
-principals:
-  owner:
-    telegram_user_id: "REPLACE_ME"      # from.id
-    telegram_owner_chat_id: "REPLACE_ME" # private chat_id (optional)
-  allowlist:
-    telegram_user_ids: []
-    telegram_chat_ids: []
-
-# Capability list
 capabilities:
   - alerts.explain
   - ops.status
   - ops.logs
   - ops.ps
 
-# Default policy: deny by default
 default:
   allow: []
   rate_limit:
@@ -26,34 +15,35 @@ default:
     max_lines: 60
     max_chars: 6000
 
-# Rules: match by channel + chat + user + conditions
 rules:
   # 1) Owner DM: explain + ops (Phase A)
   - name: owner_dm_all
     match:
       channel: telegram
       chat_type: private
-      user_id: "${principals.owner.telegram_user_id}"
+      user_id: "1864053991"
     allow:
       - alerts.explain
       - ops.status
       - ops.logs
       - ops.ps
     require:
-      mention_bot: false
+      mention_bot_for_explain: false
       reply_required_for_explain: false
+      mention_bot_for_ops: false
     rate_limit:
       rpm: 60
     output_limits:
       max_lines: 120
       max_chars: 9000
 
-  # 2) Project group: commands no @; explain must @ + reply
-  - name: project_group_ops_and_explain
+  # 2) Project group: owner can use ops; explain must @ + reply
+  - name: crypto_agent_group_owner
     match:
       channel: telegram
-      chat_id: "-5242302064"          # crypto agent group
-      user_id: "${principals.owner.telegram_user_id}"
+      chat_id: "-5242302064"
+      chat_type: group
+      user_id: "1864053991"
     allow:
       - alerts.explain
       - ops.status
@@ -69,10 +59,11 @@ rules:
       max_lines: 80
       max_chars: 8000
 
-  # 3) Project group: non-owner deny
-  - name: project_group_non_owner_deny
+  # 3) Project group: non-owner deny (with message)
+  - name: crypto_agent_group_non_owner_deny
     match:
       channel: telegram
       chat_id: "-5242302064"
+      chat_type: group
     allow: []
     deny_message: "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"

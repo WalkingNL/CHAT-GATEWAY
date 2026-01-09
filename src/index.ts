@@ -80,6 +80,7 @@ async function main() {
           storageDir,
           ownerChatId,
           allowlistMode,
+          config: loaded,
           provider,
           limiter,
           chatId: m.chatId,
