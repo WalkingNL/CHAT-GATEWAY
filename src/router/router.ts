@@ -125,6 +125,7 @@ function buildSuggestMessages(q: string): ChatMessage[] {
 export async function handleMessage(opts: {
   storageDir: string;
   ownerChatId: string;
+  // NOTE: ownerChatId is private chat_id; group owner gating must use OWNER_TELEGRAM_USER_ID
   allowlistMode: "owner_only" | "auth";
   provider: LLMProvider;
   limiter: RateLimiter;
@@ -151,6 +152,7 @@ export async function handleMessage(opts: {
     limiter,
   } = opts;
 
+  const trimmedText = (text || "").trim();
   const authState = loadAuth(storageDir, ownerChatId);
   const ownerUserId = String(process.env.OWNER_TELEGRAM_USER_ID || "");
   const isOwnerChat = chatId === ownerChatId;
@@ -161,15 +163,19 @@ export async function handleMessage(opts: {
       ? (isGroup ? isOwnerUser : isOwnerChat)
       : authState.allowed.includes(chatId) || isOwnerUser;
 
-  const trimmedText = (text || "").trim();
+  // Strip @bot mention for command parsing in groups (e.g. "@SoliaNLBot /status")
+  const cleanedText =
+    isGroup && mentionsBot
+      ? trimmedText.replace(/@\w+\b/g, "").trim()
+      : trimmedText;
+
   const trimmedReplyText = (replyText || "").trim();
 
-  const trimmed = (text || "").trim();
   // allow "/whoami" in both private and group (group may include mention)
   const isWhoami =
-    trimmed === "/whoami" ||
-    trimmed.endsWith(" /whoami") ||
-    trimmed.includes("/whoami");
+    cleanedText === "/whoami" ||
+    cleanedText.endsWith(" /whoami") ||
+    cleanedText.includes("/whoami");
 
   if (isWhoami) {
     await send(chatId, `chatId=${chatId}\nuserId=${userId}\nisGroup=${isGroup}`);
@@ -179,53 +185,63 @@ export async function handleMessage(opts: {
   if (isGroup) {
     if (!mentionsBot) return;
 
-    if (!trimmedReplyText) {
-      await send(chatId, "请回复一条告警消息再 @我，我才能解释。");
-      return;
-    }
-
-    if (!allowed) {
-      await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
-      return;
-    }
-
-    const ctx = {
-      alert_raw: trimmedReplyText,
-      symbol_context: { same_symbol_recent: "unknown" },
-      market_context: { other_symbols_active: "unknown" },
-    };
-
-    const taskId = `tg_explain_${chatId}_${Date.now()}`;
-
-    await send(chatId, "🧠 我看一下…");
-
-    const prompt =
-      "解释这条告警（facts-only）：\n" +
-      "1) 发生了什么（用人话）\n" +
-      "2) 关键结构特征（如量价背离/稳定币）\n" +
-      "3) 可能原因（推断要写依据+置信度）\n" +
-      "4) 下一步建议看什么（facts-only，不给交易建议）\n" +
-      "禁止：价格预测、买卖建议、无依据故事。\n";
-
-    try {
-      const res = await submitTask({
-        task_id: taskId,
-        stage: "analyze",
-        prompt,
-        context: ctx,
-      });
-
-      if (!res?.ok) {
-        await send(chatId, `解释失败：${res?.error || "unknown"}`);
+    // ---- Group command path: allow commands without reply (still owner/allowlist gated) ----
+    if (cleanedText.startsWith("/")) {
+      if (!allowed) {
+        await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+        return;
+      }
+      // fall through to command parsing/dispatch below
+    } else {
+      // ---- Group explain path: requires reply ----
+      if (!trimmedReplyText) {
+        await send(chatId, "请回复一条告警消息再 @我，我才能解释。");
         return;
       }
 
-      await send(chatId, res.summary);
-    } catch (e: any) {
-      await send(chatId, `解释异常：${String(e?.message || e)}`);
-    }
+      if (!allowed) {
+        await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+        return;
+      }
 
-    return;
+      const ctx = {
+        alert_raw: trimmedReplyText,
+        symbol_context: { same_symbol_recent: "unknown" },
+        market_context: { other_symbols_active: "unknown" },
+      };
+
+      const taskId = `tg_explain_${chatId}_${Date.now()}`;
+
+      await send(chatId, "🧠 我看一下…");
+
+      const prompt =
+        "解释这条告警（facts-only）：\n" +
+        "1) 发生了什么（用人话）\n" +
+        "2) 关键结构特征（如量价背离/稳定币）\n" +
+        "3) 可能原因（推断要写依据+置信度）\n" +
+        "4) 下一步建议看什么（facts-only，不给交易建议）\n" +
+        "禁止：价格预测、买卖建议、无依据故事。\n";
+
+      try {
+        const res = await submitTask({
+          task_id: taskId,
+          stage: "analyze",
+          prompt,
+          context: ctx,
+        });
+
+        if (!res?.ok) {
+          await send(chatId, `解释失败：${res?.error || "unknown"}`);
+          return;
+        }
+
+        await send(chatId, res.summary);
+      } catch (e: any) {
+        await send(chatId, `解释异常：${String(e?.message || e)}`);
+      }
+
+      return;
+    }
   }
 
   if (!allowed) return;
@@ -287,7 +303,7 @@ export async function handleMessage(opts: {
     }
   }
 
-  const cmd = parseCommand(text);
+  const cmd = parseCommand(cleanedText);
 
   // auth commands only owner
   if (cmd.kind.startsWith("auth_") && !isOwner) {
