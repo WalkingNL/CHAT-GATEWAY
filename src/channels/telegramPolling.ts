@@ -57,6 +57,7 @@ export class TelegramPolling {
     const mentionToken = botUsername
       ? (botUsername.startsWith("@") ? botUsername : `@${botUsername}`)
       : "";
+    const mentionTokenLower = mentionToken.toLowerCase();
 
     const out: TelegramMsg[] = [];
     for (const u of json.result ?? []) {
@@ -69,7 +70,9 @@ export class TelegramPolling {
       const text = String(m.text || "");
       const replyText = String(m.reply_to_message?.text || "");
       const isGroup = m.chat?.type !== "private";
-      const mentionsBot = mentionToken ? text.includes(mentionToken) : false;
+      const mentionsBot = mentionToken
+        ? text.toLowerCase().includes(mentionTokenLower)
+        : false;
       out.push({ chatId, userId, text, replyText, isGroup, mentionsBot });
     }
     return out;

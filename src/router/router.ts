@@ -17,6 +17,10 @@ function clip(s: string, n: number) {
   return t.length <= n ? t : t.slice(0, n) + "…";
 }
 
+function escapeRegExp(s: string) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function formatAnalyzeReply(out: string): string {
   // Keep it TG-friendly. Facts-only.
   return [
@@ -163,10 +167,15 @@ export async function handleMessage(opts: {
       ? (isGroup ? isOwnerUser : isOwnerChat)
       : authState.allowed.includes(chatId) || isOwnerUser;
 
+  const botUsername = String(process.env.TELEGRAM_BOT_USERNAME || "SoliaNLBot");
+  const mentionToken = botUsername
+    ? (botUsername.startsWith("@") ? botUsername : `@${botUsername}`)
+    : "";
+  const mentionPattern = mentionToken ? new RegExp(escapeRegExp(mentionToken), "gi") : null;
   // Strip @bot mention for command parsing in groups (e.g. "@SoliaNLBot /status")
   const cleanedText =
-    isGroup && mentionsBot
-      ? trimmedText.replace(/@\w+\b/g, "").trim()
+    isGroup && mentionsBot && mentionPattern
+      ? trimmedText.replace(mentionPattern, "").trim()
       : trimmedText;
 
   const trimmedReplyText = (replyText || "").trim();
