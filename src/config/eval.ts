@@ -25,12 +25,24 @@ type EvalResult = {
   reason?: string;
 };
 
+function resolveValue(v: any): any {
+  if (typeof v !== "string") return v;
+  const m = v.match(/^\$\{ENV:([A-Z0-9_]+)\}$/);
+  if (!m) return v;
+  const envVal = process.env[m[1]];
+  return envVal ?? "__UNRESOLVED__";
+}
+
 function matchRule(rule: any, inp: EvalInput): boolean {
   const m = rule?.match || {};
-  if (m.channel && m.channel !== inp.channel) return false;
-  if (m.chat_id && String(m.chat_id) !== String(inp.chat_id)) return false;
-  if (m.chat_type && String(m.chat_type) !== String(inp.chat_type)) return false;
-  if (m.user_id && String(m.user_id) !== String(inp.user_id)) return false;
+  const resolvedMatch = Object.fromEntries(
+    Object.entries(m).map(([k, v]) => [k, resolveValue(v)]),
+  );
+  if (Object.values(resolvedMatch).includes("__UNRESOLVED__")) return false;
+  if (resolvedMatch.channel && resolvedMatch.channel !== inp.channel) return false;
+  if (resolvedMatch.chat_id && String(resolvedMatch.chat_id) !== String(inp.chat_id)) return false;
+  if (resolvedMatch.chat_type && String(resolvedMatch.chat_type) !== String(inp.chat_type)) return false;
+  if (resolvedMatch.user_id && String(resolvedMatch.user_id) !== String(inp.user_id)) return false;
   return true;
 }
 

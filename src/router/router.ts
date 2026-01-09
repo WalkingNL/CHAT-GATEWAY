@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execSync } from "node:child_process";
 import { handleAskCommand, parseCommand } from "./commands.js";
 import { appendLedger } from "../audit/ledger.js";
 import { getStatusFacts } from "./context.js";
@@ -193,6 +197,160 @@ export async function handleMessage(opts: {
 
   if (isWhoami) {
     await send(chatId, `chatId=${chatId}\nuserId=${userId}\nisGroup=${isGroup}`);
+    return;
+  }
+
+  // -------------------------------
+  // C1: ops commands (facts-only)
+  // /status, /ps, /logs <pm2_name> [lines]
+  // -------------------------------
+  const MAX_LINES_DEFAULT = Number(process.env.GW_MAX_LOG_LINES || 200);
+  const MAX_LOG_CHARS = Number(process.env.GW_MAX_LOG_CHARS || 8000);
+  const clampLines = (n: number) => {
+    if (!Number.isFinite(n) || n <= 0) return 80;
+    return Math.min(Math.max(1, Math.floor(n)), MAX_LINES_DEFAULT);
+  };
+
+  const pm2Jlist = (): any[] => {
+    try {
+      const out = execSync("pm2 jlist", { encoding: "utf-8" });
+      return JSON.parse(out);
+    } catch {
+      return [];
+    }
+  };
+
+  const fmtUptime = (ms: number) => {
+    if (!ms || ms < 0) return "—";
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const h = Math.floor(m / 60);
+    const d = Math.floor(h / 24);
+    if (d > 0) return `${d}d${h % 24}h`;
+    if (h > 0) return `${h}h${m % 60}m`;
+    return `${m}m`;
+  };
+
+  const renderPs = () => {
+    const now = Date.now();
+    const rows = pm2Jlist().map((p) => {
+      const name = p?.name || "unknown";
+      const status = p?.pm2_env?.status || "unknown";
+      const restarts = p?.pm2_env?.restart_time ?? 0;
+      const pmUptime = p?.pm2_env?.pm_uptime ?? 0;
+      const uptime = pmUptime ? fmtUptime(now - pmUptime) : "—";
+      const memMb = p?.monit?.memory ? (p.monit.memory / (1024 * 1024)).toFixed(1) : "0.0";
+      const cpu = p?.monit?.cpu ?? 0;
+      return { name, status, uptime, restarts, memMb, cpu };
+    });
+
+    const lines: string[] = [];
+    lines.push("🧾 pm2 (facts-only)");
+    if (!rows.length) {
+      lines.push("- (no pm2 data)");
+    }
+    for (const r of rows) {
+      lines.push(`- ${r.name}: ${r.status} | up ${r.uptime} | restarts ${r.restarts} | mem ${r.memMb}MB | cpu ${r.cpu}%`);
+    }
+    return lines.join("\n");
+  };
+
+  const renderStatus = () => {
+    const nowUtc = new Date().toISOString();
+    let sha = "unknown";
+    try {
+      sha = execSync("git rev-parse --short HEAD", { encoding: "utf-8" }).trim();
+    } catch {}
+
+    const procs = pm2Jlist();
+    const byName = new Map<string, any>();
+    for (const p of procs) byName.set(p?.name, p);
+    const pick = (name: string) => {
+      const p = byName.get(name);
+      const st = p?.pm2_env?.status || "unknown";
+      return `${name}=${st}`;
+    };
+
+    const bits = [
+      `✅ status (facts-only)`,
+      `- time_utc: ${nowUtc}`,
+      `- repo_sha: ${sha}`,
+      `- pm2: ${[pick("crypto-agent"), pick("crypto-dashboard"), pick("chat-gateway")].join(" ")}`,
+    ];
+    return bits.join("\n");
+  };
+
+  const resolvePm2LogPath = (name: string, stream: "out" | "error") => {
+    const base = path.join(os.homedir(), ".pm2", "logs");
+    return path.join(base, `${name}-${stream}.log`);
+  };
+
+  const tailFile = (filePath: string, n: number): string => {
+    const cmd = `tail -n ${n} ${filePath.replace(/(["\\$`])/g, "\\$1")}`;
+    return execSync(cmd, { encoding: "utf-8" });
+  };
+
+  const renderLogs = (name: string, lines: number) => {
+    const n = clampLines(lines);
+    const outPath = resolvePm2LogPath(name, "out");
+    const errPath = resolvePm2LogPath(name, "error");
+    const chunks: string[] = [];
+    chunks.push(`📜 logs: ${name} (last ${n})`);
+
+    if (fs.existsSync(errPath)) {
+      try {
+        const t = tailFile(errPath, n).trimEnd();
+        if (t) {
+          chunks.push("--- error ---");
+          chunks.push(t);
+        }
+      } catch {}
+    }
+    if (fs.existsSync(outPath)) {
+      try {
+        const t = tailFile(outPath, n).trimEnd();
+        if (t) {
+          chunks.push("--- out ---");
+          chunks.push(t);
+        }
+      } catch {}
+    }
+
+    if (chunks.length <= 1) {
+      return `⚠️ logs unavailable: no pm2 log files for '${name}'`;
+    }
+    return chunks.join("\n");
+  };
+
+  if (cleanedText.startsWith("/status")) {
+    if (!allowed) {
+      await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      return;
+    }
+    await send(chatId, renderStatus());
+    return;
+  }
+
+  if (cleanedText.startsWith("/ps")) {
+    if (!allowed) {
+      await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      return;
+    }
+    await send(chatId, renderPs());
+    return;
+  }
+
+  if (cleanedText.startsWith("/logs")) {
+    if (!allowed) {
+      await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      return;
+    }
+    const parts = cleanedText.split(/\s+/).filter(Boolean);
+    const name = parts[1] || "crypto-agent";
+    const lines = parts[2] ? Number(parts[2]) : 80;
+    const out = renderLogs(name, lines);
+    const clipped = out.length > MAX_LOG_CHARS ? out.slice(0, MAX_LOG_CHARS) + "\n...(clipped)" : out;
+    await send(chatId, clipped);
     return;
   }
 
