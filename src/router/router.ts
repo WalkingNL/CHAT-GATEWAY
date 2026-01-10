@@ -235,6 +235,8 @@ type SuggestObj = {
   warnings?: string[];
 };
 
+type SendFn = (chatId: string, text: string) => Promise<void>;
+
 function summarizePatch(patch: string): string {
   const p = String(patch || "").trim();
   if (!p) return "(none)";
@@ -323,158 +325,52 @@ function buildSuggestMessages(q: string): ChatMessage[] {
   ];
 }
 
-export async function handleMessage(opts: {
-  storageDir: string;
-  ownerChatId: string;
-  // NOTE: ownerChatId is private chat_id; group owner gating must use OWNER_TELEGRAM_USER_ID
-  allowlistMode: "owner_only" | "auth";
-  config?: LoadedConfig;
-  provider: LLMProvider;
-  limiter: RateLimiter;
-  chatId: string;
-  userId: string;
-  text: string;
-  replyText?: string;
-  isGroup?: boolean;
-  mentionsBot?: boolean;
-  send: (chatId: string, text: string) => Promise<void>;
-}) {
-  const {
-    storageDir,
-    ownerChatId,
-    allowlistMode,
-    config,
-    chatId,
-    userId,
-    text,
-    replyText = "",
-    isGroup = false,
-    mentionsBot = false,
-    send,
-    provider,
-    limiter,
-  } = opts;
+type OpsLimits = {
+  maxLinesDefault: number;
+  maxLogChars: number;
+  telegramSafeMax: number;
+};
 
-  let textNorm = (text || "").trim();
-  // feedback command channel (works under Telegram privacy mode in groups)
-  if (textNorm.startsWith("/feedback")) {
-    textNorm = textNorm.replace(/^\/feedback\s*/i, "").trim();
-  }
-  const hitTooMany = FEEDBACK_TOO_MANY.some((k) => textNorm.includes(k));
-  const hitTooFew = FEEDBACK_TOO_FEW.some((k) => textNorm.includes(k));
-
-  if (hitTooMany || hitTooFew) {
-    await send(
-      chatId,
-      "已收到反馈。\n我会关注近期告警密度，并在不影响异常捕获的前提下做调整。"
-    );
-
-    appendLedger(storageDir, {
-      ts_utc: nowIso(),
-      channel: "telegram",
-      chat_id: chatId,
-      user_id: userId,
-      kind: "alert_feedback",
-      feedback: hitTooMany ? "too_many" : "too_few",
-      raw: textNorm,
-    });
-
-    return;
-  }
-
-  const trimmedText = textNorm;
-  const authState = loadAuth(storageDir, ownerChatId);
-  const ownerUserId = String(process.env.OWNER_TELEGRAM_USER_ID || "");
-  const isOwnerChat = chatId === ownerChatId;
-  const isOwnerUser = ownerUserId ? userId === ownerUserId : false;
-  const isOwner = isOwnerChat || isOwnerUser;
-  const allowed =
-    allowlistMode === "owner_only"
-      ? (isGroup ? isOwnerUser : isOwnerChat)
-      : authState.allowed.includes(chatId) || isOwnerUser;
-
-  const botUsername = String(process.env.TELEGRAM_BOT_USERNAME || "SoliaNLBot");
-  const mentionToken = botUsername
-    ? (botUsername.startsWith("@") ? botUsername : `@${botUsername}`)
-    : "";
-  const mentionPattern = mentionToken ? new RegExp(escapeRegExp(mentionToken), "gi") : null;
-  // Strip @bot mention for command parsing in groups (e.g. "@SoliaNLBot /status")
-  const cleanedText =
-    isGroup && mentionsBot && mentionPattern
-      ? trimmedText.replace(mentionPattern, "").trim()
-      : trimmedText;
-  const isCommand = cleanedText.startsWith("/");
-
-  const trimmedReplyText = (replyText || "").trim();
-
-  // allow "/whoami" in both private and group (group may include mention)
-  const isWhoami =
-    cleanedText === "/whoami" ||
-    cleanedText.endsWith(" /whoami") ||
-    cleanedText.includes("/whoami");
-
-  if (isWhoami) {
-    await send(chatId, `chatId=${chatId}\nuserId=${userId}\nisGroup=${isGroup}`);
-    return;
-  }
-
-  if (trimmedText === "👍" || trimmedText === "👎") {
-    const last = lastExplainByChatId.get(chatId);
-    if (!last) {
-      await send(chatId, "没有可反馈的解释。");
-      return;
-    }
-    writeExplainFeedback(storageDir, {
-      ts_utc: new Date().toISOString(),
-      trace_id: last.trace_id,
-      chat_id: chatId,
-      user_id: userId,
-      feedback: trimmedText === "👍" ? "up" : "down",
-    });
-    await send(chatId, "已记录反馈。");
-    return;
-  }
-
-  // -------------------------------
-  // C1: ops commands (facts-only)
-  // /status, /ps, /logs <pm2_name> [lines]
-  // -------------------------------
-  const MAX_LINES_DEFAULT = Number(process.env.GW_MAX_LOG_LINES || 200);
-  const TELEGRAM_SAFE_MAX = 3500;
-  const MAX_LOG_CHARS = Math.min(
-    Number(process.env.GW_MAX_LOG_CHARS || TELEGRAM_SAFE_MAX),
-    TELEGRAM_SAFE_MAX,
+function getOpsLimits(): OpsLimits {
+  const telegramSafeMax = 3500;
+  const maxLinesDefault = Number(process.env.GW_MAX_LOG_LINES || 200);
+  const maxLogChars = Math.min(
+    Number(process.env.GW_MAX_LOG_CHARS || telegramSafeMax),
+    telegramSafeMax,
   );
-  const clampLines = (n: number) => {
-    if (!Number.isFinite(n) || n <= 0) return 80;
-    return Math.min(Math.max(1, Math.floor(n)), MAX_LINES_DEFAULT);
-  };
+  return { maxLinesDefault, maxLogChars, telegramSafeMax };
+}
 
-  const pm2Jlist = (): any[] => {
-    try {
-      const out = execSync("pm2 jlist", { encoding: "utf-8" });
-      return JSON.parse(out);
-    } catch {
-      return [];
-    }
-  };
+function clampLines(n: number, maxLinesDefault: number) {
+  if (!Number.isFinite(n) || n <= 0) return 80;
+  return Math.min(Math.max(1, Math.floor(n)), maxLinesDefault);
+}
 
-  const fmtUptime = (ms: number) => {
-    if (!ms || ms < 0) return "—";
-    const s = Math.floor(ms / 1000);
-    const m = Math.floor(s / 60);
-    const h = Math.floor(m / 60);
-    const d = Math.floor(h / 24);
-    if (d > 0) return `${d}d${h % 24}h`;
-    if (h > 0) return `${h}h${m % 60}m`;
-    return `${m}m`;
-  };
+function pm2Jlist(): any[] {
+  try {
+    const out = execSync("pm2 jlist", { encoding: "utf-8" });
+    return JSON.parse(out);
+  } catch {
+    return [];
+  }
+}
 
-  const renderPs = (allowedNames: string[]) => {
-    const now = Date.now();
-    const rows = pm2Jlist()
-      .filter((p) => !allowedNames.length || allowedNames.includes(p?.name))
-      .map((p) => {
+function fmtUptime(ms: number) {
+  if (!ms || ms < 0) return "—";
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  const d = Math.floor(h / 24);
+  if (d > 0) return `${d}d${h % 24}h`;
+  if (h > 0) return `${h}h${m % 60}m`;
+  return `${m}m`;
+}
+
+function renderPs(allowedNames: string[]) {
+  const now = Date.now();
+  const rows = pm2Jlist()
+    .filter((p) => !allowedNames.length || allowedNames.includes(p?.name))
+    .map((p) => {
       const name = p?.name || "unknown";
       const status = p?.pm2_env?.status || "unknown";
       const restarts = p?.pm2_env?.restart_time ?? 0;
@@ -485,88 +381,116 @@ export async function handleMessage(opts: {
       return { name, status, uptime, restarts, memMb, cpu };
     });
 
-    const lines: string[] = [];
-    lines.push("🧾 pm2 (facts-only)");
-    if (!rows.length) {
-      lines.push("- (no pm2 data)");
-    }
-    for (const r of rows) {
-      lines.push(`- ${r.name}: ${r.status} | up ${r.uptime} | restarts ${r.restarts} | mem ${r.memMb}MB | cpu ${r.cpu}%`);
-    }
-    return lines.join("\n");
+  const lines: string[] = [];
+  lines.push("🧾 pm2 (facts-only)");
+  if (!rows.length) {
+    lines.push("- (no pm2 data)");
+  }
+  for (const r of rows) {
+    lines.push(`- ${r.name}: ${r.status} | up ${r.uptime} | restarts ${r.restarts} | mem ${r.memMb}MB | cpu ${r.cpu}%`);
+  }
+  return lines.join("\n");
+}
+
+function renderStatus(allowedNames: string[]) {
+  const nowUtc = new Date().toISOString();
+  let sha = "unknown";
+  try {
+    sha = execSync("git rev-parse --short HEAD", { encoding: "utf-8" }).trim();
+  } catch {}
+
+  const procs = pm2Jlist();
+  const byName = new Map<string, any>();
+  for (const p of procs) byName.set(p?.name, p);
+  const pick = (name: string) => {
+    const p = byName.get(name);
+    const st = p?.pm2_env?.status || "unknown";
+    return `${name}=${st}`;
   };
 
-  const renderStatus = (allowedNames: string[]) => {
-    const nowUtc = new Date().toISOString();
-    let sha = "unknown";
+  const names = allowedNames.length ? allowedNames : [];
+  const pm2Line = names.length
+    ? names.map((n) => pick(n)).join(" ")
+    : "(no pm2 names configured)";
+  const bits = [
+    `✅ status (facts-only)`,
+    `- time_utc: ${nowUtc}`,
+    `- repo_sha: ${sha}`,
+    `- pm2: ${pm2Line}`,
+  ];
+  return bits.join("\n");
+}
+
+function resolvePm2LogPath(name: string, stream: "out" | "error") {
+  const base = path.join(os.homedir(), ".pm2", "logs");
+  return path.join(base, `${name}-${stream}.log`);
+}
+
+function tailFile(filePath: string, n: number): string {
+  const cmd = `tail -n ${n} ${filePath.replace(/(["\\$`])/g, "\\$1")}`;
+  return execSync(cmd, { encoding: "utf-8" });
+}
+
+function renderLogs(name: string, lines: number, maxLinesDefault: number) {
+  const n = clampLines(lines, maxLinesDefault);
+  const outPath = resolvePm2LogPath(name, "out");
+  const errPath = resolvePm2LogPath(name, "error");
+  const chunks: string[] = [];
+  chunks.push(`📜 logs: ${name} (last ${n})`);
+
+  if (fs.existsSync(errPath)) {
     try {
-      sha = execSync("git rev-parse --short HEAD", { encoding: "utf-8" }).trim();
+      const t = tailFile(errPath, n).trimEnd();
+      if (t) {
+        chunks.push("--- error ---");
+        chunks.push(t);
+      }
     } catch {}
+  }
+  if (fs.existsSync(outPath)) {
+    try {
+      const t = tailFile(outPath, n).trimEnd();
+      if (t) {
+        chunks.push("--- out ---");
+        chunks.push(t);
+      }
+    } catch {}
+  }
 
-    const procs = pm2Jlist();
-    const byName = new Map<string, any>();
-    for (const p of procs) byName.set(p?.name, p);
-    const pick = (name: string) => {
-      const p = byName.get(name);
-      const st = p?.pm2_env?.status || "unknown";
-      return `${name}=${st}`;
-    };
+  if (chunks.length <= 1) {
+    return `⚠️ logs unavailable: no pm2 log files for '${name}'`;
+  }
+  return chunks.join("\n");
+}
 
-    const names = allowedNames.length ? allowedNames : [];
-    const pm2Line = names.length
-      ? names.map((n) => pick(n)).join(" ")
-      : "(no pm2 names configured)";
-    const bits = [
-      `✅ status (facts-only)`,
-      `- time_utc: ${nowUtc}`,
-      `- repo_sha: ${sha}`,
-      `- pm2: ${pm2Line}`,
-    ];
-    return bits.join("\n");
-  };
+async function handleOpsCommand(params: {
+  cleanedText: string;
+  config?: LoadedConfig;
+  chatId: string;
+  userId: string;
+  mentionsBot: boolean;
+  trimmedReplyText: string;
+  isGroup: boolean;
+  allowed: boolean;
+  send: SendFn;
+}): Promise<boolean> {
+  const {
+    cleanedText,
+    config,
+    chatId,
+    userId,
+    mentionsBot,
+    trimmedReplyText,
+    isGroup,
+    allowed,
+    send,
+  } = params;
 
-  const resolvePm2LogPath = (name: string, stream: "out" | "error") => {
-    const base = path.join(os.homedir(), ".pm2", "logs");
-    return path.join(base, `${name}-${stream}.log`);
-  };
+  if (!cleanedText.startsWith("/status") && !cleanedText.startsWith("/ps") && !cleanedText.startsWith("/logs")) {
+    return false;
+  }
 
-  const tailFile = (filePath: string, n: number): string => {
-    const cmd = `tail -n ${n} ${filePath.replace(/(["\\$`])/g, "\\$1")}`;
-    return execSync(cmd, { encoding: "utf-8" });
-  };
-
-  const renderLogs = (name: string, lines: number) => {
-    const n = clampLines(lines);
-    const outPath = resolvePm2LogPath(name, "out");
-    const errPath = resolvePm2LogPath(name, "error");
-    const chunks: string[] = [];
-    chunks.push(`📜 logs: ${name} (last ${n})`);
-
-    if (fs.existsSync(errPath)) {
-      try {
-        const t = tailFile(errPath, n).trimEnd();
-        if (t) {
-          chunks.push("--- error ---");
-          chunks.push(t);
-        }
-      } catch {}
-    }
-    if (fs.existsSync(outPath)) {
-      try {
-        const t = tailFile(outPath, n).trimEnd();
-        if (t) {
-          chunks.push("--- out ---");
-          chunks.push(t);
-        }
-      } catch {}
-    }
-
-    if (chunks.length <= 1) {
-      return `⚠️ logs unavailable: no pm2 log files for '${name}'`;
-    }
-    return chunks.join("\n");
-  };
-
+  const { maxLinesDefault, maxLogChars, telegramSafeMax } = getOpsLimits();
   const pm2LogsNames = getPm2Names(config, "pm2_logs");
   const pm2PsNames = getPm2Names(config, "pm2_ps");
   const chatType = isGroup ? "group" : "private";
@@ -583,143 +507,174 @@ export async function handleMessage(opts: {
 
   if (cleanedText.startsWith("/status")) {
     const res = evalOps("ops.status");
-    if (res.require?.mention_bot_for_ops && !mentionsBot) return;
+    if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
     const isAllowed = policyOk ? res.allowed : allowed;
     if (!isAllowed) {
       await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
-      return;
+      return true;
     }
     await send(chatId, renderStatus(pm2PsNames));
-    return;
+    return true;
   }
 
   if (cleanedText.startsWith("/ps")) {
     const res = evalOps("ops.ps");
-    if (res.require?.mention_bot_for_ops && !mentionsBot) return;
+    if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
     const isAllowed = policyOk ? res.allowed : allowed;
     if (!isAllowed) {
       await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
-      return;
+      return true;
     }
     await send(chatId, renderPs(pm2PsNames));
-    return;
+    return true;
   }
 
   if (cleanedText.startsWith("/logs")) {
     const res = evalOps("ops.logs");
-    if (res.require?.mention_bot_for_ops && !mentionsBot) return;
+    if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
     const isAllowed = policyOk ? res.allowed : allowed;
     if (!isAllowed) {
       await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
-      return;
+      return true;
     }
     const parts = cleanedText.split(/\s+/).filter(Boolean);
     if (!pm2LogsNames.length) {
       await send(chatId, "⚠️ 未配置 pm2 日志进程名（manifest: pm2_logs.names）。");
-      return;
+      return true;
     }
     const name = parts[1] || pm2LogsNames[0];
     if (!pm2LogsNames.includes(name)) {
       await send(chatId, `⚠️ 不允许的进程名：${name}`);
-      return;
+      return true;
     }
     const lines = parts[2] ? Number(parts[2]) : 80;
-    const out = renderLogs(name, lines);
-    if (out.length > MAX_LOG_CHARS) {
-      const head = out.slice(0, Math.max(0, MAX_LOG_CHARS - 40));
+    const out = renderLogs(name, lines, maxLinesDefault);
+    if (out.length > maxLogChars) {
+      const head = out.slice(0, Math.max(0, maxLogChars - 40));
       const msg =
-        `⚠️ 输出过长，已截断到 ${MAX_LOG_CHARS} 字符（上限 ${TELEGRAM_SAFE_MAX}）。\n` +
+        `⚠️ 输出过长，已截断到 ${maxLogChars} 字符（上限 ${telegramSafeMax}）。\n` +
         head +
         "\n...(clipped)";
       await send(chatId, msg);
-      return;
+      return true;
     }
     await send(chatId, out);
+    return true;
+  }
+
+  return false;
+}
+
+async function handleGroupExplain(params: {
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  trimmedReplyText: string;
+  mentionsBot: boolean;
+  send: SendFn;
+  config?: LoadedConfig;
+}) {
+  const { storageDir, chatId, userId, trimmedReplyText, mentionsBot, send, config } = params;
+  const res = evaluate(config, {
+    channel: "telegram",
+    capability: "alerts.explain",
+    chat_id: chatId,
+    chat_type: "group",
+    user_id: userId,
+    mention_bot: mentionsBot,
+    has_reply: Boolean(trimmedReplyText),
+  });
+
+  if (res.require?.mention_bot_for_explain && !mentionsBot) return;
+
+  if (res.require?.reply_required_for_explain && !trimmedReplyText) {
+    await send(chatId, "请回复一条告警消息再 @我，我才能解释。");
     return;
   }
 
-  if (isGroup) {
-    // ---- Group command path: allow commands without @bot (still owner/allowlist gated) ----
-    if (isCommand) {
-      if (!allowed) {
-        await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
-        return;
-      }
-      // fall through to command parsing/dispatch below
-    } else {
-      // ---- Group explain path: policy-driven gate ----
-      const res = evaluate(config, {
-        channel: "telegram",
-        capability: "alerts.explain",
-        chat_id: chatId,
-        chat_type: "group",
-        user_id: userId,
-        mention_bot: mentionsBot,
-        has_reply: Boolean(trimmedReplyText),
-      });
-
-      if (res.require?.mention_bot_for_explain && !mentionsBot) return;
-
-      if (res.require?.reply_required_for_explain && !trimmedReplyText) {
-        await send(chatId, "请回复一条告警消息再 @我，我才能解释。");
-        return;
-      }
-
-      if (!res.allowed) {
-        await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
-        return;
-      }
-
-      await send(chatId, "🧠 我看一下…");
-      await runExplain({
-        storageDir,
-        chatId,
-        userId,
-        rawAlert: trimmedReplyText,
-        send,
-        config,
-        channel: "telegram",
-        taskIdPrefix: "tg_explain",
-      });
-      return;
-    }
+  if (!res.allowed) {
+    await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+    return;
   }
 
-  if (!allowed && !isGroup) return;
+  await send(chatId, "🧠 我看一下…");
+  await runExplain({
+    storageDir,
+    chatId,
+    userId,
+    rawAlert: trimmedReplyText,
+    send,
+    config,
+    channel: "telegram",
+    taskIdPrefix: "tg_explain",
+  });
+}
 
-  if (!isGroup) {
-    if (trimmedReplyText) {
-      lastAlertByChatId.set(chatId, { ts: Date.now(), rawText: trimmedReplyText });
-    }
+async function handlePrivateMessage(params: {
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  trimmedText: string;
+  trimmedReplyText: string;
+  isCommand: boolean;
+  send: SendFn;
+  config?: LoadedConfig;
+}): Promise<boolean> {
+  const {
+    storageDir,
+    chatId,
+    userId,
+    trimmedText,
+    trimmedReplyText,
+    isCommand,
+    send,
+    config,
+  } = params;
 
-    if (trimmedText === "/help" || trimmedText === "help") {
-      await send(chatId, "用法：回复一条告警，然后发“解释一下/？”即可。");
-      return;
-    }
-
-    if (!isCommand) {
-      const rawAlert = trimmedReplyText || lastAlertByChatId.get(chatId)?.rawText || "";
-      if (!rawAlert) {
-        await send(chatId, "请先回复一条告警消息，然后发一句话（如：解释一下）。");
-        return;
-      }
-
-      await send(chatId, "🧠 我看一下…");
-      await runExplain({
-        storageDir,
-        chatId,
-        userId,
-        rawAlert,
-        send,
-        config,
-        channel: "telegram",
-        taskIdPrefix: "tg_explain",
-      });
-      return;
-    }
+  if (trimmedReplyText) {
+    lastAlertByChatId.set(chatId, { ts: Date.now(), rawText: trimmedReplyText });
   }
 
-  const cmd = parseCommand(cleanedText);
+  if (trimmedText === "/help" || trimmedText === "help") {
+    await send(chatId, "用法：回复一条告警，然后发“解释一下/？”即可。");
+    return true;
+  }
+
+  if (!isCommand) {
+    const rawAlert = trimmedReplyText || lastAlertByChatId.get(chatId)?.rawText || "";
+    if (!rawAlert) {
+      await send(chatId, "请先回复一条告警消息，然后发一句话（如：解释一下）。");
+      return true;
+    }
+
+    await send(chatId, "🧠 我看一下…");
+    await runExplain({
+      storageDir,
+      chatId,
+      userId,
+      rawAlert,
+      send,
+      config,
+      channel: "telegram",
+      taskIdPrefix: "tg_explain",
+    });
+    return true;
+  }
+
+  return false;
+}
+
+async function handleParsedCommand(params: {
+  cmd: ReturnType<typeof parseCommand>;
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  text: string;
+  isOwner: boolean;
+  authState: ReturnType<typeof loadAuth>;
+  send: SendFn;
+}) {
+  const { cmd, storageDir, chatId, userId, text, isOwner, authState, send } = params;
 
   // auth commands only owner
   if (cmd.kind.startsWith("auth_") && !isOwner) {
@@ -877,4 +832,180 @@ export async function handleMessage(opts: {
   // unknown
   await send(chatId, "unknown command. /help");
   appendLedger(storageDir, { ...baseAudit, cmd: "unknown" });
+}
+
+export async function handleMessage(opts: {
+  storageDir: string;
+  ownerChatId: string;
+  // NOTE: ownerChatId is private chat_id; group owner gating must use OWNER_TELEGRAM_USER_ID
+  allowlistMode: "owner_only" | "auth";
+  config?: LoadedConfig;
+  provider: LLMProvider;
+  limiter: RateLimiter;
+  chatId: string;
+  userId: string;
+  text: string;
+  replyText?: string;
+  isGroup?: boolean;
+  mentionsBot?: boolean;
+  send: (chatId: string, text: string) => Promise<void>;
+}) {
+  const {
+    storageDir,
+    ownerChatId,
+    allowlistMode,
+    config,
+    chatId,
+    userId,
+    text,
+    replyText = "",
+    isGroup = false,
+    mentionsBot = false,
+    send,
+    provider,
+    limiter,
+  } = opts;
+
+  let textNorm = (text || "").trim();
+  // feedback command channel (works under Telegram privacy mode in groups)
+  if (textNorm.startsWith("/feedback")) {
+    textNorm = textNorm.replace(/^\/feedback\s*/i, "").trim();
+  }
+  const hitTooMany = FEEDBACK_TOO_MANY.some((k) => textNorm.includes(k));
+  const hitTooFew = FEEDBACK_TOO_FEW.some((k) => textNorm.includes(k));
+
+  if (hitTooMany || hitTooFew) {
+    await send(
+      chatId,
+      "已收到反馈。\n我会关注近期告警密度，并在不影响异常捕获的前提下做调整。"
+    );
+
+    appendLedger(storageDir, {
+      ts_utc: nowIso(),
+      channel: "telegram",
+      chat_id: chatId,
+      user_id: userId,
+      kind: "alert_feedback",
+      feedback: hitTooMany ? "too_many" : "too_few",
+      raw: textNorm,
+    });
+
+    return;
+  }
+
+  const trimmedText = textNorm;
+  const authState = loadAuth(storageDir, ownerChatId);
+  const ownerUserId = String(process.env.OWNER_TELEGRAM_USER_ID || "");
+  const isOwnerChat = chatId === ownerChatId;
+  const isOwnerUser = ownerUserId ? userId === ownerUserId : false;
+  const isOwner = isOwnerChat || isOwnerUser;
+  const allowed =
+    allowlistMode === "owner_only"
+      ? (isGroup ? isOwnerUser : isOwnerChat)
+      : authState.allowed.includes(chatId) || isOwnerUser;
+
+  const botUsername = String(process.env.TELEGRAM_BOT_USERNAME || "SoliaNLBot");
+  const mentionToken = botUsername
+    ? (botUsername.startsWith("@") ? botUsername : `@${botUsername}`)
+    : "";
+  const mentionPattern = mentionToken ? new RegExp(escapeRegExp(mentionToken), "gi") : null;
+  // Strip @bot mention for command parsing in groups (e.g. "@SoliaNLBot /status")
+  const cleanedText =
+    isGroup && mentionsBot && mentionPattern
+      ? trimmedText.replace(mentionPattern, "").trim()
+      : trimmedText;
+  const isCommand = cleanedText.startsWith("/");
+
+  const trimmedReplyText = (replyText || "").trim();
+
+  // allow "/whoami" in both private and group (group may include mention)
+  const isWhoami =
+    cleanedText === "/whoami" ||
+    cleanedText.endsWith(" /whoami") ||
+    cleanedText.includes("/whoami");
+
+  if (isWhoami) {
+    await send(chatId, `chatId=${chatId}\nuserId=${userId}\nisGroup=${isGroup}`);
+    return;
+  }
+
+  if (trimmedText === "👍" || trimmedText === "👎") {
+    const last = lastExplainByChatId.get(chatId);
+    if (!last) {
+      await send(chatId, "没有可反馈的解释。");
+      return;
+    }
+    writeExplainFeedback(storageDir, {
+      ts_utc: new Date().toISOString(),
+      trace_id: last.trace_id,
+      chat_id: chatId,
+      user_id: userId,
+      feedback: trimmedText === "👍" ? "up" : "down",
+    });
+    await send(chatId, "已记录反馈。");
+    return;
+  }
+
+  const handledOps = await handleOpsCommand({
+    cleanedText,
+    config,
+    chatId,
+    userId,
+    mentionsBot,
+    trimmedReplyText,
+    isGroup,
+    allowed,
+    send,
+  });
+  if (handledOps) return;
+
+  if (isGroup) {
+    // ---- Group command path: allow commands without @bot (still owner/allowlist gated) ----
+    if (isCommand) {
+      if (!allowed) {
+        await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+        return;
+      }
+      // fall through to command parsing/dispatch below
+    } else {
+      await handleGroupExplain({
+        storageDir,
+        chatId,
+        userId,
+        trimmedReplyText,
+        mentionsBot,
+        send,
+        config,
+      });
+      return;
+    }
+  }
+
+  if (!allowed && !isGroup) return;
+
+  if (!isGroup) {
+    const handledPrivate = await handlePrivateMessage({
+      storageDir,
+      chatId,
+      userId,
+      trimmedText,
+      trimmedReplyText,
+      isCommand,
+      send,
+      config,
+    });
+    if (handledPrivate) return;
+  }
+
+  const cmd = parseCommand(cleanedText);
+  await handleParsedCommand({
+    cmd,
+    storageDir,
+    chatId,
+    userId,
+    text,
+    isOwner,
+    authState,
+    send,
+  });
 }
