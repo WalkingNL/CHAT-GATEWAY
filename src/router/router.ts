@@ -355,12 +355,19 @@ export async function handleMessage(opts: {
     limiter,
   } = opts;
 
-  const textNorm = (text || "").trim();
+  let textNorm = (text || "").trim();
+  // feedback command channel (works under Telegram privacy mode in groups)
+  if (textNorm.startsWith("/feedback")) {
+    textNorm = textNorm.replace(/^\/feedback\s*/i, "").trim();
+  }
   const hitTooMany = FEEDBACK_TOO_MANY.some((k) => textNorm.includes(k));
   const hitTooFew = FEEDBACK_TOO_FEW.some((k) => textNorm.includes(k));
 
   if (hitTooMany || hitTooFew) {
-    await send(chatId, "已收到反馈，正在调整推送策略。");
+    await send(
+      chatId,
+      "已收到反馈。\n我会关注近期告警密度，并在不影响异常捕获的前提下做调整。"
+    );
 
     appendLedger(storageDir, {
       ts_utc: nowIso(),
@@ -733,6 +740,7 @@ export async function handleMessage(opts: {
       "/auth add <chat_id>",
       "/auth del <chat_id>",
       "/auth list",
+      "/feedback <描述>（例如：告警太多了 / 告警太少了）",
     ].join("\n");
     await send(chatId, out);
     appendLedger(storageDir, { ...baseAudit, cmd: "help" });
