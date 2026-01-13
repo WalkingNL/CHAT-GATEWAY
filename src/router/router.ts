@@ -139,6 +139,150 @@ function summarizeFacts(facts: any) {
   };
 }
 
+type SignalRow = {
+  ts_utc?: string;
+  ts?: number | string;
+  ts_ms?: number;
+  ts_iso?: string;
+  symbol?: string;
+  kind?: string;
+  type?: string;
+};
+
+function utcDateStamp(d: Date): string {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function resolveSignalsRoot(config?: LoadedConfig): string | null {
+  const proj = (config?.projects || {}).crypto_agent as any;
+  const root = typeof proj?.root === "string" ? proj.root.trim() : "";
+  if (root) return root;
+  const env = String(process.env.CRYPTO_AGENT_ROOT || "").trim();
+  if (env) return env;
+  return "/srv/crypto_agent";
+}
+
+function parseSignalTsMs(row: SignalRow): number | null {
+  const ts = row.ts_utc ?? row.ts ?? row.ts_ms ?? row.ts_iso;
+  if (typeof ts === "number") return ts;
+  if (typeof ts === "string") {
+    const ms = Date.parse(ts);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
+}
+
+async function readSignalsFile(filePath: string): Promise<SignalRow[]> {
+  try {
+    const content = await fs.promises.readFile(filePath, "utf-8");
+    const rows: SignalRow[] = [];
+    for (const line of content.split("\n")) {
+      const s = line.trim();
+      if (!s) continue;
+      try {
+        rows.push(JSON.parse(s));
+      } catch {
+        // ignore malformed lines
+      }
+    }
+    return rows;
+  } catch (e: any) {
+    if (e?.code === "ENOENT") return [];
+    throw e;
+  }
+}
+
+function topCounts(counts: Map<string, number>, n = 3): Array<[string, number]> {
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, n);
+}
+
+function formatTopList(items: Array<[string, number]>): string {
+  if (!items.length) return "无";
+  return items.map(([k, v]) => `${k}(${v})`).join(", ");
+}
+
+function buildSignalsSummary(rows: SignalRow[], startMs: number, endMs: number) {
+  let rawCount = 0;
+  const dedupEntries = new Map<string, { symbol: string; kind: string }>();
+
+  for (const row of rows) {
+    const ms = parseSignalTsMs(row);
+    if (!ms) continue;
+    if (ms < startMs || ms > endMs) continue;
+    rawCount += 1;
+
+    const symbol = String(row.symbol || "").trim();
+    const kind = String(row.kind || row.type || "").trim();
+    if (!symbol || !kind) continue;
+
+    const tsKey = typeof row.ts_utc === "string" && row.ts_utc.trim()
+      ? row.ts_utc.trim()
+      : new Date(ms).toISOString();
+    const key = `${symbol}|${kind}|${tsKey}`;
+    if (dedupEntries.has(key)) continue;
+    dedupEntries.set(key, { symbol, kind });
+  }
+
+  const symbolCounts = new Map<string, number>();
+  const kindCounts = new Map<string, number>();
+  for (const entry of dedupEntries.values()) {
+    symbolCounts.set(entry.symbol, (symbolCounts.get(entry.symbol) || 0) + 1);
+    kindCounts.set(entry.kind, (kindCounts.get(entry.kind) || 0) + 1);
+  }
+
+  return {
+    rawCount,
+    dedupCount: dedupEntries.size,
+    topSymbols: topCounts(symbolCounts),
+    topKinds: topCounts(kindCounts),
+  };
+}
+
+async function getSignalsDigest(config: LoadedConfig | undefined, minutes: number) {
+  const root = resolveSignalsRoot(config);
+  if (!root) return { ok: false as const, error: "signals_root_missing" };
+
+  const now = new Date();
+  const endMs = now.getTime();
+  const startMs = endMs - minutes * 60 * 1000;
+  const nowMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+
+  const baseDir = path.join(root, "data/metrics");
+  if (!fs.existsSync(baseDir)) {
+    return { ok: false as const, error: "signals_dir_missing" };
+  }
+  const files = [
+    path.join(baseDir, `signals_${utcDateStamp(now)}.jsonl`),
+  ];
+  if (minutes > nowMinutes) {
+    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    files.push(path.join(baseDir, `signals_${utcDateStamp(yesterday)}.jsonl`));
+  }
+
+  const rows: SignalRow[] = [];
+  for (const f of files) {
+    const chunk = await readSignalsFile(f);
+    rows.push(...chunk);
+  }
+
+  return {
+    ok: true as const,
+    summary: buildSignalsSummary(rows, startMs, endMs),
+  };
+}
+
+function formatSignalsDigest(minutes: number, summary: ReturnType<typeof buildSignalsSummary>) {
+  return [
+    `🧾 过去 ${minutes}min 行为异常摘要`,
+    `- 总计：${summary.rawCount} 条（去重后 ${summary.dedupCount} 条）`,
+    `- Top：${formatTopList(summary.topSymbols)}`,
+    `- 类型：${formatTopList(summary.topKinds)}`,
+  ].join("\n");
+}
+
 async function runExplain(params: {
   storageDir: string;
   chatId: string;
@@ -673,8 +817,9 @@ async function handleParsedCommand(params: {
   isOwner: boolean;
   authState: ReturnType<typeof loadAuth>;
   send: SendFn;
+  config?: LoadedConfig;
 }) {
-  const { cmd, storageDir, chatId, userId, text, isOwner, authState, send } = params;
+  const { cmd, storageDir, chatId, userId, text, isOwner, authState, send, config } = params;
 
   // auth commands only owner
   if (cmd.kind.startsWith("auth_") && !isOwner) {
@@ -689,6 +834,7 @@ async function handleParsedCommand(params: {
     const out = [
       "/help",
       "/status",
+      "/signals [N]m",
       "/ask <q>",
       "/analyze <incident description>",
       "/suggest <incident description>",
@@ -699,6 +845,38 @@ async function handleParsedCommand(params: {
     ].join("\n");
     await send(chatId, out);
     appendLedger(storageDir, { ...baseAudit, cmd: "help" });
+    return;
+
+  } else if (cmd.kind === "signals") {
+    if (!cmd.minutes) {
+      await send(chatId, "Usage: /signals [N]m (default 60m)");
+      return;
+    }
+
+    try {
+      const digest = await getSignalsDigest(config, cmd.minutes);
+      if (!digest.ok) {
+        const msg = digest.error === "signals_dir_missing"
+          ? "signals data dir missing"
+          : "signals source not configured";
+        await send(chatId, msg);
+        return;
+      }
+
+      const out = formatSignalsDigest(cmd.minutes, digest.summary);
+      await send(chatId, out);
+      appendLedger(storageDir, {
+        ...baseAudit,
+        cmd: "signals",
+        minutes: cmd.minutes,
+        raw_count: digest.summary.rawCount,
+        dedup_count: digest.summary.dedupCount,
+        top_symbols: digest.summary.topSymbols,
+        top_kinds: digest.summary.topKinds,
+      });
+    } catch (e: any) {
+      await send(chatId, `signals read failed: ${String(e?.message || e)}`);
+    }
     return;
 
   } else if (cmd.kind === "ask") {
@@ -1007,5 +1185,6 @@ export async function handleMessage(opts: {
     isOwner,
     authState,
     send,
+    config,
   });
 }

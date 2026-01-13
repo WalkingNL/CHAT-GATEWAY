@@ -3,6 +3,7 @@ export type Cmd =
   | { kind: "analyze"; q: string }
   | { kind: "suggest"; q: string }
   | { kind: "status" }
+  | { kind: "signals"; minutes: number | null }
   | { kind: "help" }
   | { kind: "auth_add"; id: string }
   | { kind: "auth_del"; id: string }
@@ -15,10 +16,23 @@ function parseAfterCommand(t: string, cmd: string): string {
   return rest.trim();
 }
 
+function parseSignalMinutes(raw: string): number | null {
+  if (!raw) return 60;
+  const match = raw.match(/^(\d+)\s*m?$/i);
+  if (!match) return null;
+  const minutes = Number(match[1]);
+  if (!Number.isFinite(minutes) || minutes <= 0) return null;
+  return minutes;
+}
+
 export function parseCommand(text: string): Cmd {
   const t = (text || "").trim();
 
   if (t === "/status") return { kind: "status" };
+  if (t.startsWith("/signals")) {
+    const rest = parseAfterCommand(t, "/signals");
+    return { kind: "signals", minutes: parseSignalMinutes(rest) };
+  }
   if (t === "/help") return { kind: "help" };
 
   if (t.startsWith("/ask")) {
