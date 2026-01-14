@@ -115,6 +115,39 @@ export class FeishuWebhook {
     }
   }
 
+  private uploadImage(imagePath: string): string {
+    const token = this.getTenantToken();
+    const url = `${this.baseUrl}/im/v1/images`;
+    const args: string[] = ["-4", "-sS", "--connect-timeout", "5", "--max-time", "45", "-X", "POST"];
+    args.push("-H", `Authorization: Bearer ${token}`);
+    args.push("-F", "image_type=message");
+    args.push("-F", `image=@${imagePath}`);
+    args.push(url);
+
+    const out = execFileSync("curl", args, { encoding: "utf-8" });
+    const json = JSON.parse(out);
+    const key = json?.data?.image_key;
+    if (json?.code !== 0 || !key) {
+      throw new Error(`feishu uploadImage failed: ${JSON.stringify(json).slice(0, 200)}`);
+    }
+    return String(key);
+  }
+
+  async sendImage(chatId: string, imagePath: string) {
+    const imageKey = this.uploadImage(imagePath);
+    const token = this.getTenantToken();
+    const url = `${this.baseUrl}/im/v1/messages?receive_id_type=chat_id`;
+    const body = {
+      receive_id: chatId,
+      msg_type: "image",
+      content: JSON.stringify({ image_key: imageKey }),
+    };
+    const json = this.curlJson(url, "POST", body, { Authorization: `Bearer ${token}` });
+    if (json?.code !== 0) {
+      throw new Error(`feishu sendImage failed: ${JSON.stringify(json).slice(0, 200)}`);
+    }
+  }
+
   async handleEvent(body: any): Promise<FeishuEventResult> {
     if (!body || typeof body !== "object") return { kind: "ignore", reason: "invalid_body" };
     if (body.encrypt) return { kind: "ignore", reason: "encrypted_payload" };

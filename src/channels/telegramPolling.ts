@@ -48,6 +48,22 @@ export class TelegramPolling {
     }
   }
 
+  async sendPhoto(chatId: string, imagePath: string, caption?: string) {
+    const url = this.api("sendPhoto");
+    const args: string[] = ["-4", "-sS", "--connect-timeout", "5", "--max-time", "45", "-X", "POST"];
+    args.push("-F", `chat_id=${chatId}`);
+    if (caption) {
+      args.push("-F", `caption=${caption}`);
+    }
+    args.push("-F", `photo=@${imagePath}`);
+    args.push(url);
+    const out = execFileSync("curl", args, { encoding: "utf-8" });
+    const json = JSON.parse(out);
+    if (!json?.ok) {
+      throw new Error(`telegram sendPhoto failed: ${JSON.stringify(json).slice(0, 200)}`);
+    }
+  }
+
   async pollOnce(): Promise<TelegramMsg[]> {
     const url = this.api(`getUpdates?timeout=25&offset=${this.offset}`);
     const json = this.curlJson(url, "GET");
