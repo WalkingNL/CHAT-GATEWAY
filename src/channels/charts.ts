@@ -129,7 +129,7 @@ export function detectChartIntents(text: string, now = new Date()): ChartIntent[
 function chartsDir(): string {
   const env = String(process.env.CHART_OUTPUT_DIR || "").trim();
   if (env) return env;
-  return "/srv/crypto_agent/data/metrics/charts";
+  return "/srv/crypto_agent/data/metrics/on_demand";
 }
 
 function buildOutPath(kind: ChartKind, symbol?: string): string {
@@ -138,9 +138,27 @@ function buildOutPath(kind: ChartKind, symbol?: string): string {
   return path.join(chartsDir(), name);
 }
 
+function resolveAllowedOutPath(outPath: string): string {
+  const allowlistEnv = String(process.env.CHART_OUTPUT_ALLOWLIST || "").trim();
+  const allowlist = allowlistEnv
+    ? allowlistEnv.split(",").map(s => s.trim()).filter(Boolean)
+    : ["/srv/crypto_agent/data/metrics/on_demand"];
+
+  const normalized = path.resolve(outPath);
+  const ok = allowlist.some((allowed) => {
+    const base = path.resolve(allowed);
+    return normalized === base || normalized.startsWith(`${base}${path.sep}`);
+  });
+  if (!ok) {
+    throw new Error("chart output path not allowed");
+  }
+  return normalized;
+}
+
 export function renderChart(intent: ChartIntent): ChartRenderResult {
-  const outPath = buildOutPath(intent.kind, intent.symbol);
+  const outPath = resolveAllowedOutPath(buildOutPath(intent.kind, intent.symbol));
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  const python = "/srv/crypto_agent/venv/bin/python3";
 
   if (intent.kind === "factor_timeline") {
     if (!intent.symbol) {
@@ -148,13 +166,13 @@ export function renderChart(intent: ChartIntent): ChartRenderResult {
     }
     const hours = Number(intent.hours || 24);
     const script = "/srv/crypto_agent/tools/render_factor_timeline.py";
-    execFileSync("python3", [script, "--symbol", intent.symbol, "--hours", String(hours), "--out", outPath], {
+    execFileSync(python, [script, "--symbol", intent.symbol, "--hours", String(hours), "--out", outPath], {
       stdio: "pipe",
     });
   } else {
     const date = String(intent.date || formatUtcDate(new Date()));
     const script = "/srv/crypto_agent/tools/render_daily_activity_chart.py";
-    execFileSync("python3", [script, "--date", date, "--out", outPath], { stdio: "pipe" });
+    execFileSync(python, [script, "--date", date, "--out", outPath], { stdio: "pipe" });
   }
 
   if (!fs.existsSync(outPath)) {
