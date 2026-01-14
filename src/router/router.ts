@@ -17,8 +17,6 @@ import { writeExplainTrace, writeExplainFeedback } from "../audit/trace_writer.j
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
 const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
-const FEEDBACK_TOO_MANY = ["告警太多", "太多了", "一直在刷", "刷屏", "太吵", "好多告警"];
-const FEEDBACK_TOO_FEW = ["告警太少", "太安静", "没动静", "怎么没告警", "是不是坏了", "系统坏了"];
 
 function nowIso() {
   return new Date().toISOString();
@@ -109,11 +107,14 @@ async function buildExplainContext(rawAlert: string, config?: LoadedConfig) {
       })
     : { degraded: true, reason: "parse_failed" };
 
+  const signals = await getSignalsContext(config, 60, parsed?.symbol ?? null);
+
   return {
     project_id: projectId,
     alert_raw: rawAlert,
     parsed,
     facts,
+    signals,
   };
 }
 
@@ -174,7 +175,9 @@ function resolveSignalsRoot(config?: LoadedConfig): string | null {
 
 function parseSignalTsMs(row: SignalRow): number | null {
   const ts = row.ts_utc ?? row.ts ?? row.ts_ms ?? row.ts_iso;
-  if (typeof ts === "number") return ts;
+  if (typeof ts === "number") {
+    return ts < 1_000_000_000_000 ? ts * 1000 : ts;
+  }
   if (typeof ts === "string") {
     const ms = Date.parse(ts);
     return Number.isFinite(ms) ? ms : null;
@@ -211,7 +214,7 @@ function formatTopList(items: Array<[string, number]>): string {
   return items.map(([k, v]) => `${k}(${v})`).join(", ");
 }
 
-function buildSignalsSummary(rows: SignalRow[], startMs: number, endMs: number) {
+function buildSignalsSummary(rows: SignalRow[], startMs: number, endMs: number, symbol?: string | null) {
   let rawCount = 0;
   const dedupEntries = new Map<string, { symbol: string; kind: string }>();
 
@@ -221,16 +224,19 @@ function buildSignalsSummary(rows: SignalRow[], startMs: number, endMs: number) 
     if (ms < startMs || ms > endMs) continue;
     rawCount += 1;
 
-    const symbol = String(row.symbol || "").trim();
-    const kind = String(row.kind || row.type || "").trim();
-    if (!symbol || !kind) continue;
+    const symbolRaw = String(row.symbol || "").trim();
+    const kindRaw = String(row.kind || row.type || "").trim();
+    if (!symbolRaw || !kindRaw) continue;
+
+    const symbolKey = symbolRaw.toUpperCase();
+    const kindKey = kindRaw;
 
     const tsKey = typeof row.ts_utc === "string" && row.ts_utc.trim()
       ? row.ts_utc.trim()
       : new Date(ms).toISOString();
-    const key = `${symbol}|${kind}|${tsKey}`;
+    const key = `${symbolKey}|${kindKey}|${tsKey}`;
     if (dedupEntries.has(key)) continue;
-    dedupEntries.set(key, { symbol, kind });
+    dedupEntries.set(key, { symbol: symbolKey, kind: kindKey });
   }
 
   const symbolCounts = new Map<string, number>();
@@ -240,15 +246,19 @@ function buildSignalsSummary(rows: SignalRow[], startMs: number, endMs: number) 
     kindCounts.set(entry.kind, (kindCounts.get(entry.kind) || 0) + 1);
   }
 
+  const symbolKey = symbol ? String(symbol).trim().toUpperCase() : "";
+  const symbolCount = symbolKey ? (symbolCounts.get(symbolKey) || 0) : null;
+
   return {
     rawCount,
     dedupCount: dedupEntries.size,
+    symbolCount,
     topSymbols: topCounts(symbolCounts),
     topKinds: topCounts(kindCounts),
   };
 }
 
-async function getSignalsDigest(config: LoadedConfig | undefined, minutes: number) {
+async function readSignalsRows(config: LoadedConfig | undefined, minutes: number) {
   const root = resolveSignalsRoot(config);
   if (!root) return { ok: false as const, error: "signals_root_missing" };
 
@@ -275,9 +285,15 @@ async function getSignalsDigest(config: LoadedConfig | undefined, minutes: numbe
     rows.push(...chunk);
   }
 
+  return { ok: true as const, rows, startMs, endMs };
+}
+
+async function getSignalsDigest(config: LoadedConfig | undefined, minutes: number) {
+  const res = await readSignalsRows(config, minutes);
+  if (!res.ok) return res;
   return {
     ok: true as const,
-    summary: buildSignalsSummary(rows, startMs, endMs),
+    summary: buildSignalsSummary(res.rows, res.startMs, res.endMs),
   };
 }
 
@@ -287,6 +303,41 @@ function formatSignalsDigest(minutes: number, summary: ReturnType<typeof buildSi
     `- 总计：${summary.rawCount} 条（去重后 ${summary.dedupCount} 条）`,
     `- Top：${formatTopList(summary.topSymbols)}`,
     `- 类型：${formatTopList(summary.topKinds)}`,
+  ].join("\n");
+}
+
+type SignalsContext = {
+  ok: boolean;
+  minutes: number;
+  symbol?: string | null;
+  summary?: ReturnType<typeof buildSignalsSummary>;
+  error?: string;
+};
+
+async function getSignalsContext(
+  config: LoadedConfig | undefined,
+  minutes: number,
+  symbol?: string | null,
+): Promise<SignalsContext> {
+  const res = await readSignalsRows(config, minutes);
+  if (!res.ok) return { ok: false, minutes, symbol, error: res.error };
+  return {
+    ok: true,
+    minutes,
+    symbol,
+    summary: buildSignalsSummary(res.rows, res.startMs, res.endMs, symbol),
+  };
+}
+
+function formatSignalsContext(ctx?: SignalsContext | null): string {
+  if (!ctx || !ctx.ok || !ctx.summary) return "";
+  const symbolLabel = ctx.symbol ? String(ctx.symbol).toUpperCase() : "unknown";
+  const symbolCount = ctx.summary.symbolCount ?? 0;
+  return [
+    `📈 Signals ${ctx.minutes}m`,
+    `- ${symbolLabel}: ${symbolCount} 次`,
+    `- Top：${formatTopList(ctx.summary.topSymbols)}`,
+    `- 类型：${formatTopList(ctx.summary.topKinds)}`,
   ].join("\n");
 }
 
@@ -303,6 +354,7 @@ async function runExplain(params: {
   const { storageDir, chatId, userId, rawAlert, send, config, channel, taskIdPrefix } = params;
   const t0 = Date.now();
   const ctx = await buildExplainContext(rawAlert, config);
+  const signalsNote = formatSignalsContext(ctx.signals);
   const input = { alert_raw: rawAlert, parsed: ctx.parsed, facts: ctx.facts, mode: channel };
   const decision = routeExplain(input);
   const taskId = `${taskIdPrefix}_${chatId}_${Date.now()}`;
@@ -328,6 +380,9 @@ async function runExplain(params: {
     } else {
       ok = true;
       summary = String(res.summary || "");
+      if (signalsNote) {
+        summary = `${signalsNote}\n\n${summary}`;
+      }
       await send(chatId, summary);
     }
   } catch (e: any) {
@@ -490,6 +545,12 @@ function getOpsLimits(): OpsLimits {
     telegramSafeMax,
   );
   return { maxLinesDefault, maxLogChars, telegramSafeMax };
+}
+
+function getMaxWindowMinutes(): number {
+  const raw = Number(process.env.MAX_WINDOW_MINUTES || 1440);
+  if (!Number.isFinite(raw) || raw <= 0) return 1440;
+  return Math.floor(raw);
 }
 
 function clampLines(n: number, maxLinesDefault: number) {
@@ -851,7 +912,7 @@ async function handleParsedCommand(params: {
     const out = [
       "/help",
       "/status",
-      "/signals [N]m",
+      "/signals [N]m|[N]h",
       "/ask <q>",
       "/analyze <incident description>",
       "/suggest <incident description>",
@@ -865,8 +926,13 @@ async function handleParsedCommand(params: {
     return;
 
   } else if (cmd.kind === "signals") {
+    const maxWindow = getMaxWindowMinutes();
     if (!cmd.minutes) {
-      await send(chatId, "Usage: /signals [N]m (default 60m)");
+      await send(chatId, `Usage: /signals [N]m|[N]h (default 60m, max ${maxWindow}m)`);
+      return;
+    }
+    if (cmd.minutes > maxWindow) {
+      await send(chatId, `Window too large. Max ${maxWindow}m.`);
       return;
     }
 
@@ -1067,34 +1133,7 @@ export async function handleMessage(opts: {
     limiter,
   } = opts;
 
-  let textNorm = (text || "").trim();
-  // feedback command channel (works under Telegram privacy mode in groups)
-  if (textNorm.startsWith("/feedback")) {
-    textNorm = textNorm.replace(/^\/feedback\s*/i, "").trim();
-  }
-  const hitTooMany = FEEDBACK_TOO_MANY.some((k) => textNorm.includes(k));
-  const hitTooFew = FEEDBACK_TOO_FEW.some((k) => textNorm.includes(k));
-
-  if (hitTooMany || hitTooFew) {
-    await send(
-      chatId,
-      "已收到反馈。\n我会关注近期告警密度，并在不影响异常捕获的前提下做调整。"
-    );
-
-    appendLedger(storageDir, {
-      ts_utc: nowIso(),
-      channel,
-      chat_id: chatId,
-      user_id: userId,
-      kind: "alert_feedback",
-      feedback: hitTooMany ? "too_many" : "too_few",
-      raw: textNorm,
-    });
-
-    return;
-  }
-
-  const trimmedText = textNorm;
+  const trimmedText = (text || "").trim();
   const authState = loadAuth(storageDir, ownerChatId, channel);
   const resolvedOwnerUserId = String(ownerUserId || "");
   const isOwnerChat = chatId === ownerChatId;

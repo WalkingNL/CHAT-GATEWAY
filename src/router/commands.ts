@@ -16,13 +16,14 @@ function parseAfterCommand(t: string, cmd: string): string {
   return rest.trim();
 }
 
-function parseSignalMinutes(raw: string): number | null {
+function parseSignalWindow(raw: string): number | null {
   if (!raw) return 60;
-  const match = raw.match(/^(\d+)\s*m?$/i);
+  const match = raw.match(/^(\d+)\s*([mh])?$/i);
   if (!match) return null;
-  const minutes = Number(match[1]);
-  if (!Number.isFinite(minutes) || minutes <= 0) return null;
-  return minutes;
+  const n = Number(match[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const unit = String(match[2] || "m").toLowerCase();
+  return unit === "h" ? n * 60 : n;
 }
 
 export function parseCommand(text: string): Cmd {
@@ -31,7 +32,7 @@ export function parseCommand(text: string): Cmd {
   if (t === "/status") return { kind: "status" };
   if (t.startsWith("/signals")) {
     const rest = parseAfterCommand(t, "/signals");
-    return { kind: "signals", minutes: parseSignalMinutes(rest) };
+    return { kind: "signals", minutes: parseSignalWindow(rest) };
   }
   if (t === "/help") return { kind: "help" };
 

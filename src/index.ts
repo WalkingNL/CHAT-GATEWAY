@@ -3,7 +3,9 @@ import { loadConfig } from "./config/loadConfig.js";
 import { loadAllConfig } from "./config/index.js";
 import { listPaths } from "./explain/path_registry.js";
 import { registerDefaultPaths } from "./explain/paths/index.js";
+import { appendLedger } from "./audit/ledger.js";
 import { FeishuWebhook } from "./channels/feishuWebhook.js";
+import { detectFeedback, FEEDBACK_REPLY, updatePushPolicyTargets } from "./channels/feedback.js";
 import { TelegramPolling } from "./channels/telegramPolling.js";
 import { DeepSeekProvider } from "./providers/deepseek.js";
 import { RateLimiter } from "./rateLimit/limiter.js";
@@ -12,6 +14,45 @@ import { startInternalApi } from "./internal_api.js";
 
 process.on("uncaughtException", (e: any) => console.error("[uncaughtException]", e?.stack || e));
 process.on("unhandledRejection", (e: any) => console.error("[unhandledRejection]", e));
+
+async function handleFeedbackIfAny(params: {
+  storageDir: string;
+  channel: string;
+  chatId: string;
+  userId: string;
+  text: string;
+  send: (chatId: string, text: string) => Promise<void>;
+}): Promise<boolean> {
+  const { storageDir, channel, chatId, userId, text, send } = params;
+  const hit = detectFeedback(text);
+  if (!hit) return false;
+
+  let update: ReturnType<typeof updatePushPolicyTargets> | null = null;
+  let error: string | null = null;
+  try {
+    update = updatePushPolicyTargets(hit.kind);
+  } catch (e: any) {
+    error = String(e?.message || e);
+    console.error("[feedback][WARN] update failed:", error);
+  }
+
+  await send(chatId, FEEDBACK_REPLY);
+  appendLedger(storageDir, {
+    ts_utc: new Date().toISOString(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    kind: "alert_feedback",
+    feedback: hit.kind,
+    raw: hit.normalizedText,
+    policy_path: update?.path,
+    target_prev: update?.prevTarget,
+    target_next: update?.nextTarget,
+    error: error || undefined,
+  });
+
+  return true;
+}
 
 async function main() {
   const cfg = loadConfig("config.yaml");
@@ -104,6 +145,16 @@ async function main() {
             }
             if (res.kind === "message") {
               const m = res.msg;
+              if (await handleFeedbackIfAny({
+                storageDir,
+                channel: "feishu",
+                chatId: m.chatId,
+                userId: m.userId,
+                text: m.text,
+                send: feishu.sendMessage.bind(feishu),
+              })) {
+                return { body: { code: 0 } };
+              }
               void handleMessage({
                 storageDir,
                 channel: "feishu",
@@ -141,6 +192,16 @@ async function main() {
 
     for (const m of msgs) {
       try {
+        if (await handleFeedbackIfAny({
+          storageDir,
+          channel: "telegram",
+          chatId: m.chatId,
+          userId: m.userId,
+          text: m.text,
+          send: tg!.sendMessage.bind(tg),
+        })) {
+          continue;
+        }
         await handleMessage({
           storageDir,
           channel: "telegram",
