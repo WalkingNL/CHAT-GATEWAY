@@ -23,14 +23,19 @@ type PolicyState = {
     [key: string]: any;
   };
   history?: any;
+  history_events?: any[];
   [key: string]: any;
 };
 
 export type FeedbackUpdate = {
   path: string;
+  statsPath: string;
   prevTarget: number;
+  candidate: number;
   nextTarget: number;
   multiplier: number;
+  rate: number;
+  rateSource: string;
   clamp?: { min?: number; max?: number };
 };
 
@@ -62,6 +67,11 @@ function resolvePolicyStatePath(): string {
   return path.join(root, "data/metrics/push_policy_state.json");
 }
 
+function resolveStatsStatePath(): string {
+  const root = String(process.env.CRYPTO_AGENT_ROOT || "").trim() || "/srv/crypto_agent";
+  return path.join(root, "data/metrics/push_stats_state.json");
+}
+
 function safeParseJson(input: string): any | null {
   try {
     return JSON.parse(input);
@@ -76,7 +86,8 @@ function loadPolicyState(filePath: string): PolicyState {
       version: 1,
       updated_at_utc: new Date().toISOString(),
       targets: { alerts_per_hour_target: DEFAULT_ALERTS_PER_HOUR_TARGET },
-      history: [],
+      history: {},
+      history_events: [],
     };
   }
   const raw = safeParseJson(fs.readFileSync(filePath, "utf-8"));
@@ -85,8 +96,27 @@ function loadPolicyState(filePath: string): PolicyState {
     version: 1,
     updated_at_utc: new Date().toISOString(),
     targets: { alerts_per_hour_target: DEFAULT_ALERTS_PER_HOUR_TARGET },
-    history: [],
+    history: {},
+    history_events: [],
   };
+}
+
+function loadStatsRate(filePath: string): { rate: number; source: string } {
+  try {
+    if (!fs.existsSync(filePath)) return { rate: 0, source: "missing" };
+    const raw = safeParseJson(fs.readFileSync(filePath, "utf-8"));
+    if (!raw || typeof raw !== "object") return { rate: 0, source: "invalid" };
+
+    const ewma = Number((raw as any)?.rate?.alerts_per_hour_ewma);
+    if (Number.isFinite(ewma)) return { rate: ewma, source: "rate.alerts_per_hour_ewma" };
+
+    const now = Number((raw as any)?.alerts_per_hour_now ?? (raw as any)?.rate?.alerts_per_hour_now);
+    if (Number.isFinite(now)) return { rate: now, source: "alerts_per_hour_now" };
+
+    return { rate: 0, source: "missing_rate" };
+  } catch {
+    return { rate: 0, source: "error" };
+  }
 }
 
 function roundTarget(v: number): number {
@@ -116,19 +146,33 @@ function applyClamp(v: number, clamp: { min?: number; max?: number }): number {
   return out;
 }
 
+function writeJsonAtomic(filePath: string, payload: any) {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf-8");
+  fs.renameSync(tmp, filePath);
+}
+
 export function updatePushPolicyTargets(
   kind: FeedbackHit["kind"],
   ctx?: FeedbackUpdateContext,
 ): FeedbackUpdate {
   const filePath = resolvePolicyStatePath();
+  const statsPath = resolveStatsStatePath();
   const state = loadPolicyState(filePath);
 
   const targets = typeof state.targets === "object" && state.targets ? state.targets : {};
-  const prevTarget = Number(targets.alerts_per_hour_target ?? DEFAULT_ALERTS_PER_HOUR_TARGET);
+  const prevTargetRaw = Number(targets.alerts_per_hour_target ?? DEFAULT_ALERTS_PER_HOUR_TARGET);
+  const prevTarget = Number.isFinite(prevTargetRaw) ? prevTargetRaw : DEFAULT_ALERTS_PER_HOUR_TARGET;
+  const { rate, source: rateSource } = loadStatsRate(statsPath);
   const multiplier = kind === "too_many" ? 0.7 : 1.3;
   const clamp = resolveClamp(targets);
-  let nextTarget = roundTarget(prevTarget * multiplier);
-  nextTarget = applyClamp(nextTarget, clamp);
+  const candidate = kind === "too_many"
+    ? Math.min(prevTarget, rate * multiplier)
+    : Math.max(prevTarget, rate * multiplier);
+  let nextTarget = applyClamp(candidate, clamp);
+  nextTarget = roundTarget(nextTarget);
 
   targets.alerts_per_hour_target = nextTarget;
   state.targets = targets;
@@ -140,30 +184,38 @@ export function updatePushPolicyTargets(
     state.history && typeof state.history === "object" && !Array.isArray(state.history)
       ? state.history
       : {};
-  const events = Array.isArray(history.events)
-    ? history.events
-    : Array.isArray(state.history)
-      ? state.history
-      : [];
-  events.push({
+  const historyEvents = Array.isArray(state.history_events) ? state.history_events : [];
+  historyEvents.push({
     ts_utc: updatedAt,
     kind,
     prev_target: prevTarget,
+    candidate_target: candidate,
     next_target: nextTarget,
     multiplier,
+    rate,
+    rate_source: rateSource,
     clamp_min: clamp.min,
     clamp_max: clamp.max,
     source: "feedback",
   });
-  history.events = events;
   history.last_feedback = kind;
   history.last_reason = "feedback";
   history.last_updated_by = ctx?.updatedBy || "gateway";
   history.last_updated_at_utc = updatedAt;
   state.history = history;
+  state.history_events = historyEvents;
 
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(state, null, 2), "utf-8");
+  writeJsonAtomic(filePath, state);
 
-  return { path: filePath, prevTarget, nextTarget, multiplier, clamp };
+  return {
+    path: filePath,
+    statsPath,
+    prevTarget,
+    candidate,
+    nextTarget,
+    multiplier,
+    rate,
+    rateSource,
+    clamp,
+  };
 }
