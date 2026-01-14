@@ -67,3 +67,55 @@ rules:
       chat_type: group
     allow: []
     deny_message: "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"
+
+  # 4) Feishu owner DM
+  - name: feishu_owner_dm_all
+    match:
+      channel: feishu
+      chat_type: private
+      user_id: "NL"
+    allow:
+      - alerts.explain
+      - ops.status
+      - ops.logs
+      - ops.ps
+    require:
+      mention_bot_for_explain: false
+      reply_required_for_explain: false
+      mention_bot_for_ops: false
+    rate_limit:
+      rpm: 60
+    output_limits:
+      max_lines: 120
+      max_chars: 9000
+
+  # 5) Feishu group: owner allow (explain requires @ + reply)
+  - name: feishu_group_owner
+    match:
+      channel: feishu
+      chat_id: "oc_d69f1c419652e849c85e6d15cf467c2f"
+      chat_type: group
+      user_id: "NL"
+    allow:
+      - alerts.explain
+      - ops.status
+      - ops.logs
+      - ops.ps
+    require:
+      mention_bot_for_explain: true
+      reply_required_for_explain: true
+      mention_bot_for_ops: false
+    rate_limit:
+      rpm: 30
+    output_limits:
+      max_lines: 80
+      max_chars: 8000
+
+  # 6) Feishu group: non-owner deny (with message)
+  - name: feishu_group_non_owner_deny
+    match:
+      channel: feishu
+      chat_id: "oc_d69f1c419652e849c85e6d15cf467c2f"
+      chat_type: group
+    allow: []
+    deny_message: "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"
