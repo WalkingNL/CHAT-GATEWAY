@@ -135,7 +135,7 @@ async function handleChartIfAny(params: {
 
   const authState = loadAuth(storageDir, ownerChatId, "telegram");
   const isOwnerChat = chatId === ownerChatId;
-  const isOwnerUser = ownerUserId ? userId === ownerUserId : false;
+  const isOwnerUser = ownerUserId ? userId === ownerUserId : userId === ownerChatId;
   const allowed =
     allowlistMode === "owner_only"
       ? (isGroup ? isOwnerUser : isOwnerChat)
@@ -153,11 +153,15 @@ async function handleChartIfAny(params: {
       mention_bot: mentionsBot,
       has_reply: Boolean(replyText),
     });
+    if (!policyOk) return { allowed, res };
+    if (res.allowed) return { allowed: true, res };
     if (res.require?.mention_bot_for_ops && !mentionsBot) {
       return { allowed: false, silent: true, res };
     }
-    const isAllowed = policyOk ? res.allowed : allowed;
-    return { allowed: isAllowed, res };
+    if ((res.reason === "not_allowed" || !res.reason) && allowed) {
+      return { allowed: true, res };
+    }
+    return { allowed: false, res };
   };
 
   for (const intent of intents) {
@@ -170,7 +174,7 @@ async function handleChartIfAny(params: {
       if (!gate.silent) {
         await sendTelegramText(
           chatId,
-          gate.res?.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。",
+          gate.res?.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放。",
         );
       }
       return true;
