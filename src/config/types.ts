@@ -24,10 +24,14 @@ export type PolicyPrincipals = {
   owner?: {
     telegram_user_id?: string;
     telegram_owner_chat_id?: string;
+    feishu_user_id?: string;
+    feishu_owner_chat_id?: string;
   };
   allowlist?: {
     telegram_user_ids?: string[];
     telegram_chat_ids?: string[];
+    feishu_user_ids?: string[];
+    feishu_chat_ids?: string[];
   };
 };
 

@@ -9,6 +9,10 @@ export type InternalApiOpts = {
     token: string;
     storageDir: string;
     provider: LLMProvider;
+    feishu?: {
+        path: string;
+        handler: (body: any) => Promise<{ status?: number; body?: any } | void>;
+    };
 };
 
 async function readJson(req: http.IncomingMessage): Promise<any> {
@@ -87,6 +91,23 @@ export function startInternalApi(opts: InternalApiOpts) {
 
     const server = http.createServer(async (req, res) => {
         const url = new URL(req.url || "/", `http://${host}:${port}`);
+
+        if (opts.feishu && req.method === "POST" && url.pathname === opts.feishu.path) {
+            let body: any;
+            try {
+                body = await readJson(req);
+            } catch {
+                return badRequest(res, "invalid_json");
+            }
+
+            try {
+                const out = await opts.feishu.handler(body);
+                if (out?.status) res.statusCode = out.status;
+                return okJson(res, out?.body ?? { code: 0 });
+            } catch (e: any) {
+                return badRequest(res, `feishu_handler_failed:${String(e?.message || e)}`);
+            }
+        }
 
         // Auth (all endpoints)
         const auth = String(req.headers["authorization"] || "");

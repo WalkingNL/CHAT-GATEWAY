@@ -24,6 +24,13 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function taskPrefix(channel: string): string {
+  if (channel === "telegram") return "tg";
+  if (channel === "feishu") return "fs";
+  const clean = channel.replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "").toLowerCase();
+  return clean ? clean.slice(0, 12) : "chan";
+}
+
 function clip(s: string, n: number) {
   const t = String(s || "");
   return t.length <= n ? t : t.slice(0, n) + "…";
@@ -608,6 +615,7 @@ function renderLogs(name: string, lines: number, maxLinesDefault: number) {
 }
 
 async function handleOpsCommand(params: {
+  channel: string;
   cleanedText: string;
   config?: LoadedConfig;
   chatId: string;
@@ -619,6 +627,7 @@ async function handleOpsCommand(params: {
   send: SendFn;
 }): Promise<boolean> {
   const {
+    channel,
     cleanedText,
     config,
     chatId,
@@ -640,7 +649,7 @@ async function handleOpsCommand(params: {
   const chatType = isGroup ? "group" : "private";
   const policyOk = config?.meta?.policyOk === true;
   const evalOps = (capability: string) => evaluate(config, {
-    channel: "telegram",
+    channel,
     capability,
     chat_id: chatId,
     chat_type: chatType,
@@ -710,6 +719,8 @@ async function handleOpsCommand(params: {
 }
 
 async function handleGroupExplain(params: {
+  channel: string;
+  taskIdPrefix: string;
   storageDir: string;
   chatId: string;
   userId: string;
@@ -718,9 +729,9 @@ async function handleGroupExplain(params: {
   send: SendFn;
   config?: LoadedConfig;
 }) {
-  const { storageDir, chatId, userId, trimmedReplyText, mentionsBot, send, config } = params;
+  const { channel, taskIdPrefix, storageDir, chatId, userId, trimmedReplyText, mentionsBot, send, config } = params;
   const res = evaluate(config, {
-    channel: "telegram",
+    channel,
     capability: "alerts.explain",
     chat_id: chatId,
     chat_type: "group",
@@ -749,12 +760,14 @@ async function handleGroupExplain(params: {
     rawAlert: trimmedReplyText,
     send,
     config,
-    channel: "telegram",
-    taskIdPrefix: "tg_explain",
+    channel,
+    taskIdPrefix: `${taskIdPrefix}_explain`,
   });
 }
 
 async function handlePrivateMessage(params: {
+  channel: string;
+  taskIdPrefix: string;
   storageDir: string;
   chatId: string;
   userId: string;
@@ -765,6 +778,8 @@ async function handlePrivateMessage(params: {
   config?: LoadedConfig;
 }): Promise<boolean> {
   const {
+    channel,
+    taskIdPrefix,
     storageDir,
     chatId,
     userId,
@@ -799,8 +814,8 @@ async function handlePrivateMessage(params: {
       rawAlert,
       send,
       config,
-      channel: "telegram",
-      taskIdPrefix: "tg_explain",
+      channel,
+      taskIdPrefix: `${taskIdPrefix}_explain`,
     });
     return true;
   }
@@ -810,6 +825,8 @@ async function handlePrivateMessage(params: {
 
 async function handleParsedCommand(params: {
   cmd: ReturnType<typeof parseCommand>;
+  channel: string;
+  taskIdPrefix: string;
   storageDir: string;
   chatId: string;
   userId: string;
@@ -819,7 +836,7 @@ async function handleParsedCommand(params: {
   send: SendFn;
   config?: LoadedConfig;
 }) {
-  const { cmd, storageDir, chatId, userId, text, isOwner, authState, send, config } = params;
+  const { cmd, channel, taskIdPrefix, storageDir, chatId, userId, text, isOwner, authState, send, config } = params;
 
   // auth commands only owner
   if (cmd.kind.startsWith("auth_") && !isOwner) {
@@ -828,7 +845,7 @@ async function handleParsedCommand(params: {
   }
 
   const ts = nowIso();
-  const baseAudit = { ts_utc: ts, channel: "telegram", chat_id: chatId, user_id: userId, raw: text };
+  const baseAudit = { ts_utc: ts, channel, chat_id: chatId, user_id: userId, raw: text };
 
   if (cmd.kind === "help") {
     const out = [
@@ -882,6 +899,8 @@ async function handleParsedCommand(params: {
   } else if (cmd.kind === "ask") {
     await handleAskCommand({
       chatId,
+      channel,
+      taskIdPrefix,
       text: cmd.q,
       reply: (m) => send(chatId, m),
     });
@@ -895,7 +914,7 @@ async function handleParsedCommand(params: {
       return;
     }
 
-    const taskId = `tg_analyze_${chatId}_${Date.now()}`;
+    const taskId = `${taskIdPrefix}_analyze_${chatId}_${Date.now()}`;
 
     try {
       const res = await submitTask({
@@ -903,7 +922,7 @@ async function handleParsedCommand(params: {
         stage: "analyze",
         prompt,
         context: {
-          source: "telegram",
+          source: channel,
           chat_id: chatId,
           user_id: userId,
         },
@@ -930,7 +949,7 @@ async function handleParsedCommand(params: {
       return;
     }
 
-    const taskId = `tg_suggest_${chatId}_${Date.now()}`;
+    const taskId = `${taskIdPrefix}_suggest_${chatId}_${Date.now()}`;
 
     try {
       const res = await submitTask({
@@ -938,7 +957,7 @@ async function handleParsedCommand(params: {
         stage: "suggest",
         prompt,
         context: {
-          source: "telegram",
+          source: channel,
           chat_id: chatId,
           user_id: userId,
         },
@@ -993,7 +1012,7 @@ async function handleParsedCommand(params: {
 
   if (cmd.kind === "auth_add") {
     if (!authState.allowed.includes(cmd.id)) authState.allowed.push(cmd.id);
-    saveAuth(storageDir, authState);
+    saveAuth(storageDir, authState, channel);
     await send(chatId, `added ${cmd.id}`);
     appendLedger(storageDir, { ...baseAudit, cmd: "auth_add", target: cmd.id });
     return;
@@ -1001,7 +1020,7 @@ async function handleParsedCommand(params: {
 
   if (cmd.kind === "auth_del") {
     authState.allowed = authState.allowed.filter(x => x !== cmd.id);
-    saveAuth(storageDir, authState);
+    saveAuth(storageDir, authState, channel);
     await send(chatId, `deleted ${cmd.id}`);
     appendLedger(storageDir, { ...baseAudit, cmd: "auth_del", target: cmd.id });
     return;
@@ -1014,8 +1033,10 @@ async function handleParsedCommand(params: {
 
 export async function handleMessage(opts: {
   storageDir: string;
+  channel: string;
   ownerChatId: string;
-  // NOTE: ownerChatId is private chat_id; group owner gating must use OWNER_TELEGRAM_USER_ID
+  // NOTE: ownerChatId is private chat_id; group owner gating must use ownerUserId
+  ownerUserId?: string;
   allowlistMode: "owner_only" | "auth";
   config?: LoadedConfig;
   provider: LLMProvider;
@@ -1030,7 +1051,9 @@ export async function handleMessage(opts: {
 }) {
   const {
     storageDir,
+    channel,
     ownerChatId,
+    ownerUserId,
     allowlistMode,
     config,
     chatId,
@@ -1060,7 +1083,7 @@ export async function handleMessage(opts: {
 
     appendLedger(storageDir, {
       ts_utc: nowIso(),
-      channel: "telegram",
+      channel,
       chat_id: chatId,
       user_id: userId,
       kind: "alert_feedback",
@@ -1072,26 +1095,29 @@ export async function handleMessage(opts: {
   }
 
   const trimmedText = textNorm;
-  const authState = loadAuth(storageDir, ownerChatId);
-  const ownerUserId = String(process.env.OWNER_TELEGRAM_USER_ID || "");
+  const authState = loadAuth(storageDir, ownerChatId, channel);
+  const resolvedOwnerUserId = String(ownerUserId || "");
   const isOwnerChat = chatId === ownerChatId;
-  const isOwnerUser = ownerUserId ? userId === ownerUserId : false;
+  const isOwnerUser = resolvedOwnerUserId ? userId === resolvedOwnerUserId : false;
   const isOwner = isOwnerChat || isOwnerUser;
   const allowed =
     allowlistMode === "owner_only"
       ? (isGroup ? isOwnerUser : isOwnerChat)
       : authState.allowed.includes(chatId) || isOwnerUser;
 
-  const botUsername = String(process.env.TELEGRAM_BOT_USERNAME || "SoliaNLBot");
+  const botUsername = channel === "telegram"
+    ? String(process.env.TELEGRAM_BOT_USERNAME || "SoliaNLBot")
+    : "";
   const mentionToken = botUsername
     ? (botUsername.startsWith("@") ? botUsername : `@${botUsername}`)
     : "";
   const mentionPattern = mentionToken ? new RegExp(escapeRegExp(mentionToken), "gi") : null;
   // Strip @bot mention for command parsing in groups (e.g. "@SoliaNLBot /status")
   const cleanedText =
-    isGroup && mentionsBot && mentionPattern
+    channel === "telegram" && isGroup && mentionsBot && mentionPattern
       ? trimmedText.replace(mentionPattern, "").trim()
       : trimmedText;
+  const taskIdPrefix = taskPrefix(channel);
   const isCommand = cleanedText.startsWith("/");
 
   const trimmedReplyText = (replyText || "").trim();
@@ -1125,6 +1151,7 @@ export async function handleMessage(opts: {
   }
 
   const handledOps = await handleOpsCommand({
+    channel,
     cleanedText,
     config,
     chatId,
@@ -1147,6 +1174,8 @@ export async function handleMessage(opts: {
       // fall through to command parsing/dispatch below
     } else {
       await handleGroupExplain({
+        channel,
+        taskIdPrefix,
         storageDir,
         chatId,
         userId,
@@ -1163,6 +1192,8 @@ export async function handleMessage(opts: {
 
   if (!isGroup) {
     const handledPrivate = await handlePrivateMessage({
+      channel,
+      taskIdPrefix,
       storageDir,
       chatId,
       userId,
@@ -1178,6 +1209,8 @@ export async function handleMessage(opts: {
   const cmd = parseCommand(cleanedText);
   await handleParsedCommand({
     cmd,
+    channel,
+    taskIdPrefix,
     storageDir,
     chatId,
     userId,

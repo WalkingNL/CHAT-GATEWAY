@@ -65,6 +65,8 @@ import { submitTask } from "../internal_client";
 
 export async function handleAskCommand(ctx: {
   chatId: number | string;
+  channel: string;
+  taskIdPrefix: string;
   text: string;
   reply: (msg: string) => Promise<void>;
 }) {
@@ -74,7 +76,7 @@ export async function handleAskCommand(ctx: {
     return;
   }
 
-  const taskId = `tg_ask_${Date.now()}`;
+  const taskId = `${ctx.taskIdPrefix}_ask_${Date.now()}`;
 
   await ctx.reply("🧠 Thinking…");
 
@@ -84,7 +86,7 @@ export async function handleAskCommand(ctx: {
       stage: "analyze",
       prompt: question,
       context: {
-        source: "telegram",
+        source: ctx.channel,
         chat_id: ctx.chatId,
       },
     });

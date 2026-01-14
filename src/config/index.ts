@@ -79,10 +79,14 @@ export function defaultPolicy(): PolicyConfig {
       owner: {
         telegram_user_id: "",
         telegram_owner_chat_id: "",
+        feishu_user_id: "",
+        feishu_owner_chat_id: "",
       },
       allowlist: {
         telegram_user_ids: [],
         telegram_chat_ids: [],
+        feishu_user_ids: [],
+        feishu_chat_ids: [],
       },
     },
     capabilities: ["alerts.explain", "ops.help"],
@@ -98,6 +102,20 @@ export function defaultPolicy(): PolicyConfig {
           channel: "telegram",
           chat_type: "private",
           user_id: "${principals.owner.telegram_user_id}",
+        },
+        allow: ["alerts.explain", "ops.help"],
+        require: {
+          mention_bot_for_explain: false,
+          reply_required_for_explain: false,
+          mention_bot_for_ops: false,
+        },
+      },
+      {
+        name: "owner_dm_fallback_feishu",
+        match: {
+          channel: "feishu",
+          chat_type: "private",
+          user_id: "${principals.owner.feishu_user_id}",
         },
         allow: ["alerts.explain", "ops.help"],
         require: {
