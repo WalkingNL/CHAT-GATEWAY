@@ -30,7 +30,7 @@ async function handleFeedbackIfAny(params: {
   let update: ReturnType<typeof updatePushPolicyTargets> | null = null;
   let error: string | null = null;
   try {
-    update = updatePushPolicyTargets(hit.kind);
+    update = updatePushPolicyTargets(hit.kind, { updatedBy: `${channel}:${userId}` });
   } catch (e: any) {
     error = String(e?.message || e);
     console.error("[feedback][WARN] update failed:", error);

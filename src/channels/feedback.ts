@@ -18,9 +18,11 @@ type PolicyState = {
   updated_at_utc?: string;
   targets?: {
     alerts_per_hour_target?: number;
+    alerts_per_hour_min?: number;
+    alerts_per_hour_max?: number;
     [key: string]: any;
   };
-  history?: any[];
+  history?: any;
   [key: string]: any;
 };
 
@@ -29,6 +31,11 @@ export type FeedbackUpdate = {
   prevTarget: number;
   nextTarget: number;
   multiplier: number;
+  clamp?: { min?: number; max?: number };
+};
+
+type FeedbackUpdateContext = {
+  updatedBy?: string;
 };
 
 export function detectFeedback(rawText: string): FeedbackHit | null {
@@ -87,33 +94,76 @@ function roundTarget(v: number): number {
   return Math.max(1, Number(v.toFixed(2)));
 }
 
-export function updatePushPolicyTargets(kind: FeedbackHit["kind"]): FeedbackUpdate {
+function parseLimit(v: any): number | null {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+function resolveClamp(targets: Record<string, any>) {
+  const min = parseLimit(targets.alerts_per_hour_min ?? process.env.ALERTS_PER_HOUR_MIN);
+  const max = parseLimit(targets.alerts_per_hour_max ?? process.env.ALERTS_PER_HOUR_MAX);
+  const clamp: { min?: number; max?: number } = {};
+  if (min !== null) clamp.min = min;
+  if (max !== null) clamp.max = max;
+  return clamp;
+}
+
+function applyClamp(v: number, clamp: { min?: number; max?: number }): number {
+  let out = v;
+  if (typeof clamp.min === "number") out = Math.max(clamp.min, out);
+  if (typeof clamp.max === "number") out = Math.min(clamp.max, out);
+  return out;
+}
+
+export function updatePushPolicyTargets(
+  kind: FeedbackHit["kind"],
+  ctx?: FeedbackUpdateContext,
+): FeedbackUpdate {
   const filePath = resolvePolicyStatePath();
   const state = loadPolicyState(filePath);
 
   const targets = typeof state.targets === "object" && state.targets ? state.targets : {};
   const prevTarget = Number(targets.alerts_per_hour_target ?? DEFAULT_ALERTS_PER_HOUR_TARGET);
   const multiplier = kind === "too_many" ? 0.7 : 1.3;
-  const nextTarget = roundTarget(prevTarget * multiplier);
+  const clamp = resolveClamp(targets);
+  let nextTarget = roundTarget(prevTarget * multiplier);
+  nextTarget = applyClamp(nextTarget, clamp);
 
   targets.alerts_per_hour_target = nextTarget;
   state.targets = targets;
-  state.updated_at_utc = new Date().toISOString();
+  const updatedAt = new Date().toISOString();
+  state.updated_at_utc = updatedAt;
   state.version = state.version ?? 1;
 
-  const history = Array.isArray(state.history) ? state.history : [];
-  history.push({
-    ts_utc: state.updated_at_utc,
+  const history =
+    state.history && typeof state.history === "object" && !Array.isArray(state.history)
+      ? state.history
+      : {};
+  const events = Array.isArray(history.events)
+    ? history.events
+    : Array.isArray(state.history)
+      ? state.history
+      : [];
+  events.push({
+    ts_utc: updatedAt,
     kind,
     prev_target: prevTarget,
     next_target: nextTarget,
     multiplier,
+    clamp_min: clamp.min,
+    clamp_max: clamp.max,
     source: "feedback",
   });
+  history.events = events;
+  history.last_feedback = kind;
+  history.last_reason = "feedback";
+  history.last_updated_by = ctx?.updatedBy || "gateway";
+  history.last_updated_at_utc = updatedAt;
   state.history = history;
 
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(state, null, 2), "utf-8");
 
-  return { path: filePath, prevTarget, nextTarget, multiplier };
+  return { path: filePath, prevTarget, nextTarget, multiplier, clamp };
 }
