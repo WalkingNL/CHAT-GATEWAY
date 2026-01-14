@@ -96,10 +96,42 @@ async function handleChartIfAny(params: {
   } = params;
 
   const trimmed = String(text || "").trim();
-  if (!trimmed || trimmed.startsWith("/")) return false;
+  if (!trimmed) return false;
 
-  const intents = detectChartIntents(trimmed);
-  if (!intents.length) return false;
+  const lower = trimmed.toLowerCase();
+  const commandToken = "/chart";
+  let chartQuery: string | null = null;
+  let usedCommand = false;
+
+  if (lower.startsWith(commandToken)) {
+    chartQuery = trimmed.slice(commandToken.length).trim();
+    usedCommand = true;
+  } else if (mentionsBot && lower.includes(commandToken)) {
+    const idx = lower.indexOf(commandToken);
+    chartQuery = trimmed.slice(idx + commandToken.length).trim();
+    usedCommand = true;
+  } else if (!isGroup) {
+    chartQuery = trimmed;
+  } else {
+    return false;
+  }
+
+  if (!chartQuery) {
+    if (usedCommand) {
+      await sendTelegramText(chatId, "Usage: /chart <symbol> <factor|daily activity> <time window>");
+      return true;
+    }
+    return false;
+  }
+
+  const intents = detectChartIntents(chartQuery);
+  if (!intents.length) {
+    if (usedCommand) {
+      await sendTelegramText(chatId, "未识别图表类型。示例：/chart BTC factor timeline 24h");
+      return true;
+    }
+    return false;
+  }
 
   const authState = loadAuth(storageDir, ownerChatId, "telegram");
   const isOwnerChat = chatId === ownerChatId;
