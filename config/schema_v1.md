@@ -120,8 +120,12 @@ Purpose: define who can do what (capabilities) where (channel/chat/user), with g
 Minimal v1 fields:
 - `owner.telegram_user_id`: owner user id for group gating (`from.id`).
 - `owner.telegram_owner_chat_id`: owner private chat id (optional).
+- `owner.feishu_user_id`: owner user id for group gating.
+- `owner.feishu_owner_chat_id`: owner private chat id (optional).
 - `allowlist.telegram_user_ids`: future expansion.
 - `allowlist.telegram_chat_ids`: future expansion.
+- `allowlist.feishu_user_ids`: future expansion.
+- `allowlist.feishu_chat_ids`: future expansion.
 
 ### capabilities
 
@@ -151,7 +155,7 @@ Each rule:
 | deny_message | no | Message on deny. |
 
 `match` supports (v1):
-- `channel`: `telegram`
+- `channel`: `telegram` | `feishu`
 - `chat_id`: string
 - `chat_type`: `private` | `group` | `supergroup`
 - `user_id`: string

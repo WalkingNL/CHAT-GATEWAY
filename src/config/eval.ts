@@ -1,7 +1,7 @@
 import type { LoadedConfig } from "./types.js";
 
 type EvalInput = {
-  channel: "telegram";
+  channel: string;
   capability: "alerts.explain" | "ops.help" | string;
   chat_id: string;
   chat_type: "private" | "group" | "supergroup";
@@ -16,6 +16,7 @@ type EvalResult = {
   require?: {
     mention_bot_for_explain?: boolean;
     reply_required_for_explain?: boolean;
+    mention_bot_for_ops?: boolean;
   };
   limits?: {
     rpm?: number;

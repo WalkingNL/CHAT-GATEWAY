@@ -1,6 +1,7 @@
 gateway:
   owner:
     telegram_chat_id: 1864053991
+    feishu_chat_id: "oc_d69f1c419652e849c85e6d15cf467c2f"
   storage:
     dir: "./data"
   memory:
@@ -24,3 +25,13 @@ channels:
     bot_token_env: "TELEGRAM_BOT_TOKEN"
     allowlist_mode: "auth"     # owner_only | auth
     poll_interval_ms: 1500
+  feishu:
+    enabled: true
+    app_id_env: "FEISHU_APP_ID"
+    app_secret_env: "FEISHU_APP_SECRET"
+    verification_token_env: "FEISHU_VERIFICATION_TOKEN"
+    bot_user_id_env: "FEISHU_BOT_USER_ID"
+    bot_open_id_env: "FEISHU_BOT_OPEN_ID"
+    bot_name_env: "FEISHU_BOT_NAME"
+    event_path: "/feishu/events"
+    allowlist_mode: "auth"     # owner_only | auth

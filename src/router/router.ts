@@ -12,11 +12,21 @@ import { submitTask } from "../internal_client.js";
 import { evaluate } from "../config/index.js";
 import type { LoadedConfig } from "../config/types.js";
 import { parseAlertText, LocalFsFactsProvider } from "../facts/index.js";
+import { routeExplain } from "../explain/router_v1.js";
+import { writeExplainTrace, writeExplainFeedback } from "../audit/trace_writer.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
+const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function taskPrefix(channel: string): string {
+  if (channel === "telegram") return "tg";
+  if (channel === "feishu") return "fs";
+  const clean = channel.replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "").toLowerCase();
+  return clean ? clean.slice(0, 12) : "chan";
 }
 
 function clip(s: string, n: number) {
@@ -44,6 +54,22 @@ function resolveProjectId(config?: LoadedConfig): string | null {
   }
   const ids = Object.keys(projects);
   return ids.length ? ids[0] : null;
+}
+
+function getProject(config?: LoadedConfig) {
+  const projectId = resolveProjectId(config);
+  if (!projectId) return null;
+  const proj = (config?.projects || {})[projectId];
+  if (!proj) return null;
+  return { projectId, proj };
+}
+
+function getPm2Names(config: LoadedConfig | undefined, resourceKey: "pm2_logs" | "pm2_ps"): string[] {
+  const p = getProject(config);
+  if (!p) return [];
+  const res: any = (p.proj as any)?.resources?.[resourceKey];
+  const names = Array.isArray(res?.names) ? res.names : [];
+  return names.map((n: any) => String(n)).filter(Boolean);
 }
 
 async function collectFacts(params: {
@@ -81,12 +107,321 @@ async function buildExplainContext(rawAlert: string, config?: LoadedConfig) {
       })
     : { degraded: true, reason: "parse_failed" };
 
+  const signals = await getSignalsContext(config, 60, parsed?.symbol ?? null);
+
   return {
     project_id: projectId,
     alert_raw: rawAlert,
     parsed,
     facts,
+    signals,
   };
+}
+
+function bucketFactor(v?: number | null): string | null {
+  if (typeof v !== "number") return null;
+  if (v < 2) return "<2";
+  if (v < 5) return "2-5";
+  if (v < 10) return "5-10";
+  return ">=10";
+}
+
+function bucketChangePct(v?: number | null): string | null {
+  if (typeof v !== "number") return null;
+  const a = Math.abs(v);
+  if (a < 0.5) return "<0.5";
+  if (a < 1) return "0.5-1";
+  if (a < 3) return "1-3";
+  if (a < 5) return "3-5";
+  return ">=5";
+}
+
+function summarizeFacts(facts: any) {
+  const top1h = facts?.window_1h?.top3 || [];
+  const top24h = facts?.window_24h?.top3 || [];
+  const recent = facts?.symbol_recent?.items;
+  return {
+    top3_1h: Array.isArray(top1h) ? top1h : [],
+    top3_24h: Array.isArray(top24h) ? top24h : [],
+    symbol_recent_count: Array.isArray(recent) ? recent.length : 0,
+  };
+}
+
+type SignalRow = {
+  ts_utc?: string;
+  ts?: number | string;
+  ts_ms?: number;
+  ts_iso?: string;
+  symbol?: string;
+  kind?: string;
+  type?: string;
+};
+
+function utcDateStamp(d: Date): string {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function resolveSignalsRoot(config?: LoadedConfig): string | null {
+  const proj = (config?.projects || {}).crypto_agent as any;
+  const root = typeof proj?.root === "string" ? proj.root.trim() : "";
+  if (root) return root;
+  const env = String(process.env.CRYPTO_AGENT_ROOT || "").trim();
+  if (env) return env;
+  return "/srv/crypto_agent";
+}
+
+function parseSignalTsMs(row: SignalRow): number | null {
+  const ts = row.ts_utc ?? row.ts ?? row.ts_ms ?? row.ts_iso;
+  if (typeof ts === "number") {
+    return ts < 1_000_000_000_000 ? ts * 1000 : ts;
+  }
+  if (typeof ts === "string") {
+    const ms = Date.parse(ts);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
+}
+
+async function readSignalsFile(filePath: string): Promise<SignalRow[]> {
+  try {
+    const content = await fs.promises.readFile(filePath, "utf-8");
+    const rows: SignalRow[] = [];
+    for (const line of content.split("\n")) {
+      const s = line.trim();
+      if (!s) continue;
+      try {
+        rows.push(JSON.parse(s));
+      } catch {
+        // ignore malformed lines
+      }
+    }
+    return rows;
+  } catch (e: any) {
+    if (e?.code === "ENOENT") return [];
+    throw e;
+  }
+}
+
+function topCounts(counts: Map<string, number>, n = 3): Array<[string, number]> {
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, n);
+}
+
+function formatTopList(items: Array<[string, number]>): string {
+  if (!items.length) return "无";
+  return items.map(([k, v]) => `${k}(${v})`).join(", ");
+}
+
+function buildSignalsSummary(rows: SignalRow[], startMs: number, endMs: number, symbol?: string | null) {
+  let rawCount = 0;
+  const dedupEntries = new Map<string, { symbol: string; kind: string }>();
+
+  for (const row of rows) {
+    const ms = parseSignalTsMs(row);
+    if (!ms) continue;
+    if (ms < startMs || ms > endMs) continue;
+    rawCount += 1;
+
+    const symbolRaw = String(row.symbol || "").trim();
+    const kindRaw = String(row.kind || row.type || "").trim();
+    if (!symbolRaw || !kindRaw) continue;
+
+    const symbolKey = symbolRaw.toUpperCase();
+    const kindKey = kindRaw;
+
+    const tsKey = typeof row.ts_utc === "string" && row.ts_utc.trim()
+      ? row.ts_utc.trim()
+      : new Date(ms).toISOString();
+    const key = `${symbolKey}|${kindKey}|${tsKey}`;
+    if (dedupEntries.has(key)) continue;
+    dedupEntries.set(key, { symbol: symbolKey, kind: kindKey });
+  }
+
+  const symbolCounts = new Map<string, number>();
+  const kindCounts = new Map<string, number>();
+  for (const entry of dedupEntries.values()) {
+    symbolCounts.set(entry.symbol, (symbolCounts.get(entry.symbol) || 0) + 1);
+    kindCounts.set(entry.kind, (kindCounts.get(entry.kind) || 0) + 1);
+  }
+
+  const symbolKey = symbol ? String(symbol).trim().toUpperCase() : "";
+  const symbolCount = symbolKey ? (symbolCounts.get(symbolKey) || 0) : null;
+
+  return {
+    rawCount,
+    dedupCount: dedupEntries.size,
+    symbolCount,
+    topSymbols: topCounts(symbolCounts),
+    topKinds: topCounts(kindCounts),
+  };
+}
+
+async function readSignalsRows(config: LoadedConfig | undefined, minutes: number) {
+  const root = resolveSignalsRoot(config);
+  if (!root) return { ok: false as const, error: "signals_root_missing" };
+
+  const now = new Date();
+  const endMs = now.getTime();
+  const startMs = endMs - minutes * 60 * 1000;
+  const nowMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+
+  const baseDir = path.join(root, "data/metrics");
+  if (!fs.existsSync(baseDir)) {
+    return { ok: false as const, error: "signals_dir_missing" };
+  }
+  const files = [
+    path.join(baseDir, `signals_${utcDateStamp(now)}.jsonl`),
+  ];
+  if (minutes > nowMinutes) {
+    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    files.push(path.join(baseDir, `signals_${utcDateStamp(yesterday)}.jsonl`));
+  }
+
+  const rows: SignalRow[] = [];
+  for (const f of files) {
+    const chunk = await readSignalsFile(f);
+    rows.push(...chunk);
+  }
+
+  return { ok: true as const, rows, startMs, endMs };
+}
+
+async function getSignalsDigest(config: LoadedConfig | undefined, minutes: number) {
+  const res = await readSignalsRows(config, minutes);
+  if (!res.ok) return res;
+  return {
+    ok: true as const,
+    summary: buildSignalsSummary(res.rows, res.startMs, res.endMs),
+  };
+}
+
+function formatSignalsDigest(minutes: number, summary: ReturnType<typeof buildSignalsSummary>) {
+  return [
+    `🧾 过去 ${minutes}min 行为异常摘要`,
+    `- 总计：${summary.rawCount} 条（去重后 ${summary.dedupCount} 条）`,
+    `- Top：${formatTopList(summary.topSymbols)}`,
+    `- 类型：${formatTopList(summary.topKinds)}`,
+  ].join("\n");
+}
+
+type SignalsContext = {
+  ok: boolean;
+  minutes: number;
+  symbol?: string | null;
+  summary?: ReturnType<typeof buildSignalsSummary>;
+  error?: string;
+};
+
+async function getSignalsContext(
+  config: LoadedConfig | undefined,
+  minutes: number,
+  symbol?: string | null,
+): Promise<SignalsContext> {
+  const res = await readSignalsRows(config, minutes);
+  if (!res.ok) return { ok: false, minutes, symbol, error: res.error };
+  return {
+    ok: true,
+    minutes,
+    symbol,
+    summary: buildSignalsSummary(res.rows, res.startMs, res.endMs, symbol),
+  };
+}
+
+function formatSignalsContext(ctx?: SignalsContext | null): string {
+  if (!ctx || !ctx.ok || !ctx.summary) return "";
+  const symbolLabel = ctx.symbol ? String(ctx.symbol).toUpperCase() : "unknown";
+  const symbolCount = ctx.summary.symbolCount ?? 0;
+  return [
+    `📈 Signals ${ctx.minutes}m`,
+    `- ${symbolLabel}: ${symbolCount} 次`,
+    `- Top：${formatTopList(ctx.summary.topSymbols)}`,
+    `- 类型：${formatTopList(ctx.summary.topKinds)}`,
+  ].join("\n");
+}
+
+async function runExplain(params: {
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  rawAlert: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  config?: LoadedConfig;
+  channel: string;
+  taskIdPrefix: string;
+}) {
+  const { storageDir, chatId, userId, rawAlert, send, config, channel, taskIdPrefix } = params;
+  const t0 = Date.now();
+  const ctx = await buildExplainContext(rawAlert, config);
+  const signalsNote = formatSignalsContext(ctx.signals);
+  const input = { alert_raw: rawAlert, parsed: ctx.parsed, facts: ctx.facts, mode: channel };
+  const decision = routeExplain(input);
+  const taskId = `${taskIdPrefix}_${chatId}_${Date.now()}`;
+
+  let summary = "";
+  let ok = false;
+  let errCode = "";
+  let latencyMs = 0;
+
+  try {
+    const res = await submitTask({
+      task_id: taskId,
+      stage: "analyze",
+      prompt: decision.prompt,
+      context: { ...ctx, router: { selected_paths: decision.selected_paths } },
+    });
+
+    latencyMs = Number(res?.latency_ms || Date.now() - t0);
+
+    if (!res?.ok) {
+      errCode = res?.error || "unknown";
+      await send(chatId, `解释失败：${errCode}`);
+    } else {
+      ok = true;
+      summary = String(res.summary || "");
+      if (signalsNote) {
+        summary = `${signalsNote}\n\n${summary}`;
+      }
+      await send(chatId, summary);
+    }
+  } catch (e: any) {
+    latencyMs = Date.now() - t0;
+    errCode = String(e?.message || e);
+    await send(chatId, `解释异常：${errCode}`);
+  }
+
+  const parsed = ctx.parsed;
+  const trace = {
+    ts_utc: new Date().toISOString(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    project_id: ctx.project_id,
+    alert_features: {
+      symbol: parsed?.symbol ?? null,
+      priority: parsed?.priority ?? null,
+      factor_bucket: bucketFactor(parsed?.factor),
+      change_pct_bucket: bucketChangePct(parsed?.change_pct),
+    },
+    facts_summary: summarizeFacts(ctx.facts),
+    router: { selected_paths: decision.selected_paths },
+    llm: {
+      provider: "internal_api",
+      model: "unknown",
+      latency_ms: latencyMs,
+      ok,
+      err_code: ok ? undefined : errCode || "unknown",
+    },
+    output_meta: {
+      chars: summary.length,
+      truncated: false,
+    },
+    trace_id: taskId,
+  };
+
+  writeExplainTrace(storageDir, trace);
+  lastExplainByChatId.set(chatId, { ts: Date.now(), trace_id: taskId });
 }
 
 function formatAnalyzeReply(out: string): string {
@@ -105,6 +440,8 @@ type SuggestObj = {
   verify_cmds?: string[];
   warnings?: string[];
 };
+
+type SendFn = (chatId: string, text: string) => Promise<void>;
 
 function summarizePatch(patch: string): string {
   const p = String(patch || "").trim();
@@ -194,112 +531,58 @@ function buildSuggestMessages(q: string): ChatMessage[] {
   ];
 }
 
-export async function handleMessage(opts: {
-  storageDir: string;
-  ownerChatId: string;
-  // NOTE: ownerChatId is private chat_id; group owner gating must use OWNER_TELEGRAM_USER_ID
-  allowlistMode: "owner_only" | "auth";
-  config?: LoadedConfig;
-  provider: LLMProvider;
-  limiter: RateLimiter;
-  chatId: string;
-  userId: string;
-  text: string;
-  replyText?: string;
-  isGroup?: boolean;
-  mentionsBot?: boolean;
-  send: (chatId: string, text: string) => Promise<void>;
-}) {
-  const {
-    storageDir,
-    ownerChatId,
-    allowlistMode,
-    config,
-    chatId,
-    userId,
-    text,
-    replyText = "",
-    isGroup = false,
-    mentionsBot = false,
-    send,
-    provider,
-    limiter,
-  } = opts;
+type OpsLimits = {
+  maxLinesDefault: number;
+  maxLogChars: number;
+  telegramSafeMax: number;
+};
 
-  const trimmedText = (text || "").trim();
-  const authState = loadAuth(storageDir, ownerChatId);
-  const ownerUserId = String(process.env.OWNER_TELEGRAM_USER_ID || "");
-  const isOwnerChat = chatId === ownerChatId;
-  const isOwnerUser = ownerUserId ? userId === ownerUserId : false;
-  const isOwner = isOwnerChat || isOwnerUser;
-  const allowed =
-    allowlistMode === "owner_only"
-      ? (isGroup ? isOwnerUser : isOwnerChat)
-      : authState.allowed.includes(chatId) || isOwnerUser;
-
-  const botUsername = String(process.env.TELEGRAM_BOT_USERNAME || "SoliaNLBot");
-  const mentionToken = botUsername
-    ? (botUsername.startsWith("@") ? botUsername : `@${botUsername}`)
-    : "";
-  const mentionPattern = mentionToken ? new RegExp(escapeRegExp(mentionToken), "gi") : null;
-  // Strip @bot mention for command parsing in groups (e.g. "@SoliaNLBot /status")
-  const cleanedText =
-    isGroup && mentionsBot && mentionPattern
-      ? trimmedText.replace(mentionPattern, "").trim()
-      : trimmedText;
-  const isCommand = cleanedText.startsWith("/");
-
-  const trimmedReplyText = (replyText || "").trim();
-
-  // allow "/whoami" in both private and group (group may include mention)
-  const isWhoami =
-    cleanedText === "/whoami" ||
-    cleanedText.endsWith(" /whoami") ||
-    cleanedText.includes("/whoami");
-
-  if (isWhoami) {
-    await send(chatId, `chatId=${chatId}\nuserId=${userId}\nisGroup=${isGroup}`);
-    return;
-  }
-
-  // -------------------------------
-  // C1: ops commands (facts-only)
-  // /status, /ps, /logs <pm2_name> [lines]
-  // -------------------------------
-  const MAX_LINES_DEFAULT = Number(process.env.GW_MAX_LOG_LINES || 200);
-  const TELEGRAM_SAFE_MAX = 3500;
-  const MAX_LOG_CHARS = Math.min(
-    Number(process.env.GW_MAX_LOG_CHARS || TELEGRAM_SAFE_MAX),
-    TELEGRAM_SAFE_MAX,
+function getOpsLimits(): OpsLimits {
+  const telegramSafeMax = 3500;
+  const maxLinesDefault = Number(process.env.GW_MAX_LOG_LINES || 200);
+  const maxLogChars = Math.min(
+    Number(process.env.GW_MAX_LOG_CHARS || telegramSafeMax),
+    telegramSafeMax,
   );
-  const clampLines = (n: number) => {
-    if (!Number.isFinite(n) || n <= 0) return 80;
-    return Math.min(Math.max(1, Math.floor(n)), MAX_LINES_DEFAULT);
-  };
+  return { maxLinesDefault, maxLogChars, telegramSafeMax };
+}
 
-  const pm2Jlist = (): any[] => {
-    try {
-      const out = execSync("pm2 jlist", { encoding: "utf-8" });
-      return JSON.parse(out);
-    } catch {
-      return [];
-    }
-  };
+function getMaxWindowMinutes(): number {
+  const raw = Number(process.env.MAX_WINDOW_MINUTES || 1440);
+  if (!Number.isFinite(raw) || raw <= 0) return 1440;
+  return Math.floor(raw);
+}
 
-  const fmtUptime = (ms: number) => {
-    if (!ms || ms < 0) return "—";
-    const s = Math.floor(ms / 1000);
-    const m = Math.floor(s / 60);
-    const h = Math.floor(m / 60);
-    const d = Math.floor(h / 24);
-    if (d > 0) return `${d}d${h % 24}h`;
-    if (h > 0) return `${h}h${m % 60}m`;
-    return `${m}m`;
-  };
+function clampLines(n: number, maxLinesDefault: number) {
+  if (!Number.isFinite(n) || n <= 0) return 80;
+  return Math.min(Math.max(1, Math.floor(n)), maxLinesDefault);
+}
 
-  const renderPs = () => {
-    const now = Date.now();
-    const rows = pm2Jlist().map((p) => {
+function pm2Jlist(): any[] {
+  try {
+    const out = execSync("pm2 jlist", { encoding: "utf-8" });
+    return JSON.parse(out);
+  } catch {
+    return [];
+  }
+}
+
+function fmtUptime(ms: number) {
+  if (!ms || ms < 0) return "—";
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  const d = Math.floor(h / 24);
+  if (d > 0) return `${d}d${h % 24}h`;
+  if (h > 0) return `${h}h${m % 60}m`;
+  return `${m}m`;
+}
+
+function renderPs(allowedNames: string[]) {
+  const now = Date.now();
+  const rows = pm2Jlist()
+    .filter((p) => !allowedNames.length || allowedNames.includes(p?.name))
+    .map((p) => {
       const name = p?.name || "unknown";
       const status = p?.pm2_env?.status || "unknown";
       const restarts = p?.pm2_env?.restart_time ?? 0;
@@ -310,252 +593,311 @@ export async function handleMessage(opts: {
       return { name, status, uptime, restarts, memMb, cpu };
     });
 
-    const lines: string[] = [];
-    lines.push("🧾 pm2 (facts-only)");
-    if (!rows.length) {
-      lines.push("- (no pm2 data)");
-    }
-    for (const r of rows) {
-      lines.push(`- ${r.name}: ${r.status} | up ${r.uptime} | restarts ${r.restarts} | mem ${r.memMb}MB | cpu ${r.cpu}%`);
-    }
-    return lines.join("\n");
+  const lines: string[] = [];
+  lines.push("🧾 pm2 (facts-only)");
+  if (!rows.length) {
+    lines.push("- (no pm2 data)");
+  }
+  for (const r of rows) {
+    lines.push(`- ${r.name}: ${r.status} | up ${r.uptime} | restarts ${r.restarts} | mem ${r.memMb}MB | cpu ${r.cpu}%`);
+  }
+  return lines.join("\n");
+}
+
+function renderStatus(allowedNames: string[]) {
+  const nowUtc = new Date().toISOString();
+  let sha = "unknown";
+  try {
+    sha = execSync("git rev-parse --short HEAD", { encoding: "utf-8" }).trim();
+  } catch {}
+
+  const procs = pm2Jlist();
+  const byName = new Map<string, any>();
+  for (const p of procs) byName.set(p?.name, p);
+  const pick = (name: string) => {
+    const p = byName.get(name);
+    const st = p?.pm2_env?.status || "unknown";
+    return `${name}=${st}`;
   };
 
-  const renderStatus = () => {
-    const nowUtc = new Date().toISOString();
-    let sha = "unknown";
+  const names = allowedNames.length ? allowedNames : [];
+  const pm2Line = names.length
+    ? names.map((n) => pick(n)).join(" ")
+    : "(no pm2 names configured)";
+  const bits = [
+    `✅ status (facts-only)`,
+    `- time_utc: ${nowUtc}`,
+    `- repo_sha: ${sha}`,
+    `- pm2: ${pm2Line}`,
+  ];
+  return bits.join("\n");
+}
+
+function resolvePm2LogPath(name: string, stream: "out" | "error") {
+  const base = path.join(os.homedir(), ".pm2", "logs");
+  return path.join(base, `${name}-${stream}.log`);
+}
+
+function tailFile(filePath: string, n: number): string {
+  const cmd = `tail -n ${n} ${filePath.replace(/(["\\$`])/g, "\\$1")}`;
+  return execSync(cmd, { encoding: "utf-8" });
+}
+
+function renderLogs(name: string, lines: number, maxLinesDefault: number) {
+  const n = clampLines(lines, maxLinesDefault);
+  const outPath = resolvePm2LogPath(name, "out");
+  const errPath = resolvePm2LogPath(name, "error");
+  const chunks: string[] = [];
+  chunks.push(`📜 logs: ${name} (last ${n})`);
+
+  if (fs.existsSync(errPath)) {
     try {
-      sha = execSync("git rev-parse --short HEAD", { encoding: "utf-8" }).trim();
+      const t = tailFile(errPath, n).trimEnd();
+      if (t) {
+        chunks.push("--- error ---");
+        chunks.push(t);
+      }
     } catch {}
+  }
+  if (fs.existsSync(outPath)) {
+    try {
+      const t = tailFile(outPath, n).trimEnd();
+      if (t) {
+        chunks.push("--- out ---");
+        chunks.push(t);
+      }
+    } catch {}
+  }
 
-    const procs = pm2Jlist();
-    const byName = new Map<string, any>();
-    for (const p of procs) byName.set(p?.name, p);
-    const pick = (name: string) => {
-      const p = byName.get(name);
-      const st = p?.pm2_env?.status || "unknown";
-      return `${name}=${st}`;
-    };
+  if (chunks.length <= 1) {
+    return `⚠️ logs unavailable: no pm2 log files for '${name}'`;
+  }
+  return chunks.join("\n");
+}
 
-    const bits = [
-      `✅ status (facts-only)`,
-      `- time_utc: ${nowUtc}`,
-      `- repo_sha: ${sha}`,
-      `- pm2: ${[pick("crypto-agent"), pick("crypto-dashboard"), pick("chat-gateway")].join(" ")}`,
-    ];
-    return bits.join("\n");
-  };
+async function handleOpsCommand(params: {
+  channel: string;
+  cleanedText: string;
+  config?: LoadedConfig;
+  chatId: string;
+  userId: string;
+  mentionsBot: boolean;
+  trimmedReplyText: string;
+  isGroup: boolean;
+  allowed: boolean;
+  send: SendFn;
+}): Promise<boolean> {
+  const {
+    channel,
+    cleanedText,
+    config,
+    chatId,
+    userId,
+    mentionsBot,
+    trimmedReplyText,
+    isGroup,
+    allowed,
+    send,
+  } = params;
 
-  const resolvePm2LogPath = (name: string, stream: "out" | "error") => {
-    const base = path.join(os.homedir(), ".pm2", "logs");
-    return path.join(base, `${name}-${stream}.log`);
-  };
+  if (!cleanedText.startsWith("/status") && !cleanedText.startsWith("/ps") && !cleanedText.startsWith("/logs")) {
+    return false;
+  }
 
-  const tailFile = (filePath: string, n: number): string => {
-    const cmd = `tail -n ${n} ${filePath.replace(/(["\\$`])/g, "\\$1")}`;
-    return execSync(cmd, { encoding: "utf-8" });
-  };
-
-  const renderLogs = (name: string, lines: number) => {
-    const n = clampLines(lines);
-    const outPath = resolvePm2LogPath(name, "out");
-    const errPath = resolvePm2LogPath(name, "error");
-    const chunks: string[] = [];
-    chunks.push(`📜 logs: ${name} (last ${n})`);
-
-    if (fs.existsSync(errPath)) {
-      try {
-        const t = tailFile(errPath, n).trimEnd();
-        if (t) {
-          chunks.push("--- error ---");
-          chunks.push(t);
-        }
-      } catch {}
-    }
-    if (fs.existsSync(outPath)) {
-      try {
-        const t = tailFile(outPath, n).trimEnd();
-        if (t) {
-          chunks.push("--- out ---");
-          chunks.push(t);
-        }
-      } catch {}
-    }
-
-    if (chunks.length <= 1) {
-      return `⚠️ logs unavailable: no pm2 log files for '${name}'`;
-    }
-    return chunks.join("\n");
-  };
+  const { maxLinesDefault, maxLogChars, telegramSafeMax } = getOpsLimits();
+  const pm2LogsNames = getPm2Names(config, "pm2_logs");
+  const pm2PsNames = getPm2Names(config, "pm2_ps");
+  const chatType = isGroup ? "group" : "private";
+  const policyOk = config?.meta?.policyOk === true;
+  const evalOps = (capability: string) => evaluate(config, {
+    channel,
+    capability,
+    chat_id: chatId,
+    chat_type: chatType,
+    user_id: userId,
+    mention_bot: mentionsBot,
+    has_reply: Boolean(trimmedReplyText),
+  });
 
   if (cleanedText.startsWith("/status")) {
-    if (!allowed) {
-      await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
-      return;
+    const res = evalOps("ops.status");
+    if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
+    const isAllowed = policyOk ? res.allowed : allowed;
+    if (!isAllowed) {
+      await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      return true;
     }
-    await send(chatId, renderStatus());
-    return;
+    await send(chatId, renderStatus(pm2PsNames));
+    return true;
   }
 
   if (cleanedText.startsWith("/ps")) {
-    if (!allowed) {
-      await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
-      return;
+    const res = evalOps("ops.ps");
+    if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
+    const isAllowed = policyOk ? res.allowed : allowed;
+    if (!isAllowed) {
+      await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      return true;
     }
-    await send(chatId, renderPs());
-    return;
+    await send(chatId, renderPs(pm2PsNames));
+    return true;
   }
 
   if (cleanedText.startsWith("/logs")) {
-    if (!allowed) {
-      await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
-      return;
+    const res = evalOps("ops.logs");
+    if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
+    const isAllowed = policyOk ? res.allowed : allowed;
+    if (!isAllowed) {
+      await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      return true;
     }
     const parts = cleanedText.split(/\s+/).filter(Boolean);
-    const name = parts[1] || "crypto-agent";
+    if (!pm2LogsNames.length) {
+      await send(chatId, "⚠️ 未配置 pm2 日志进程名（manifest: pm2_logs.names）。");
+      return true;
+    }
+    const name = parts[1] || pm2LogsNames[0];
+    if (!pm2LogsNames.includes(name)) {
+      await send(chatId, `⚠️ 不允许的进程名：${name}`);
+      return true;
+    }
     const lines = parts[2] ? Number(parts[2]) : 80;
-    const out = renderLogs(name, lines);
-    if (out.length > MAX_LOG_CHARS) {
-      const head = out.slice(0, Math.max(0, MAX_LOG_CHARS - 40));
+    const out = renderLogs(name, lines, maxLinesDefault);
+    if (out.length > maxLogChars) {
+      const head = out.slice(0, Math.max(0, maxLogChars - 40));
       const msg =
-        `⚠️ 输出过长，已截断到 ${MAX_LOG_CHARS} 字符（上限 ${TELEGRAM_SAFE_MAX}）。\n` +
+        `⚠️ 输出过长，已截断到 ${maxLogChars} 字符（上限 ${telegramSafeMax}）。\n` +
         head +
         "\n...(clipped)";
       await send(chatId, msg);
-      return;
+      return true;
     }
     await send(chatId, out);
+    return true;
+  }
+
+  return false;
+}
+
+async function handleGroupExplain(params: {
+  channel: string;
+  taskIdPrefix: string;
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  trimmedReplyText: string;
+  mentionsBot: boolean;
+  send: SendFn;
+  config?: LoadedConfig;
+}) {
+  const { channel, taskIdPrefix, storageDir, chatId, userId, trimmedReplyText, mentionsBot, send, config } = params;
+  const res = evaluate(config, {
+    channel,
+    capability: "alerts.explain",
+    chat_id: chatId,
+    chat_type: "group",
+    user_id: userId,
+    mention_bot: mentionsBot,
+    has_reply: Boolean(trimmedReplyText),
+  });
+
+  if (res.require?.mention_bot_for_explain && !mentionsBot) return;
+
+  if (res.require?.reply_required_for_explain && !trimmedReplyText) {
+    await send(chatId, "请回复一条告警消息再 @我，我才能解释。");
     return;
   }
 
-  if (isGroup) {
-    // ---- Group command path: allow commands without @bot (still owner/allowlist gated) ----
-    if (isCommand) {
-      if (!allowed) {
-        await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
-        return;
-      }
-      // fall through to command parsing/dispatch below
-    } else {
-      // ---- Group explain path: policy-driven gate ----
-      const res = evaluate(config, {
-        channel: "telegram",
-        capability: "alerts.explain",
-        chat_id: chatId,
-        chat_type: "group",
-        user_id: userId,
-        mention_bot: mentionsBot,
-        has_reply: Boolean(trimmedReplyText),
-      });
-
-      if (res.require?.mention_bot_for_explain && !mentionsBot) return;
-
-      if (res.require?.reply_required_for_explain && !trimmedReplyText) {
-        await send(chatId, "请回复一条告警消息再 @我，我才能解释。");
-        return;
-      }
-
-      if (!res.allowed) {
-        await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
-        return;
-      }
-
-      const ctx = await buildExplainContext(trimmedReplyText, config);
-
-      const taskId = `tg_explain_${chatId}_${Date.now()}`;
-
-      await send(chatId, "🧠 我看一下…");
-
-      const prompt =
-        "解释这条告警（facts-only）：\n" +
-        "1) 发生了什么（用人话）\n" +
-        "2) 关键结构特征（如量价背离/稳定币）\n" +
-        "3) 可能原因（推断要写依据+置信度）\n" +
-        "4) 下一步建议看什么（facts-only，不给交易建议）\n" +
-        "禁止：价格预测、买卖建议、无依据故事。\n" +
-        "If facts.window_1h/24h/symbol_recent.ok is true, you MUST reference them. " +
-        "If false, explicitly say what is missing.\n";
-
-      try {
-        const res = await submitTask({
-          task_id: taskId,
-          stage: "analyze",
-          prompt,
-          context: ctx,
-        });
-
-        if (!res?.ok) {
-          await send(chatId, `解释失败：${res?.error || "unknown"}`);
-          return;
-        }
-
-        await send(chatId, res.summary);
-      } catch (e: any) {
-        await send(chatId, `解释异常：${String(e?.message || e)}`);
-      }
-
-      return;
-    }
+  if (!res.allowed) {
+    await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+    return;
   }
 
-  if (!allowed && !isGroup) return;
+  await send(chatId, "🧠 我看一下…");
+  await runExplain({
+    storageDir,
+    chatId,
+    userId,
+    rawAlert: trimmedReplyText,
+    send,
+    config,
+    channel,
+    taskIdPrefix: `${taskIdPrefix}_explain`,
+  });
+}
 
-  if (!isGroup) {
-    if (trimmedReplyText) {
-      lastAlertByChatId.set(chatId, { ts: Date.now(), rawText: trimmedReplyText });
-    }
+async function handlePrivateMessage(params: {
+  channel: string;
+  taskIdPrefix: string;
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  trimmedText: string;
+  trimmedReplyText: string;
+  isCommand: boolean;
+  send: SendFn;
+  config?: LoadedConfig;
+}): Promise<boolean> {
+  const {
+    channel,
+    taskIdPrefix,
+    storageDir,
+    chatId,
+    userId,
+    trimmedText,
+    trimmedReplyText,
+    isCommand,
+    send,
+    config,
+  } = params;
 
-    if (trimmedText === "/help" || trimmedText === "help") {
-      await send(chatId, "用法：回复一条告警，然后发“解释一下/？”即可。");
-      return;
-    }
-
-    if (!isCommand) {
-      const rawAlert = trimmedReplyText || lastAlertByChatId.get(chatId)?.rawText || "";
-      if (!rawAlert) {
-        await send(chatId, "请先回复一条告警消息，然后发一句话（如：解释一下）。");
-        return;
-      }
-
-      const ctx = await buildExplainContext(rawAlert, config);
-
-      const taskId = `tg_explain_${chatId}_${Date.now()}`;
-
-      await send(chatId, "🧠 我看一下…");
-
-      const prompt =
-        "解释这条告警（facts-only）：\n" +
-        "1) 发生了什么（用人话）\n" +
-        "2) 关键结构特征（如量价背离/稳定币）\n" +
-        "3) 可能原因（推断要写依据+置信度）\n" +
-        "4) 下一步建议看什么（facts-only，不给交易建议）\n" +
-        "禁止：价格预测、买卖建议、无依据故事。\n" +
-        "If facts.window_1h/24h/symbol_recent.ok is true, you MUST reference them. " +
-        "If false, explicitly say what is missing.\n";
-
-      try {
-        const res = await submitTask({
-          task_id: taskId,
-          stage: "analyze",
-          prompt,
-          context: ctx,
-        });
-
-        if (!res?.ok) {
-          await send(chatId, `解释失败：${res?.error || "unknown"}`);
-          return;
-        }
-
-        await send(chatId, res.summary);
-      } catch (e: any) {
-        await send(chatId, `解释异常：${String(e?.message || e)}`);
-      }
-
-      return;
-    }
+  if (trimmedReplyText) {
+    lastAlertByChatId.set(chatId, { ts: Date.now(), rawText: trimmedReplyText });
   }
 
-  const cmd = parseCommand(cleanedText);
+  if (trimmedText === "/help" || trimmedText === "help") {
+    await send(chatId, "用法：回复一条告警，然后发“解释一下/？”即可。");
+    return true;
+  }
+
+  if (!isCommand) {
+    const rawAlert = trimmedReplyText || lastAlertByChatId.get(chatId)?.rawText || "";
+    if (!rawAlert) {
+      await send(chatId, "请先回复一条告警消息，然后发一句话（如：解释一下）。");
+      return true;
+    }
+
+    await send(chatId, "🧠 我看一下…");
+    await runExplain({
+      storageDir,
+      chatId,
+      userId,
+      rawAlert,
+      send,
+      config,
+      channel,
+      taskIdPrefix: `${taskIdPrefix}_explain`,
+    });
+    return true;
+  }
+
+  return false;
+}
+
+async function handleParsedCommand(params: {
+  cmd: ReturnType<typeof parseCommand>;
+  channel: string;
+  taskIdPrefix: string;
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  text: string;
+  isOwner: boolean;
+  authState: ReturnType<typeof loadAuth>;
+  send: SendFn;
+  config?: LoadedConfig;
+}) {
+  const { cmd, channel, taskIdPrefix, storageDir, chatId, userId, text, isOwner, authState, send, config } = params;
 
   // auth commands only owner
   if (cmd.kind.startsWith("auth_") && !isOwner) {
@@ -564,26 +906,67 @@ export async function handleMessage(opts: {
   }
 
   const ts = nowIso();
-  const baseAudit = { ts_utc: ts, channel: "telegram", chat_id: chatId, user_id: userId, raw: text };
+  const baseAudit = { ts_utc: ts, channel, chat_id: chatId, user_id: userId, raw: text };
 
   if (cmd.kind === "help") {
     const out = [
       "/help",
       "/status",
+      "/signals [N]m|[N]h",
       "/ask <q>",
       "/analyze <incident description>",
       "/suggest <incident description>",
       "/auth add <chat_id>",
       "/auth del <chat_id>",
       "/auth list",
+      "/feedback <描述>（例如：告警太多了 / 告警太少了）",
     ].join("\n");
     await send(chatId, out);
     appendLedger(storageDir, { ...baseAudit, cmd: "help" });
     return;
 
+  } else if (cmd.kind === "signals") {
+    const maxWindow = getMaxWindowMinutes();
+    if (!cmd.minutes) {
+      await send(chatId, `Usage: /signals [N]m|[N]h (default 60m, max ${maxWindow}m)`);
+      return;
+    }
+    if (cmd.minutes > maxWindow) {
+      await send(chatId, `Window too large. Max ${maxWindow}m.`);
+      return;
+    }
+
+    try {
+      const digest = await getSignalsDigest(config, cmd.minutes);
+      if (!digest.ok) {
+        const msg = digest.error === "signals_dir_missing"
+          ? "signals data dir missing"
+          : "signals source not configured";
+        await send(chatId, msg);
+        return;
+      }
+
+      const out = formatSignalsDigest(cmd.minutes, digest.summary);
+      await send(chatId, out);
+      appendLedger(storageDir, {
+        ...baseAudit,
+        cmd: "signals",
+        minutes: cmd.minutes,
+        raw_count: digest.summary.rawCount,
+        dedup_count: digest.summary.dedupCount,
+        top_symbols: digest.summary.topSymbols,
+        top_kinds: digest.summary.topKinds,
+      });
+    } catch (e: any) {
+      await send(chatId, `signals read failed: ${String(e?.message || e)}`);
+    }
+    return;
+
   } else if (cmd.kind === "ask") {
     await handleAskCommand({
       chatId,
+      channel,
+      taskIdPrefix,
       text: cmd.q,
       reply: (m) => send(chatId, m),
     });
@@ -597,7 +980,7 @@ export async function handleMessage(opts: {
       return;
     }
 
-    const taskId = `tg_analyze_${chatId}_${Date.now()}`;
+    const taskId = `${taskIdPrefix}_analyze_${chatId}_${Date.now()}`;
 
     try {
       const res = await submitTask({
@@ -605,7 +988,7 @@ export async function handleMessage(opts: {
         stage: "analyze",
         prompt,
         context: {
-          source: "telegram",
+          source: channel,
           chat_id: chatId,
           user_id: userId,
         },
@@ -632,7 +1015,7 @@ export async function handleMessage(opts: {
       return;
     }
 
-    const taskId = `tg_suggest_${chatId}_${Date.now()}`;
+    const taskId = `${taskIdPrefix}_suggest_${chatId}_${Date.now()}`;
 
     try {
       const res = await submitTask({
@@ -640,7 +1023,7 @@ export async function handleMessage(opts: {
         stage: "suggest",
         prompt,
         context: {
-          source: "telegram",
+          source: channel,
           chat_id: chatId,
           user_id: userId,
         },
@@ -695,7 +1078,7 @@ export async function handleMessage(opts: {
 
   if (cmd.kind === "auth_add") {
     if (!authState.allowed.includes(cmd.id)) authState.allowed.push(cmd.id);
-    saveAuth(storageDir, authState);
+    saveAuth(storageDir, authState, channel);
     await send(chatId, `added ${cmd.id}`);
     appendLedger(storageDir, { ...baseAudit, cmd: "auth_add", target: cmd.id });
     return;
@@ -703,7 +1086,7 @@ export async function handleMessage(opts: {
 
   if (cmd.kind === "auth_del") {
     authState.allowed = authState.allowed.filter(x => x !== cmd.id);
-    saveAuth(storageDir, authState);
+    saveAuth(storageDir, authState, channel);
     await send(chatId, `deleted ${cmd.id}`);
     appendLedger(storageDir, { ...baseAudit, cmd: "auth_del", target: cmd.id });
     return;
@@ -712,4 +1095,168 @@ export async function handleMessage(opts: {
   // unknown
   await send(chatId, "unknown command. /help");
   appendLedger(storageDir, { ...baseAudit, cmd: "unknown" });
+}
+
+export async function handleMessage(opts: {
+  storageDir: string;
+  channel: string;
+  ownerChatId: string;
+  // NOTE: ownerChatId is private chat_id; group owner gating must use ownerUserId
+  ownerUserId?: string;
+  allowlistMode: "owner_only" | "auth";
+  config?: LoadedConfig;
+  provider: LLMProvider;
+  limiter: RateLimiter;
+  chatId: string;
+  userId: string;
+  text: string;
+  replyText?: string;
+  isGroup?: boolean;
+  mentionsBot?: boolean;
+  send: (chatId: string, text: string) => Promise<void>;
+}) {
+  const {
+    storageDir,
+    channel,
+    ownerChatId,
+    ownerUserId,
+    allowlistMode,
+    config,
+    chatId,
+    userId,
+    text,
+    replyText = "",
+    isGroup = false,
+    mentionsBot = false,
+    send,
+    provider,
+    limiter,
+  } = opts;
+
+  const trimmedText = (text || "").trim();
+  const authState = loadAuth(storageDir, ownerChatId, channel);
+  const resolvedOwnerUserId = String(ownerUserId || "");
+  const isOwnerChat = chatId === ownerChatId;
+  const isOwnerUser = resolvedOwnerUserId ? userId === resolvedOwnerUserId : false;
+  const isOwner = isOwnerChat || isOwnerUser;
+  const allowed =
+    allowlistMode === "owner_only"
+      ? (isGroup ? isOwnerUser : isOwnerChat)
+      : authState.allowed.includes(chatId) || isOwnerUser;
+
+  const botUsername = channel === "telegram"
+    ? String(process.env.TELEGRAM_BOT_USERNAME || "SoliaNLBot")
+    : "";
+  const mentionToken = botUsername
+    ? (botUsername.startsWith("@") ? botUsername : `@${botUsername}`)
+    : "";
+  const mentionPattern = mentionToken ? new RegExp(escapeRegExp(mentionToken), "gi") : null;
+  // Strip @bot mention for command parsing in groups (e.g. "@SoliaNLBot /status")
+  const cleanedText =
+    channel === "telegram" && isGroup && mentionsBot && mentionPattern
+      ? trimmedText.replace(mentionPattern, "").trim()
+      : trimmedText;
+  const taskIdPrefix = taskPrefix(channel);
+  const isCommand = cleanedText.startsWith("/");
+
+  const trimmedReplyText = (replyText || "").trim();
+
+  // allow "/whoami" in both private and group (group may include mention)
+  const isWhoami =
+    cleanedText === "/whoami" ||
+    cleanedText.endsWith(" /whoami") ||
+    cleanedText.includes("/whoami");
+
+  if (isWhoami) {
+    await send(chatId, `chatId=${chatId}\nuserId=${userId}\nisGroup=${isGroup}`);
+    return;
+  }
+
+  if (trimmedText === "👍" || trimmedText === "👎") {
+    const last = lastExplainByChatId.get(chatId);
+    if (!last) {
+      await send(chatId, "没有可反馈的解释。");
+      return;
+    }
+    writeExplainFeedback(storageDir, {
+      ts_utc: new Date().toISOString(),
+      trace_id: last.trace_id,
+      chat_id: chatId,
+      user_id: userId,
+      feedback: trimmedText === "👍" ? "up" : "down",
+    });
+    await send(chatId, "已记录反馈。");
+    return;
+  }
+
+  const handledOps = await handleOpsCommand({
+    channel,
+    cleanedText,
+    config,
+    chatId,
+    userId,
+    mentionsBot,
+    trimmedReplyText,
+    isGroup,
+    allowed,
+    send,
+  });
+  if (handledOps) return;
+
+  if (isGroup) {
+    // ---- Group command path: allow commands without @bot (still owner/allowlist gated) ----
+    if (isCommand) {
+      if (!allowed) {
+        await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+        return;
+      }
+      // fall through to command parsing/dispatch below
+    } else {
+      await handleGroupExplain({
+        channel,
+        taskIdPrefix,
+        storageDir,
+        chatId,
+        userId,
+        trimmedReplyText,
+        mentionsBot,
+        send,
+        config,
+      });
+      return;
+    }
+  }
+
+  if (!allowed && !isGroup) return;
+
+  if (!isGroup) {
+    const handledPrivate = await handlePrivateMessage({
+      channel,
+      taskIdPrefix,
+      storageDir,
+      chatId,
+      userId,
+      trimmedText,
+      trimmedReplyText,
+      isCommand,
+      send,
+      config,
+    });
+    if (handledPrivate) return;
+  }
+
+  const cmd = parseCommand(cleanedText);
+  await handleParsedCommand({
+    cmd,
+    channel,
+    taskIdPrefix,
+    storageDir,
+    chatId,
+    userId,
+    text,
+    isOwner,
+    authState,
+    send,
+    config,
+  });
 }

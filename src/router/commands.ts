@@ -3,6 +3,7 @@ export type Cmd =
   | { kind: "analyze"; q: string }
   | { kind: "suggest"; q: string }
   | { kind: "status" }
+  | { kind: "signals"; minutes: number | null }
   | { kind: "help" }
   | { kind: "auth_add"; id: string }
   | { kind: "auth_del"; id: string }
@@ -15,10 +16,24 @@ function parseAfterCommand(t: string, cmd: string): string {
   return rest.trim();
 }
 
+function parseSignalWindow(raw: string): number | null {
+  if (!raw) return 60;
+  const match = raw.match(/^(\d+)\s*([mh])?$/i);
+  if (!match) return null;
+  const n = Number(match[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const unit = String(match[2] || "m").toLowerCase();
+  return unit === "h" ? n * 60 : n;
+}
+
 export function parseCommand(text: string): Cmd {
   const t = (text || "").trim();
 
   if (t === "/status") return { kind: "status" };
+  if (t.startsWith("/signals")) {
+    const rest = parseAfterCommand(t, "/signals");
+    return { kind: "signals", minutes: parseSignalWindow(rest) };
+  }
   if (t === "/help") return { kind: "help" };
 
   if (t.startsWith("/ask")) {
@@ -51,6 +66,8 @@ import { submitTask } from "../internal_client";
 
 export async function handleAskCommand(ctx: {
   chatId: number | string;
+  channel: string;
+  taskIdPrefix: string;
   text: string;
   reply: (msg: string) => Promise<void>;
 }) {
@@ -60,7 +77,7 @@ export async function handleAskCommand(ctx: {
     return;
   }
 
-  const taskId = `tg_ask_${Date.now()}`;
+  const taskId = `${ctx.taskIdPrefix}_ask_${Date.now()}`;
 
   await ctx.reply("🧠 Thinking…");
 
@@ -70,7 +87,7 @@ export async function handleAskCommand(ctx: {
       stage: "analyze",
       prompt: question,
       context: {
-        source: "telegram",
+        source: ctx.channel,
         chat_id: ctx.chatId,
       },
     });

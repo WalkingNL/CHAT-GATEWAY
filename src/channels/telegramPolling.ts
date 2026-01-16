@@ -48,6 +48,22 @@ export class TelegramPolling {
     }
   }
 
+  async sendPhoto(chatId: string, imagePath: string, caption?: string) {
+    const url = this.api("sendPhoto");
+    const args: string[] = ["-4", "-sS", "--connect-timeout", "5", "--max-time", "45", "-X", "POST"];
+    args.push("-F", `chat_id=${chatId}`);
+    if (caption) {
+      args.push("-F", `caption=${caption}`);
+    }
+    args.push("-F", `photo=@${imagePath}`);
+    args.push(url);
+    const out = execFileSync("curl", args, { encoding: "utf-8" });
+    const json = JSON.parse(out);
+    if (!json?.ok) {
+      throw new Error(`telegram sendPhoto failed: ${JSON.stringify(json).slice(0, 200)}`);
+    }
+  }
+
   async pollOnce(): Promise<TelegramMsg[]> {
     const url = this.api(`getUpdates?timeout=25&offset=${this.offset}`);
     const json = this.curlJson(url, "GET");
@@ -70,8 +86,23 @@ export class TelegramPolling {
       const text = String(m.text || "");
       const replyText = String(m.reply_to_message?.text || "");
       const isGroup = m.chat?.type !== "private";
+      const entities = Array.isArray(m.entities) ? m.entities : [];
+      const mentionByEntity = mentionToken
+        ? entities.some((e: any) => {
+            if (e?.type === "mention") {
+              if (typeof e.offset !== "number" || typeof e.length !== "number") return false;
+              const slice = text.slice(e.offset, e.offset + e.length);
+              return slice.toLowerCase() === mentionTokenLower;
+            }
+            if (e?.type === "text_mention" && e?.user?.username) {
+              const u = String(e.user.username);
+              return (`@${u}`.toLowerCase() === mentionTokenLower);
+            }
+            return false;
+          })
+        : false;
       const mentionsBot = mentionToken
-        ? text.toLowerCase().includes(mentionTokenLower)
+        ? text.toLowerCase().includes(mentionTokenLower) || mentionByEntity
         : false;
       out.push({ chatId, userId, text, replyText, isGroup, mentionsBot });
     }
