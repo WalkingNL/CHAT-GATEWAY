@@ -1,10 +1,10 @@
-import http from "node:http";
-
-import { createInternalApiHandler } from "../core/internal_api.js";
 import { buildProvider } from "../core/provider_factory.js";
+import { startInternalApi } from "../core/internal_api.js";
+import { TelegramPolling } from "../integrations/channels/telegramPolling.js";
 import { buildIntegrationContext } from "../integrations/runtime/context.js";
+import { createFeishuWebhookHandler, startFeishuWebhookServer } from "../integrations/runtime/feishu.js";
 import { ensureInternalApiUrl } from "../integrations/runtime/internal_url.js";
-import { createFeishuWebhookHandler } from "../integrations/runtime/feishu.js";
+import { startNotifyServer } from "../integrations/runtime/notify_server.js";
 import { startTelegramPolling } from "../integrations/runtime/telegram.js";
 
 process.on("uncaughtException", (e: any) => console.error("[uncaughtException]", e?.stack || e));
@@ -18,40 +18,78 @@ function toNumber(value: any, fallback: number): number {
 function main() {
   const ctx = buildIntegrationContext();
   const provider = buildProvider(ctx.cfg);
-  const host = String(process.env.CHAT_GATEWAY_HOST || ctx.cfg.gateway?.server?.host || "127.0.0.1");
-  const port = toNumber(process.env.CHAT_GATEWAY_PORT ?? ctx.cfg.gateway?.server?.port, 8787);
+
+  const gatewayHost = String(process.env.CHAT_GATEWAY_HOST || ctx.cfg.gateway?.server?.host || "127.0.0.1");
+  const gatewayPort = toNumber(process.env.CHAT_GATEWAY_PORT ?? ctx.cfg.gateway?.server?.port, 8787);
   const token = String(process.env.CHAT_GATEWAY_TOKEN || "");
 
-  if (!process.env.CHAT_GATEWAY_INTERNAL_URL) {
-    process.env.CHAT_GATEWAY_INTERNAL_URL = `http://${host}:${port}`;
-  }
-  ensureInternalApiUrl(ctx.cfg);
-
-  const internalHandler = createInternalApiHandler({
-    host,
-    port,
+  startInternalApi({
+    host: gatewayHost,
+    port: gatewayPort,
     token,
     storageDir: ctx.storageDir,
     provider,
   });
+
+  if (!process.env.CHAT_GATEWAY_INTERNAL_URL) {
+    process.env.CHAT_GATEWAY_INTERNAL_URL = `http://${gatewayHost}:${gatewayPort}`;
+  }
+  ensureInternalApiUrl(ctx.cfg);
+
+  const fcfg = ctx.cfg.channels?.feishu ?? {};
+  const feishuHost = String(process.env.FEISHU_WEBHOOK_HOST || fcfg.listen_host || gatewayHost);
+  const feishuPort = toNumber(process.env.FEISHU_WEBHOOK_PORT ?? fcfg.listen_port, gatewayPort + 1);
+
   const feishuRuntime = createFeishuWebhookHandler(ctx);
+  startFeishuWebhookServer(feishuRuntime, feishuHost, feishuPort);
 
-  const server = http.createServer(async (req, res) => {
-    if (feishuRuntime.enabled) {
-      const handled = await feishuRuntime.handler(req, res);
-      if (handled) return;
-    }
-    await internalHandler(req, res);
+  const tcfg = ctx.cfg.channels?.telegram ?? {};
+  const telegramEnabled = tcfg.enabled !== false;
+  const telegram = telegramEnabled
+    ? new TelegramPolling({
+        bot_token_env: String(tcfg.bot_token_env || "TELEGRAM_BOT_TOKEN"),
+        poll_interval_ms: Number(tcfg.poll_interval_ms || 1500),
+      })
+    : undefined;
+
+  const ownerFeishuChatId = String(ctx.cfg.gateway?.owner?.feishu_chat_id ?? "");
+
+  void startTelegramPolling(ctx, {
+    telegram,
+    feishuSendText: feishuRuntime.sendText,
+    feishuSendImage: feishuRuntime.sendImage,
+    feishuChatId: ownerFeishuChatId || undefined,
   });
 
-  server.listen(port, host, () => {
-    console.log(`[core] internal API listening on http://${host}:${port}`);
-    if (feishuRuntime.enabled) {
-      console.log(`[feishu] webhook path active at ${feishuRuntime.path}`);
-    }
+  const integrationsHost = String(process.env.INTEGRATIONS_HOST || gatewayHost);
+  const integrationsPort = toNumber(process.env.INTEGRATIONS_PORT, gatewayPort + 2);
+
+  startNotifyServer({
+    host: integrationsHost,
+    port: integrationsPort,
+    token,
+    senders: {
+      telegram: telegram
+        ? {
+            sendText: telegram.sendMessage.bind(telegram),
+            sendImage: telegram.sendPhoto.bind(telegram),
+          }
+        : undefined,
+      feishu: feishuRuntime.enabled && feishuRuntime.sendText && feishuRuntime.sendImage
+        ? {
+            sendText: feishuRuntime.sendText,
+            sendImage: feishuRuntime.sendImage,
+          }
+        : undefined,
+    },
   });
 
-  void startTelegramPolling(ctx);
+  console.log("[chat-gateway] started (all-in-one)", {
+    core: { host: gatewayHost, port: gatewayPort },
+    feishu: feishuRuntime.enabled ? { host: feishuHost, port: feishuPort } : "disabled",
+    notify: { host: integrationsHost, port: integrationsPort },
+    telegram: telegramEnabled ? "polling" : "disabled",
+  });
 }
 
 function dumpUnknown(e: any) {

@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileLimited } from "../runtime/exec_limiter.js";
 
 export interface FeishuCfg {
   app_id_env: string;
@@ -12,6 +12,7 @@ export interface FeishuCfg {
 
 export type FeishuMsg = {
   chatId: string;
+  chatType: string;
   text: string;
   userId: string;
   replyText: string;
@@ -54,13 +55,13 @@ export class FeishuWebhook {
     this.baseUrl = String(cfg.base_url || "https://open.feishu.cn/open-apis").trim();
   }
 
-  private curlJson(
+  private async curlJson(
     url: string,
     method: CurlMethod,
     body?: any,
     headers?: Record<string, string>,
     maxTimeSec = 45,
-  ): any {
+  ): Promise<any> {
     const args: string[] = ["-4", "-sS", "--connect-timeout", "5", "--max-time", String(maxTimeSec)];
     if (method === "POST") {
       args.push("-X", "POST", "-H", "Content-Type: application/json");
@@ -77,16 +78,16 @@ export class FeishuWebhook {
     }
     args.push(url);
 
-    const out = execFileSync("curl", args, { encoding: "utf-8" });
-    return JSON.parse(out);
+    const { stdout } = await execFileLimited("feishu", "curl", args);
+    return JSON.parse(stdout);
   }
 
-  private getTenantToken(): string {
+  private async getTenantToken(): Promise<string> {
     const now = Date.now();
     if (this.tenantToken && now < this.tenantTokenExpireAt - 60_000) return this.tenantToken;
 
     const url = `${this.baseUrl}/auth/v3/tenant_access_token/internal/`;
-    const json = this.curlJson(url, "POST", {
+    const json = await this.curlJson(url, "POST", {
       app_id: this.appId,
       app_secret: this.appSecret,
     });
@@ -102,21 +103,21 @@ export class FeishuWebhook {
   }
 
   async sendMessage(chatId: string, text: string) {
-    const token = this.getTenantToken();
+    const token = await this.getTenantToken();
     const url = `${this.baseUrl}/im/v1/messages?receive_id_type=chat_id`;
     const body = {
       receive_id: chatId,
       msg_type: "text",
       content: JSON.stringify({ text }),
     };
-    const json = this.curlJson(url, "POST", body, { Authorization: `Bearer ${token}` });
+    const json = await this.curlJson(url, "POST", body, { Authorization: `Bearer ${token}` });
     if (json?.code !== 0) {
       throw new Error(`feishu sendMessage failed: ${JSON.stringify(json).slice(0, 200)}`);
     }
   }
 
-  private uploadImage(imagePath: string): string {
-    const token = this.getTenantToken();
+  private async uploadImage(imagePath: string): Promise<string> {
+    const token = await this.getTenantToken();
     const url = `${this.baseUrl}/im/v1/images`;
     const args: string[] = ["-4", "-sS", "--connect-timeout", "5", "--max-time", "45", "-X", "POST"];
     args.push("-H", `Authorization: Bearer ${token}`);
@@ -124,8 +125,8 @@ export class FeishuWebhook {
     args.push("-F", `image=@${imagePath}`);
     args.push(url);
 
-    const out = execFileSync("curl", args, { encoding: "utf-8" });
-    const json = JSON.parse(out);
+    const { stdout } = await execFileLimited("feishu", "curl", args);
+    const json = JSON.parse(stdout);
     const key = json?.data?.image_key;
     if (json?.code !== 0 || !key) {
       throw new Error(`feishu uploadImage failed: ${JSON.stringify(json).slice(0, 200)}`);
@@ -134,15 +135,15 @@ export class FeishuWebhook {
   }
 
   async sendImage(chatId: string, imagePath: string) {
-    const imageKey = this.uploadImage(imagePath);
-    const token = this.getTenantToken();
+    const imageKey = await this.uploadImage(imagePath);
+    const token = await this.getTenantToken();
     const url = `${this.baseUrl}/im/v1/messages?receive_id_type=chat_id`;
     const body = {
       receive_id: chatId,
       msg_type: "image",
       content: JSON.stringify({ image_key: imageKey }),
     };
-    const json = this.curlJson(url, "POST", body, { Authorization: `Bearer ${token}` });
+    const json = await this.curlJson(url, "POST", body, { Authorization: `Bearer ${token}` });
     if (json?.code !== 0) {
       throw new Error(`feishu sendImage failed: ${JSON.stringify(json).slice(0, 200)}`);
     }
@@ -201,7 +202,7 @@ export class FeishuWebhook {
 
     return {
       kind: "message",
-      msg: { chatId, userId, text, replyText, isGroup, mentionsBot },
+      msg: { chatId, chatType, userId, text, replyText, isGroup, mentionsBot },
     };
   }
 
@@ -262,9 +263,9 @@ export class FeishuWebhook {
 
   private async fetchMessageText(messageId: string): Promise<string> {
     try {
-      const token = this.getTenantToken();
+      const token = await this.getTenantToken();
       const url = `${this.baseUrl}/im/v1/messages/${messageId}`;
-      const json = this.curlJson(url, "GET", undefined, { Authorization: `Bearer ${token}` }, 8);
+      const json = await this.curlJson(url, "GET", undefined, { Authorization: `Bearer ${token}` }, 8);
       const dataMsg = json?.data?.message || json?.data?.items?.[0] || json?.data?.items || null;
       const msgType = String(dataMsg?.msg_type || dataMsg?.message_type || "");
       const content = dataMsg?.body?.content ?? dataMsg?.content;

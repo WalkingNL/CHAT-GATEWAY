@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileLimited } from "../runtime/exec_limiter.js";
 
 export interface TelegramCfg {
   bot_token_env: string;
@@ -7,6 +7,7 @@ export interface TelegramCfg {
 
 export type TelegramMsg = {
   chatId: string;
+  chatType: string;
   text: string;
   userId: string;
   replyText: string;
@@ -28,7 +29,7 @@ export class TelegramPolling {
     return `https://api.telegram.org/bot${this.token}/${path}`;
   }
 
-  private curlJson(url: string, method: "GET" | "POST", body?: any): any {
+  private async curlJson(url: string, method: "GET" | "POST", body?: any): Promise<any> {
     // Use curl -4 for stability; apply timeouts to avoid hanging
     const args: string[] = ["-4", "-sS", "--connect-timeout", "5", "--max-time", "45"];
     if (method === "POST") {
@@ -37,12 +38,12 @@ export class TelegramPolling {
     }
     args.push(url);
 
-    const out = execFileSync("curl", args, { encoding: "utf-8" });
-    return JSON.parse(out);
+    const { stdout } = await execFileLimited("telegram", "curl", args);
+    return JSON.parse(stdout);
   }
 
   async sendMessage(chatId: string, text: string) {
-    const json = this.curlJson(this.api("sendMessage"), "POST", { chat_id: chatId, text });
+    const json = await this.curlJson(this.api("sendMessage"), "POST", { chat_id: chatId, text });
     if (!json?.ok) {
       throw new Error(`telegram sendMessage failed: ${JSON.stringify(json).slice(0, 200)}`);
     }
@@ -57,8 +58,8 @@ export class TelegramPolling {
     }
     args.push("-F", `photo=@${imagePath}`);
     args.push(url);
-    const out = execFileSync("curl", args, { encoding: "utf-8" });
-    const json = JSON.parse(out);
+    const { stdout } = await execFileLimited("telegram", "curl", args);
+    const json = JSON.parse(stdout);
     if (!json?.ok) {
       throw new Error(`telegram sendPhoto failed: ${JSON.stringify(json).slice(0, 200)}`);
     }
@@ -66,7 +67,7 @@ export class TelegramPolling {
 
   async pollOnce(): Promise<TelegramMsg[]> {
     const url = this.api(`getUpdates?timeout=25&offset=${this.offset}`);
-    const json = this.curlJson(url, "GET");
+    const json = await this.curlJson(url, "GET");
     if (!json?.ok) return [];
 
     const botUsername = String(process.env.TELEGRAM_BOT_USERNAME || "SoliaNLBot");
@@ -85,7 +86,8 @@ export class TelegramPolling {
       const userId = String(m.from?.id ?? chatId);
       const text = String(m.text || "");
       const replyText = String(m.reply_to_message?.text || "");
-      const isGroup = m.chat?.type !== "private";
+      const chatType = String(m.chat?.type || "");
+      const isGroup = chatType !== "private";
       const entities = Array.isArray(m.entities) ? m.entities : [];
       const mentionByEntity = mentionToken
         ? entities.some((e: any) => {
@@ -104,7 +106,7 @@ export class TelegramPolling {
       const mentionsBot = mentionToken
         ? text.toLowerCase().includes(mentionTokenLower) || mentionByEntity
         : false;
-      out.push({ chatId, userId, text, replyText, isGroup, mentionsBot });
+      out.push({ chatId, chatType, userId, text, replyText, isGroup, mentionsBot });
     }
     return out;
   }

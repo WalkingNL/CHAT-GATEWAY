@@ -1,0 +1,8 @@
+# Project notify defaults for integrations /v1/notify/*
+projects:
+  crypto_agent:
+    notify:
+      telegram_chat_ids:
+        - "YOUR_TELEGRAM_CHAT_ID"
+      feishu_chat_ids:
+        - "YOUR_FEISHU_CHAT_ID"

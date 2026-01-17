@@ -1,9 +1,9 @@
 import http from "node:http";
 
 import { FeishuWebhook } from "../channels/feishuWebhook.js";
-import { handleMessage } from "../router/router.js";
-import { handleFeedbackIfAny } from "./handlers.js";
 import type { IntegrationContext } from "./context.js";
+import { dispatchMessageEvent } from "./dispatch.js";
+import { fromFeishu } from "./message_event.js";
 
 type FeishuWebhookHandler = (req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>;
 
@@ -30,10 +30,15 @@ export type FeishuWebhookRuntime = {
   enabled: boolean;
   path: string;
   handler: FeishuWebhookHandler;
+  sendText?: (chatId: string, text: string) => Promise<void>;
+  sendImage?: (chatId: string, imagePath: string) => Promise<void>;
 };
 
-export function createFeishuWebhookHandler(ctx: IntegrationContext): FeishuWebhookRuntime {
-  const { cfg, loaded, storageDir, limiter } = ctx;
+export function createFeishuWebhookHandler(
+  ctx: IntegrationContext,
+  client?: FeishuWebhook,
+): FeishuWebhookRuntime {
+  const { cfg } = ctx;
   const fcfg = cfg.channels?.feishu ?? {};
   const feishuEnabled = Boolean(fcfg.enabled);
   if (!feishuEnabled) {
@@ -49,9 +54,7 @@ export function createFeishuWebhookHandler(ctx: IntegrationContext): FeishuWebho
     throw new Error("Set gateway.owner.feishu_chat_id in config.yaml");
   }
 
-  const allowlistModeFeishu = (fcfg.allowlist_mode ?? "auth") as "owner_only" | "auth";
-
-  const feishu = new FeishuWebhook({
+  const feishu = client ?? new FeishuWebhook({
     app_id_env: String(fcfg.app_id_env || "FEISHU_APP_ID"),
     app_secret_env: String(fcfg.app_secret_env || "FEISHU_APP_SECRET"),
     verification_token_env: String(fcfg.verification_token_env || "FEISHU_VERIFICATION_TOKEN"),
@@ -63,8 +66,6 @@ export function createFeishuWebhookHandler(ctx: IntegrationContext): FeishuWebho
 
   const feishuEventPathRaw = String(fcfg.event_path || "/feishu/events");
   const feishuEventPath = feishuEventPathRaw.startsWith("/") ? feishuEventPathRaw : `/${feishuEventPathRaw}`;
-  const ownerFeishuUserId = String(process.env.OWNER_FEISHU_USER_ID || "");
-
   const handler: FeishuWebhookHandler = async (req, res) => {
     if (req.method !== "POST") return false;
     const url = new URL(req.url || "/", "http://localhost");
@@ -85,33 +86,9 @@ export function createFeishuWebhookHandler(ctx: IntegrationContext): FeishuWebho
         return true;
       }
       if (out.kind === "message") {
-        const m = out.msg;
-        if (await handleFeedbackIfAny({
-          storageDir,
-          channel: "feishu",
-          chatId: m.chatId,
-          userId: m.userId,
-          text: m.text,
-          send: feishu.sendMessage.bind(feishu),
-        })) {
-          okJson(res, { code: 0 });
-          return true;
-        }
-        void handleMessage({
-          storageDir,
-          channel: "feishu",
-          ownerChatId: ownerFeishuChatId,
-          ownerUserId: ownerFeishuUserId,
-          allowlistMode: allowlistModeFeishu,
-          config: loaded,
-          limiter,
-          chatId: m.chatId,
-          userId: m.userId,
-          text: m.text,
-          replyText: m.replyText,
-          isGroup: m.isGroup,
-          mentionsBot: m.mentionsBot,
-          send: feishu.sendMessage.bind(feishu),
+        const event = fromFeishu(out.msg);
+        void dispatchMessageEvent(ctx, event, {
+          sendText: feishu.sendMessage.bind(feishu),
         }).catch((e: any) => {
           console.error("[feishu][WARN] handleMessage failed:", String(e?.message || e));
         });
@@ -128,6 +105,8 @@ export function createFeishuWebhookHandler(ctx: IntegrationContext): FeishuWebho
     enabled: true,
     path: feishuEventPath,
     handler,
+    sendText: feishu.sendMessage.bind(feishu),
+    sendImage: feishu.sendImage.bind(feishu),
   };
 }
 

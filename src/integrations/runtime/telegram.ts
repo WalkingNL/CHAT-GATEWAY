@@ -1,10 +1,17 @@
 import { TelegramPolling } from "../channels/telegramPolling.js";
-import { handleMessage } from "../router/router.js";
-import { handleChartIfAny, handleFeedbackIfAny } from "./handlers.js";
 import type { IntegrationContext } from "./context.js";
+import { dispatchMessageEvent } from "./dispatch.js";
+import { fromTelegram } from "./message_event.js";
 
-export async function startTelegramPolling(ctx: IntegrationContext) {
-  const { cfg, loaded, storageDir, limiter } = ctx;
+type TelegramOpts = {
+  telegram?: TelegramPolling;
+  feishuSendText?: (chatId: string, text: string) => Promise<void>;
+  feishuSendImage?: (chatId: string, imagePath: string) => Promise<void>;
+  feishuChatId?: string;
+};
+
+export async function startTelegramPolling(ctx: IntegrationContext, opts?: TelegramOpts) {
+  const { cfg } = ctx;
   const tcfg = cfg.channels?.telegram ?? {};
   const telegramEnabled = tcfg.enabled !== false;
   if (!telegramEnabled) {
@@ -13,14 +20,11 @@ export async function startTelegramPolling(ctx: IntegrationContext) {
   }
 
   const ownerTelegramChatId = String(cfg.gateway?.owner?.telegram_chat_id ?? "");
-  const ownerTelegramUserId = String(process.env.OWNER_TELEGRAM_USER_ID || "");
   if (!ownerTelegramChatId || ownerTelegramChatId === "YOUR_OWNER_CHAT_ID") {
     throw new Error("Set gateway.owner.telegram_chat_id in config.yaml");
   }
 
-  const allowlistModeTelegram = (tcfg.allowlist_mode ?? "auth") as "owner_only" | "auth";
-
-  const tg = new TelegramPolling({
+  const tg = opts?.telegram ?? new TelegramPolling({
     bot_token_env: String(tcfg.bot_token_env || "TELEGRAM_BOT_TOKEN"),
     poll_interval_ms: Number(tcfg.poll_interval_ms || 1500),
   });
@@ -36,48 +40,12 @@ export async function startTelegramPolling(ctx: IntegrationContext) {
 
     for (const m of msgs) {
       try {
-        if (await handleFeedbackIfAny({
-          storageDir,
-          channel: "telegram",
-          chatId: m.chatId,
-          userId: m.userId,
-          text: m.text,
-          send: tg.sendMessage.bind(tg),
-        })) {
-          continue;
-        }
-        if (await handleChartIfAny({
-          storageDir,
-          config: loaded,
-          allowlistMode: allowlistModeTelegram,
-          ownerChatId: ownerTelegramChatId,
-          ownerUserId: ownerTelegramUserId,
-          chatId: m.chatId,
-          userId: m.userId,
-          text: m.text,
-          isGroup: m.isGroup,
-          mentionsBot: m.mentionsBot,
-          replyText: m.replyText,
-          sendTelegram: tg.sendPhoto.bind(tg),
-          sendTelegramText: tg.sendMessage.bind(tg),
-        })) {
-          continue;
-        }
-        await handleMessage({
-          storageDir,
-          channel: "telegram",
-          ownerChatId: ownerTelegramChatId,
-          ownerUserId: ownerTelegramUserId,
-          allowlistMode: allowlistModeTelegram,
-          config: loaded,
-          limiter,
-          chatId: m.chatId,
-          userId: m.userId,
-          text: m.text,
-          replyText: m.replyText,
-          isGroup: m.isGroup,
-          mentionsBot: m.mentionsBot,
-          send: tg.sendMessage.bind(tg),
+        await dispatchMessageEvent(ctx, fromTelegram(m), {
+          sendText: tg.sendMessage.bind(tg),
+          sendPhoto: tg.sendPhoto.bind(tg),
+          sendFeishuText: opts?.feishuSendText,
+          sendFeishuImage: opts?.feishuSendImage,
+          feishuChatId: opts?.feishuChatId,
         });
       } catch (e: any) {
         console.error("[tg][WARN] handleMessage failed:", String(e?.message || e));

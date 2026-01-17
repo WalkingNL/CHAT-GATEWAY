@@ -1,4 +1,6 @@
-const BASE = process.env.CHAT_GATEWAY_INTERNAL_URL || "http://127.0.0.1:8787";
+function resolveBaseUrl(): string {
+  return process.env.CHAT_GATEWAY_INTERNAL_URL || "http://127.0.0.1:8787";
+}
 
 export async function submitTask(payload: {
   task_id: string;
@@ -6,10 +8,11 @@ export async function submitTask(payload: {
   prompt: string;
   context?: any;
 }) {
+  const base = resolveBaseUrl();
   const token = process.env.CHAT_GATEWAY_TOKEN;
   if (!token) throw new Error("Missing CHAT_GATEWAY_TOKEN");
 
-  const res = await fetch(`${BASE}/v1/tasks`, {
+  const res = await fetch(`${base}/v1/tasks`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileLimited } from "../runtime/exec_limiter.js";
 
 export type ChartKind = "factor_timeline" | "daily_activity";
 
@@ -155,21 +155,20 @@ function resolveAllowedOutPath(outPath: string): string {
   return normalized;
 }
 
-function runPython(args: string[]) {
+async function runPython(args: string[]): Promise<void> {
   const python = "/srv/crypto_agent/venv/bin/python3";
   const cwd = "/srv/crypto_agent";
   const mergedPyPath = [cwd, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
   const env = { ...process.env, PYTHONPATH: mergedPyPath, TZ: "UTC" };
-  execFileSync(python, args, {
+  await execFileLimited("charts", python, args, {
     cwd,
     env,
     timeout: 60_000,
     maxBuffer: 10 * 1024 * 1024,
-    stdio: "pipe",
   });
 }
 
-export function renderChart(intent: ChartIntent): ChartRenderResult {
+export async function renderChart(intent: ChartIntent): Promise<ChartRenderResult> {
   const outPath = resolveAllowedOutPath(buildOutPath(intent.kind, intent.symbol));
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
 
@@ -179,11 +178,11 @@ export function renderChart(intent: ChartIntent): ChartRenderResult {
     }
     const hours = Number(intent.hours || 24);
     const script = "/srv/crypto_agent/tools/render_factor_timeline.py";
-    runPython([script, "--symbol", intent.symbol, "--hours", String(hours), "--out", outPath]);
+    await runPython([script, "--symbol", intent.symbol, "--hours", String(hours), "--out", outPath]);
   } else {
     const date = String(intent.date || formatUtcDate(new Date()));
     const script = "/srv/crypto_agent/tools/render_daily_activity_chart.py";
-    runPython([script, "--date", date, "--out", outPath]);
+    await runPython([script, "--date", date, "--out", outPath]);
   }
 
   if (!fs.existsSync(outPath)) {

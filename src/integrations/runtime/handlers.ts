@@ -172,7 +172,7 @@ export async function handleChartIfAny(params: {
     }
 
     try {
-      const rendered = renderChart(intent);
+      const rendered = await renderChart(intent);
       await sendTelegram(chatId, rendered.outPath, rendered.caption);
       if (sendFeishuImage && sendFeishuText && feishuChatId) {
         await sendFeishuText(feishuChatId, rendered.caption);
