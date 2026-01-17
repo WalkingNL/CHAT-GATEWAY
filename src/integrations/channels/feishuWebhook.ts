@@ -15,6 +15,8 @@ export type FeishuMsg = {
   chatType: string;
   text: string;
   userId: string;
+  messageId: string;
+  replyToId: string;
   replyText: string;
   isGroup: boolean;
   mentionsBot: boolean;
@@ -183,6 +185,7 @@ export class FeishuWebhook {
 
     const chatId = String(message?.chat_id || "");
     const userId = String(sender?.sender_id?.user_id || sender?.sender_id?.open_id || "");
+    const messageId = String(message?.message_id || "");
     const rawText = this.parseContentText(message?.content ?? message?.body?.content, msgType);
     const text = this.stripMentions(rawText);
     if (!chatId || !userId || !text) {
@@ -202,7 +205,7 @@ export class FeishuWebhook {
 
     return {
       kind: "message",
-      msg: { chatId, chatType, userId, text, replyText, isGroup, mentionsBot },
+      msg: { chatId, chatType, userId, messageId, replyToId: parentId, text, replyText, isGroup, mentionsBot },
     };
   }
 

@@ -110,6 +110,13 @@ const moduleMetrics = new Map<ExecModule, ExecMetrics>();
 const warnQueue = toNonNegativeInt(process.env.CHAT_GATEWAY_EXEC_WARN_QUEUE, 10);
 const warnWaitMs = toNonNegativeInt(process.env.CHAT_GATEWAY_EXEC_WARN_WAIT_MS, 2000);
 const logIntervalMs = toNonNegativeInt(process.env.CHAT_GATEWAY_EXEC_LOG_INTERVAL_MS, 60_000);
+const defaultTimeoutMs = toNonNegativeInt(process.env.CHAT_GATEWAY_EXEC_TIMEOUT_MS, 60_000);
+const moduleTimeouts: Record<ExecModule, number> = {
+  telegram: toNonNegativeInt(process.env.CHAT_GATEWAY_EXEC_TIMEOUT_TELEGRAM_MS, defaultTimeoutMs),
+  feishu: toNonNegativeInt(process.env.CHAT_GATEWAY_EXEC_TIMEOUT_FEISHU_MS, defaultTimeoutMs),
+  notify: toNonNegativeInt(process.env.CHAT_GATEWAY_EXEC_TIMEOUT_NOTIFY_MS, defaultTimeoutMs),
+  charts: toNonNegativeInt(process.env.CHAT_GATEWAY_EXEC_TIMEOUT_CHARTS_MS, defaultTimeoutMs),
+};
 
 function getModuleSemaphore(name: ExecModule): Semaphore {
   const cached = moduleSemaphores.get(name);
@@ -205,7 +212,8 @@ export async function execFileLimited(
   maybeLogSummary(moduleName, getModuleMetrics(moduleName));
 
   try {
-    const merged: ExecOptions = { ...options, encoding: "utf8" };
+    const timeout = options.timeout ?? moduleTimeouts[moduleName];
+    const merged: ExecOptions = { ...options, encoding: "utf8", timeout };
     const res = await execFileAsync(file, args, merged);
     return { stdout: String(res.stdout || ""), stderr: String(res.stderr || "") };
   } finally {

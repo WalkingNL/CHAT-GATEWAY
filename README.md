@@ -9,6 +9,8 @@ Core gateway + integrations split. Core stays reusable; channel-specific logic l
 
 ## Entrypoints
 
+Default entrypoint (`src/index.ts`) imports core-only to avoid accidentally running integrations/all-in-one.
+
 Core only (default):
 
 ```bash
@@ -96,11 +98,15 @@ npx tsx src/entrypoints/all_in_one.ts
 - `CHAT_GATEWAY_EXEC_MAX_GLOBAL`: global execFile concurrency (default 8)
 - `CHAT_GATEWAY_EXEC_MAX_TELEGRAM`, `CHAT_GATEWAY_EXEC_MAX_FEISHU`, `CHAT_GATEWAY_EXEC_MAX_NOTIFY`, `CHAT_GATEWAY_EXEC_MAX_CHARTS`: per-module execFile concurrency
 - `CHAT_GATEWAY_EXEC_WARN_QUEUE`, `CHAT_GATEWAY_EXEC_WARN_WAIT_MS`, `CHAT_GATEWAY_EXEC_LOG_INTERVAL_MS`: exec queue observability thresholds
+- `CHAT_GATEWAY_EXEC_TIMEOUT_MS`: exec per-call timeout in ms (default 60000)
+- `CHAT_GATEWAY_EXEC_TIMEOUT_TELEGRAM_MS`, `CHAT_GATEWAY_EXEC_TIMEOUT_FEISHU_MS`, `CHAT_GATEWAY_EXEC_TIMEOUT_NOTIFY_MS`, `CHAT_GATEWAY_EXEC_TIMEOUT_CHARTS_MS`: per-module timeout overrides
 - `CHAT_GATEWAY_CIRCUIT_OPEN_AFTER`, `CHAT_GATEWAY_CIRCUIT_OPEN_MS`: supervisor circuit breaker (defaults 5 failures / 60s)
 - `CHAT_GATEWAY_CIRCUIT_OPEN_AFTER_TELEGRAM`, `CHAT_GATEWAY_CIRCUIT_OPEN_AFTER_FEISHU`, `CHAT_GATEWAY_CIRCUIT_OPEN_AFTER_NOTIFY`: per-module overrides
 - `CHAT_GATEWAY_CIRCUIT_OPEN_MS_TELEGRAM`, `CHAT_GATEWAY_CIRCUIT_OPEN_MS_FEISHU`, `CHAT_GATEWAY_CIRCUIT_OPEN_MS_NOTIFY`: per-module overrides
 - `CHAT_GATEWAY_MAX_RESTARTS_PER_HOUR` (default 30) and `CHAT_GATEWAY_MAX_RESTARTS_TELEGRAM_PER_HOUR`/`FEISHU`/`NOTIFY`
 - `CHAT_GATEWAY_SUPERVISE_RESET_MS` and `CHAT_GATEWAY_SUPERVISE_RESET_MS_TELEGRAM`/`FEISHU`/`NOTIFY`
+
+Supervisor backoff defaults: 1s → 2s → 5s → 10s → 30s (max 30s). Not currently configurable.
 
 ## Core HTTP API
 
@@ -110,7 +116,7 @@ npx tsx src/entrypoints/all_in_one.ts
 ## Integrations notify API
 
 Auth: `Authorization: Bearer $CHAT_GATEWAY_TOKEN` (required)
-Network: internal-only (loopback/private IPs). Bind `INTEGRATIONS_HOST=127.0.0.1` or a private IP.
+Network: internal-only (loopback/private IPs). Only trust direct socket address; X-Forwarded-For is ignored. Bind `INTEGRATIONS_HOST=127.0.0.1` or a private IP.
 Registry: `config/projects.yml` auto-reloads on mtime change; `SIGHUP` forces reload.
 
 - `POST /v1/notify/text`
@@ -130,8 +136,14 @@ Registry: `config/projects.yml` auto-reloads on mtime change; `SIGHUP` forces re
 | --- | --- |
 | Downstream TG/Feishu/notify crash | supervisor backoff + circuit breaker; restart limit can stop the loop |
 | Exec queue saturation | concurrency caps prevent fork storm; WARN logs show queue/wait stats |
+| Exec timeout | per-call timeout kills the subprocess; caller sees error |
 | Registry reload failure | keep last good config; WARN with hash; next mtime/SIGHUP retries |
 | Network jitter/timeouts | curl timeouts raise errors; supervisor backoff isolates failures |
+
+## Verification
+
+- Type check: `npm run build` (tsc); for tsx-only flows, run `tsx --typecheck` if needed.
+- Lint (if configured in this repo).
 
 ## Networking note
 

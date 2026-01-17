@@ -10,6 +10,8 @@ export type TelegramMsg = {
   chatType: string;
   text: string;
   userId: string;
+  messageId: string;
+  replyToId: string;
   replyText: string;
   isGroup: boolean;
   mentionsBot: boolean;
@@ -84,6 +86,8 @@ export class TelegramPolling {
 
       const chatId = String(m.chat?.id ?? "");
       const userId = String(m.from?.id ?? chatId);
+      const messageId = String(m.message_id ?? "");
+      const replyToId = String(m.reply_to_message?.message_id ?? "");
       const text = String(m.text || "");
       const replyText = String(m.reply_to_message?.text || "");
       const chatType = String(m.chat?.type || "");
@@ -106,7 +110,7 @@ export class TelegramPolling {
       const mentionsBot = mentionToken
         ? text.toLowerCase().includes(mentionTokenLower) || mentionByEntity
         : false;
-      out.push({ chatId, chatType, userId, text, replyText, isGroup, mentionsBot });
+      out.push({ chatId, chatType, userId, messageId, replyToId, text, replyText, isGroup, mentionsBot });
     }
     return out;
   }

@@ -6,6 +6,8 @@ export type MessageEvent = {
   chatId: string;
   chatType: string;
   userId: string;
+  messageId: string;
+  replyToId: string;
   text: string;
   replyText: string;
   isGroup: boolean;
@@ -18,6 +20,8 @@ export function fromTelegram(msg: TelegramMsg): MessageEvent {
     chatId: msg.chatId,
     chatType: msg.chatType || (msg.isGroup ? "group" : "private"),
     userId: msg.userId,
+    messageId: msg.messageId,
+    replyToId: msg.replyToId,
     text: msg.text,
     replyText: msg.replyText,
     isGroup: msg.isGroup,
@@ -31,6 +35,8 @@ export function fromFeishu(msg: FeishuMsg): MessageEvent {
     chatId: msg.chatId,
     chatType: msg.chatType || (msg.isGroup ? "group" : "private"),
     userId: msg.userId,
+    messageId: msg.messageId,
+    replyToId: msg.replyToId,
     text: msg.text,
     replyText: msg.replyText,
     isGroup: msg.isGroup,
