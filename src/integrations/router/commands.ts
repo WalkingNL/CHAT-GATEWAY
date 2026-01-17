@@ -62,7 +62,7 @@ export function parseCommand(text: string): Cmd {
 }
 
 // ===== LLM gateway commands =====
-import { submitTask } from "../internal_client";
+import { submitTask } from "../../core/internal_client.js";
 
 export async function handleAskCommand(ctx: {
   chatId: number | string;

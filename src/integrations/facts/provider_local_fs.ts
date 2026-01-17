@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import type { ProjectManifest } from "../config/types.js";
+import type { ProjectManifest } from "../../core/config/types.js";
 
 export type ExplainFacts = {
   window_1h: any;

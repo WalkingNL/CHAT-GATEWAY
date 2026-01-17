@@ -5,12 +5,12 @@ import { execSync } from "node:child_process";
 import { handleAskCommand, parseCommand } from "./commands.js";
 import { appendLedger } from "../audit/ledger.js";
 import { getStatusFacts } from "./context.js";
-import { RateLimiter } from "../rateLimit/limiter.js";
+import type { RateLimiter } from "../../core/rateLimit/limiter.js";
 import { loadAuth, saveAuth } from "../auth/store.js";
-import type { LLMProvider, ChatMessage } from "../providers/base.js";
-import { submitTask } from "../internal_client.js";
-import { evaluate } from "../config/index.js";
-import type { LoadedConfig } from "../config/types.js";
+import type { ChatMessage } from "../../core/providers/base.js";
+import { submitTask } from "../../core/internal_client.js";
+import { evaluate } from "../../core/config/index.js";
+import type { LoadedConfig } from "../../core/config/types.js";
 import { parseAlertText, LocalFsFactsProvider } from "../facts/index.js";
 import { routeExplain } from "../explain/router_v1.js";
 import { writeExplainTrace, writeExplainFeedback } from "../audit/trace_writer.js";
@@ -1105,7 +1105,6 @@ export async function handleMessage(opts: {
   ownerUserId?: string;
   allowlistMode: "owner_only" | "auth";
   config?: LoadedConfig;
-  provider: LLMProvider;
   limiter: RateLimiter;
   chatId: string;
   userId: string;
@@ -1127,11 +1126,10 @@ export async function handleMessage(opts: {
     text,
     replyText = "",
     isGroup = false,
-    mentionsBot = false,
-    send,
-    provider,
-    limiter,
-  } = opts;
+  mentionsBot = false,
+  send,
+  limiter,
+} = opts;
 
   const trimmedText = (text || "").trim();
   const authState = loadAuth(storageDir, ownerChatId, channel);
