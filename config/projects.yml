@@ -1,6 +1,9 @@
 # Project notify defaults for integrations /v1/notify/*
 projects:
   crypto_agent:
+    on_demand:
+      url: "http://127.0.0.1:8799"
+      token_env: "CRYPTO_AGENT_ON_DEMAND_TOKEN"
     notify:
       telegram_chat_ids:
         - "YOUR_TELEGRAM_CHAT_ID"

@@ -41,24 +41,23 @@ export async function dispatchMessageEvent(ctx: IntegrationContext, event: Messa
     return;
   }
 
-  if (channel === "telegram" && senders.sendPhoto) {
+  if (channel === "telegram") {
     if (await handleChartIfAny({
       storageDir,
       config: loaded,
       allowlistMode: allowlistModeTelegram,
       ownerChatId: ownerTelegramChatId,
       ownerUserId: ownerTelegramUserId,
+      channel: event.channel,
       chatId: event.chatId,
+      messageId: event.messageId,
+      replyToId: event.replyToId,
       userId: event.userId,
       text: event.text,
       isGroup: event.isGroup,
       mentionsBot: event.mentionsBot,
       replyText: event.replyText,
-      sendTelegram: senders.sendPhoto,
       sendTelegramText: senders.sendText,
-      sendFeishuImage: senders.sendFeishuImage,
-      sendFeishuText: senders.sendFeishuText,
-      feishuChatId: senders.feishuChatId,
     })) {
       return;
     }

@@ -196,7 +196,7 @@ export class FeishuWebhook {
     const isGroup = !(chatType === "p2p" || chatType === "private");
 
     let replyText = "";
-    const parentId = String(message?.parent_id || message?.root_id || "");
+    const parentId = String(message?.parent_id || "");
     if (parentId) {
       replyText = await this.fetchMessageText(parentId);
     }

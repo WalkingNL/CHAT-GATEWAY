@@ -5,6 +5,38 @@ import { loadAuth } from "../auth/store.js";
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
 
+function sanitizeRequestId(raw: string): string {
+  return raw.replace(/[^A-Za-z0-9._:-]/g, "_").slice(0, 200);
+}
+
+function buildChartRequestId(
+  channel: string,
+  messageId: string,
+  chatId: string,
+  intent: ReturnType<typeof detectChartIntents>[number],
+) {
+  const parts: string[] = [channel, chatId, messageId, intent.kind];
+  return sanitizeRequestId(parts.join(":"));
+}
+
+function resolveProjectId(config?: LoadedConfig): string | null {
+  const envId = String(process.env.GW_DEFAULT_PROJECT_ID || "").trim();
+  if (envId) return envId;
+
+  const policyAny = config?.policy as any;
+  const policyId = typeof policyAny?.default_project_id === "string"
+    ? policyAny.default_project_id.trim()
+    : "";
+  if (policyId) return policyId;
+
+  const projects = config?.projects || {};
+  for (const [id, proj] of Object.entries(projects)) {
+    if (proj && (proj as any).enabled !== false) return id;
+  }
+  const ids = Object.keys(projects);
+  return ids.length ? ids[0] : null;
+}
+
 export async function handleFeedbackIfAny(params: {
   storageDir: string;
   channel: string;
@@ -50,17 +82,16 @@ export async function handleChartIfAny(params: {
   allowlistMode: "owner_only" | "auth";
   ownerChatId: string;
   ownerUserId: string;
+  channel: string;
   chatId: string;
+  messageId: string;
+  replyToId: string;
   userId: string;
   text: string;
   isGroup: boolean;
   mentionsBot: boolean;
   replyText: string;
-  sendTelegram: (chatId: string, imagePath: string, caption?: string) => Promise<void>;
   sendTelegramText: (chatId: string, text: string) => Promise<void>;
-  sendFeishuImage?: (chatId: string, imagePath: string) => Promise<void>;
-  sendFeishuText?: (chatId: string, text: string) => Promise<void>;
-  feishuChatId?: string;
 }): Promise<boolean> {
   const {
     storageDir,
@@ -68,17 +99,16 @@ export async function handleChartIfAny(params: {
     allowlistMode,
     ownerChatId,
     ownerUserId,
+    channel,
     chatId,
+    messageId,
+    replyToId,
     userId,
     text,
     isGroup,
     mentionsBot,
     replyText,
-    sendTelegram,
     sendTelegramText,
-    sendFeishuImage,
-    sendFeishuText,
-    feishuChatId,
   } = params;
 
   const trimmed = String(text || "").trim();
@@ -119,6 +149,21 @@ export async function handleChartIfAny(params: {
     return false;
   }
 
+  const requestKey = messageId || replyToId;
+  if (!requestKey) {
+    await sendTelegramText(chatId, "该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配");
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "chart_reject",
+      reason: "missing_message_id_and_parent_id",
+      raw: trimmed,
+    });
+    return true;
+  }
+
   const authState = loadAuth(storageDir, ownerChatId, "telegram");
   const isOwnerChat = chatId === ownerChatId;
   const isOwnerUser = ownerUserId ? userId === ownerUserId : userId === ownerChatId;
@@ -128,6 +173,12 @@ export async function handleChartIfAny(params: {
       : authState.allowed.includes(chatId) || isOwnerUser;
   const policyOk = config?.meta?.policyOk === true;
   const chatType = isGroup ? "group" : "private";
+  const projectId = resolveProjectId(config);
+
+  if (!projectId) {
+    await sendTelegramText(chatId, "未配置默认项目，无法生成图表");
+    return true;
+  }
 
   const checkAllowed = (capability: string) => {
     const res = evaluate(config, {
@@ -172,12 +223,13 @@ export async function handleChartIfAny(params: {
     }
 
     try {
-      const rendered = await renderChart(intent);
-      await sendTelegram(chatId, rendered.outPath, rendered.caption);
-      if (sendFeishuImage && sendFeishuText && feishuChatId) {
-        await sendFeishuText(feishuChatId, rendered.caption);
-        await sendFeishuImage(feishuChatId, rendered.outPath);
+      const reqId = buildChartRequestId(channel || "telegram", requestKey, chatId, intent);
+      const rendered = await renderChart(intent, { projectId, requestId: reqId });
+      if (!rendered.ok) {
+        const trace = rendered.traceId ? ` trace_id=${rendered.traceId}` : "";
+        throw new Error(`${rendered.error || "render_failed"}${trace}`.trim());
       }
+      await sendTelegramText(chatId, "已请求生成图表，稍后发送");
     } catch (e: any) {
       await sendTelegramText(chatId, `图表生成失败：${String(e?.message || e)}`);
       return true;

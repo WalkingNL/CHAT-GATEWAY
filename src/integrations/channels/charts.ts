@@ -1,6 +1,4 @@
-import fs from "node:fs";
-import path from "node:path";
-import { execFileLimited } from "../runtime/exec_limiter.js";
+import { loadProjectRegistry } from "../runtime/project_registry.js";
 
 export type ChartKind = "factor_timeline" | "daily_activity";
 
@@ -14,8 +12,12 @@ export type ChartIntent = {
 
 type ChartRenderResult = {
   kind: ChartKind;
-  outPath: string;
-  caption: string;
+  ok: boolean;
+  imagePath?: string;
+  sent?: { telegram?: boolean; feishu?: boolean };
+  traceId?: string;
+  status?: string;
+  error?: string;
 };
 
 const DEFAULT_SYMBOL_MAP: Record<string, string> = {
@@ -126,68 +128,107 @@ export function detectChartIntents(text: string, now = new Date()): ChartIntent[
   return out;
 }
 
-function chartsDir(): string {
-  const env = String(process.env.CHART_OUTPUT_DIR || "").trim();
-  if (env) return env;
-  return "/srv/crypto_agent/data/metrics/on_demand";
+type OnDemandConfig = { url: string; token: string };
+
+function resolveOnDemandConfig(projectId?: string): OnDemandConfig {
+  const envUrl = String(process.env.CRYPTO_AGENT_ON_DEMAND_URL || "").trim();
+  const envToken = String(process.env.CRYPTO_AGENT_ON_DEMAND_TOKEN || "").trim();
+  if (envUrl && envToken) return { url: envUrl, token: envToken };
+
+  const registry = loadProjectRegistry();
+  const proj = projectId ? registry.projects?.[projectId] : undefined;
+  const anyProj = proj ?? registry.projects?.crypto_agent ?? null;
+  const onDemand = (anyProj as any)?.on_demand ?? {};
+
+  const url = String(
+    onDemand.url
+      || (anyProj as any)?.on_demand_url
+      || envUrl
+      || "http://127.0.0.1:8799",
+  ).trim();
+
+  const tokenEnv = String(
+    onDemand.token_env
+      || (anyProj as any)?.on_demand_token_env
+      || "",
+  ).trim();
+  const token = String(
+    (tokenEnv ? process.env[tokenEnv] : "")
+      || onDemand.token
+      || (anyProj as any)?.on_demand_token
+      || envToken
+      || "",
+  ).trim();
+
+  if (!token) throw new Error("missing on-demand token");
+  return { url, token };
 }
 
-function buildOutPath(kind: ChartKind, symbol?: string): string {
-  const safeSymbol = String(symbol || "na").replace(/[^a-z0-9_-]+/gi, "").toLowerCase();
-  const name = `${kind}_${safeSymbol || "na"}_${Date.now()}.png`;
-  return path.join(chartsDir(), name);
-}
-
-function resolveAllowedOutPath(outPath: string): string {
-  const allowlistEnv = String(process.env.CHART_OUTPUT_ALLOWLIST || "").trim();
-  const allowlist = allowlistEnv
-    ? allowlistEnv.split(",").map(s => s.trim()).filter(Boolean)
-    : ["/srv/crypto_agent/data/metrics/on_demand"];
-
-  const normalized = path.resolve(outPath);
-  const ok = allowlist.some((allowed) => {
-    const base = path.resolve(allowed);
-    return normalized === base || normalized.startsWith(`${base}${path.sep}`);
-  });
-  if (!ok) {
-    throw new Error("chart output path not allowed");
-  }
-  return normalized;
-}
-
-async function runPython(args: string[]): Promise<void> {
-  const python = "/srv/crypto_agent/venv/bin/python3";
-  const cwd = "/srv/crypto_agent";
-  const mergedPyPath = [cwd, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
-  const env = { ...process.env, PYTHONPATH: mergedPyPath, TZ: "UTC" };
-  await execFileLimited("charts", python, args, {
-    cwd,
-    env,
-    timeout: 60_000,
-    maxBuffer: 10 * 1024 * 1024,
-  });
-}
-
-export async function renderChart(intent: ChartIntent): Promise<ChartRenderResult> {
-  const outPath = resolveAllowedOutPath(buildOutPath(intent.kind, intent.symbol));
-  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+function buildRenderPayload(intent: ChartIntent, projectId: string | undefined, requestId: string) {
+  const payload: any = {
+    request_id: requestId,
+    kind: intent.kind,
+    caption: intent.caption,
+    target: projectId ? { project_id: projectId } : undefined,
+  };
 
   if (intent.kind === "factor_timeline") {
-    if (!intent.symbol) {
-      throw new Error("missing symbol");
-    }
+    payload.symbol = intent.symbol;
     const hours = Number(intent.hours || 24);
-    const script = "/srv/crypto_agent/tools/render_factor_timeline.py";
-    await runPython([script, "--symbol", intent.symbol, "--hours", String(hours), "--out", outPath]);
+    payload.window_minutes = Math.max(1, Math.round(hours * 60));
   } else {
-    const date = String(intent.date || formatUtcDate(new Date()));
-    const script = "/srv/crypto_agent/tools/render_daily_activity_chart.py";
-    await runPython([script, "--date", date, "--out", outPath]);
+    payload.date_utc = String(intent.date || formatUtcDate(new Date()));
   }
 
-  if (!fs.existsSync(outPath)) {
-    throw new Error(`chart output missing: ${outPath}`);
-  }
+  return payload;
+}
 
-  return { kind: intent.kind, outPath, caption: intent.caption };
+async function postJson(url: string, token: string, body: any): Promise<any> {
+  const timeoutMs = Number(process.env.CHAT_GATEWAY_CHART_ACK_TIMEOUT_MS || "2000");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let data: any = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { ok: false, error: "invalid_json", raw: text };
+    }
+    if (!res.ok) {
+      throw new Error(`on_demand_http_${res.status}: ${data?.error || text}`);
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function renderChart(
+  intent: ChartIntent,
+  opts?: { projectId?: string; requestId?: string },
+): Promise<ChartRenderResult> {
+  const requestId = String(opts?.requestId || "").trim();
+  if (!requestId) throw new Error("missing_request_id");
+  const cfg = resolveOnDemandConfig(opts?.projectId);
+  const payload = buildRenderPayload(intent, opts?.projectId, requestId);
+  const res = await postJson(`${cfg.url}/v1/render`, cfg.token, payload);
+  return {
+    kind: intent.kind,
+    ok: Boolean(res?.ok),
+    imagePath: res?.image_path ? String(res.image_path) : undefined,
+    sent: res?.sent,
+    traceId: res?.trace_id ? String(res.trace_id) : undefined,
+    status: res?.status ? String(res.status) : undefined,
+    error: res?.error ? String(res.error) : undefined,
+  };
 }
