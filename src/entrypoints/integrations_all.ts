@@ -4,6 +4,7 @@ import { createFeishuWebhookHandler, startFeishuWebhookServer } from "../integra
 import { ensureInternalApiUrl } from "../integrations/runtime/internal_url.js";
 import { startNotifyServer } from "../integrations/runtime/notify_server.js";
 import { startTelegramPolling } from "../integrations/runtime/telegram.js";
+import { startCognitiveReminderLoop } from "../integrations/runtime/cognitive.js";
 
 process.on("uncaughtException", (e: any) => console.error("[uncaughtException]", e?.stack || e));
 process.on("unhandledRejection", (e: any) => console.error("[unhandledRejection]", e));
@@ -170,6 +171,8 @@ function main() {
         }
       : undefined,
   };
+
+  startCognitiveReminderLoop({ storageDir: ctx.storageDir, senders });
 
   if (feishuRuntime.enabled) {
     void supervise("feishu", async () => {

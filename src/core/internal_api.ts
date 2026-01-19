@@ -2,6 +2,7 @@ import http from "node:http";
 
 import type { LLMProvider, ChatMessage } from "./providers/base.js";
 import { TaskStore } from "./task_store.js";
+import { CognitiveStore, type CognitiveStatus } from "./cognitive_store.js";
 
 export type InternalApiOpts = {
   host: string;
@@ -348,6 +349,52 @@ export function createInternalApiHandler(opts: InternalApiOpts): InternalApiHand
 
       store.put(taskId, resp);
       return okJson(res, resp);
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/cognitive/items") {
+      const store = new CognitiveStore(opts.storageDir);
+      const rawStatus = String(url.searchParams.get("status") || "");
+      const statusSet = new Set(["OPEN", "IN_PROGRESS", "BLOCKED", "DONE", "DISMISSED"]);
+      const statuses = rawStatus
+        .split(",")
+        .map(s => s.trim().toUpperCase())
+        .filter(s => statusSet.has(s));
+      const limitRaw = Number(url.searchParams.get("limit") || 0);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 200;
+      const items = store.listItems({ status: statuses.length ? (statuses as CognitiveStatus[]) : undefined, limit });
+      return okJson(res, { ok: true, items });
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/cognitive/update") {
+      let body: any;
+      try {
+        body = await readJson(req);
+      } catch {
+        return badRequest(res, "invalid_json");
+      }
+      const id = String(body.id || body.issue_id || body.short_id || "").trim();
+      const status = String(body.status || "").trim().toUpperCase();
+      const statusSet = new Set(["OPEN", "IN_PROGRESS", "BLOCKED", "DONE", "DISMISSED"]);
+      if (!id) return badRequest(res, "missing_id");
+      if (!statusSet.has(status)) return badRequest(res, "invalid_status");
+      const store = new CognitiveStore(opts.storageDir);
+      const item = await store.updateStatus(id, status as CognitiveStatus, body.updated_by);
+      if (!item) return notFound(res);
+      return okJson(res, { ok: true, item });
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/cognitive/migrate") {
+      let body: any;
+      try {
+        body = await readJson(req);
+      } catch {
+        return badRequest(res, "invalid_json");
+      }
+      const items = Array.isArray(body?.items) ? body.items : null;
+      if (!items || items.length === 0) return badRequest(res, "missing_items");
+      const store = new CognitiveStore(opts.storageDir);
+      const result = await store.importItems(items);
+      return okJson(res, { ok: true, ...result });
     }
 
     return notFound(res);
