@@ -92,6 +92,7 @@ export async function dispatchMessageEvent(ctx: IntegrationContext, event: Messa
     userId: event.userId,
     messageId: event.messageId,
     replyToId: event.replyToId,
+    replyText: event.replyText,
     text: event.text,
     isGroup: event.isGroup,
     mentionsBot: event.mentionsBot,

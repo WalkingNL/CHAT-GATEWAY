@@ -182,16 +182,26 @@ function parseConfirm(text: string): "record" | "ignore" | null {
   return null;
 }
 
-function parseStatusUpdate(text: string): { id: string; status: CognitiveStatus } | null {
+function findCognitiveId(text: string): string | null {
   const idMatch = text.match(/\bC-\d{8}-\d{3}\b/i);
-  if (!idMatch) return null;
+  return idMatch ? idMatch[0] : null;
+}
+
+function parseStatusUpdate(text: string): { id: string; status: CognitiveStatus } | null {
+  const id = findCognitiveId(text);
+  if (!id) return null;
   const lower = normalizeForMatch(text);
   for (const item of STATUS_MAP) {
     if (item.terms.some(term => lower.includes(term))) {
-      return { id: idMatch[0], status: item.status };
+      return { id, status: item.status };
     }
   }
   return null;
+}
+
+function hasUpdateVerb(text: string): boolean {
+  const t = normalizeForMatch(text);
+  return ["更新", "状态", "改为", "设为", "标记", "修改"].some(word => t.includes(word));
 }
 
 function resolveOwnerMatch(userId: string, ownerUserId: string, ownerChatId: string): boolean {
@@ -270,6 +280,7 @@ export async function handleCognitiveIfAny(params: {
   userId: string;
   messageId: string;
   replyToId: string;
+  replyText: string;
   text: string;
   isGroup: boolean;
   mentionsBot: boolean;
@@ -285,6 +296,7 @@ export async function handleCognitiveIfAny(params: {
     userId,
     messageId,
     replyToId,
+    replyText,
     text,
     isGroup,
     mentionsBot,
@@ -293,6 +305,8 @@ export async function handleCognitiveIfAny(params: {
 
   const rawText = String(text || "").trim();
   const normalized = normalizeText(rawText);
+  const replyRaw = String(replyText || "").trim();
+  const replyNormalized = normalizeText(replyRaw);
   if (!normalized) return false;
   if (isCommand(normalized)) return false;
   if (isGroup && !mentionsBot) return false;
@@ -326,8 +340,33 @@ export async function handleCognitiveIfAny(params: {
     return true;
   }
 
+  const idOnly = findCognitiveId(normalized);
+  if (idOnly && hasUpdateVerb(normalized) && !parseStatusUpdate(normalized)) {
+    await send(
+      chatId,
+      `请指定状态，例如：${idOnly} DONE / IN_PROGRESS / BLOCKED / DISMISSED`,
+    );
+    return true;
+  }
+
   const ruleDecision = classifyByRules(normalized);
   let decision: { action: "record" | "ignore" | "ask_clarify"; confidence: number; reason: string } | null = null;
+
+  const stripIntentPrefix = (textValue: string): { matched: boolean; rest: string } => {
+    const t = normalizeText(textValue);
+    const lower = t.toLowerCase();
+    for (const term of EXPLICIT_INTENTS) {
+      const tl = term.toLowerCase();
+      if (lower.startsWith(tl)) {
+        let rest = t.slice(term.length).trim();
+        rest = rest.replace(/^[:：\-—]+/, "").trim();
+        return { matched: true, rest };
+      }
+    }
+    return { matched: false, rest: "" };
+  };
+
+  const intentStrip = stripIntentPrefix(normalized);
 
   if (ruleDecision.action === "record") {
     decision = { ...ruleDecision, action: "record" };
@@ -348,7 +387,30 @@ export async function handleCognitiveIfAny(params: {
 
   if (!shouldAsk && !shouldRecord) return false;
 
-  const issueId = buildIssueId(channel, chatId, messageId, replyToId);
+  let targetRawText = rawText;
+  let targetNormalized = normalized;
+  let useReplyId = false;
+
+  if (intentStrip.matched) {
+    if (intentStrip.rest) {
+      targetRawText = intentStrip.rest;
+      targetNormalized = normalizeText(intentStrip.rest);
+    } else if (replyNormalized) {
+      targetRawText = replyRaw;
+      targetNormalized = replyNormalized;
+      useReplyId = Boolean(replyToId);
+    } else {
+      await send(chatId, "请直接描述问题内容，或回复要记录的消息再说“记录这个问题”。");
+      return true;
+    }
+  }
+
+  const issueId = buildIssueId(
+    channel,
+    chatId,
+    useReplyId ? "" : messageId,
+    replyToId,
+  );
   if (!issueId) {
     await send(chatId, "该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配");
     appendLedger(storageDir, {
@@ -377,13 +439,13 @@ export async function handleCognitiveIfAny(params: {
   const itemBase = {
     issue_id: issueId,
     type: itemType,
-    raw_text: rawText,
-    normalized_text: normalized,
-    dedup_key: hashText(normalized),
+    raw_text: targetRawText,
+    normalized_text: targetNormalized,
+    dedup_key: hashText(targetNormalized),
     source,
     status: "OPEN" as CognitiveStatus,
     created_at_utc: createdAt,
-    next_remind_at_utc: computeRemindAt(normalized),
+    next_remind_at_utc: computeRemindAt(targetNormalized),
   };
 
   if (shouldAsk) {
