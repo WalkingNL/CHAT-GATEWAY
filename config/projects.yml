@@ -6,6 +6,6 @@ projects:
       token_env: "CRYPTO_AGENT_ON_DEMAND_TOKEN"
     notify:
       telegram_chat_ids:
-        - "YOUR_TELEGRAM_CHAT_ID"
+        - "-5242302064"
       feishu_chat_ids:
-        - "YOUR_FEISHU_CHAT_ID"
+        - "oc_d69f1c419652e849c85e6d15cf467c2f"
