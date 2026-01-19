@@ -168,9 +168,7 @@ export function updatePushPolicyTargets(
   const { rate, source: rateSource } = loadStatsRate(statsPath);
   const multiplier = kind === "too_many" ? 0.7 : 1.3;
   const clamp = resolveClamp(targets);
-  const candidate = kind === "too_many"
-    ? Math.min(prevTarget, rate * multiplier)
-    : Math.max(prevTarget, rate * multiplier);
+  const candidate = prevTarget * multiplier;
   let nextTarget = applyClamp(candidate, clamp);
   nextTarget = roundTarget(nextTarget);
 
