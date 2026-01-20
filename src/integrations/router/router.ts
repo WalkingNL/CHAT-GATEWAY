@@ -676,6 +676,7 @@ function renderLogs(name: string, lines: number, maxLinesDefault: number) {
 }
 
 async function handleOpsCommand(params: {
+  storageDir: string;
   channel: string;
   cleanedText: string;
   config?: LoadedConfig;
@@ -688,6 +689,7 @@ async function handleOpsCommand(params: {
   send: SendFn;
 }): Promise<boolean> {
   const {
+    storageDir,
     channel,
     cleanedText,
     config,
@@ -727,7 +729,10 @@ async function handleOpsCommand(params: {
       await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
       return true;
     }
-    await send(chatId, renderStatus(pm2PsNames));
+    const status = renderStatus(pm2PsNames);
+    const feedback = getStatusFacts(storageDir).split("\n").slice(1);
+    const out = feedback.length ? `${status}\n${feedback.join("\n")}` : status;
+    await send(chatId, out);
     return true;
   }
 
@@ -1063,7 +1068,7 @@ async function handleParsedCommand(params: {
   }
 
   if (cmd.kind === "status") {
-    const out = getStatusFacts();
+    const out = getStatusFacts(storageDir);
     await send(chatId, out);
     appendLedger(storageDir, { ...baseAudit, cmd: "status", out_tail: out.slice(-800) });
     return;
@@ -1188,6 +1193,7 @@ export async function handleMessage(opts: {
   }
 
   const handledOps = await handleOpsCommand({
+    storageDir,
     channel,
     cleanedText,
     config,

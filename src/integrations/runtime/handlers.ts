@@ -1,6 +1,13 @@
+import fs from "node:fs";
+import path from "node:path";
 import { appendLedger } from "../audit/ledger.js";
 import { detectChartIntents, renderChart } from "../channels/charts.js";
-import { detectFeedback, FEEDBACK_REPLY, updatePushPolicyTargets } from "../channels/feedback.js";
+import {
+  buildFeedbackReply,
+  detectFeedback,
+  FEEDBACK_REPLY,
+  updatePushPolicyTargets,
+} from "../channels/feedback.js";
 import { loadAuth } from "../auth/store.js";
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
@@ -39,15 +46,41 @@ function resolveProjectId(config?: LoadedConfig): string | null {
 
 export async function handleFeedbackIfAny(params: {
   storageDir: string;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
   channel: string;
   chatId: string;
   userId: string;
+  isGroup: boolean;
   text: string;
   send: (chatId: string, text: string) => Promise<void>;
 }): Promise<boolean> {
-  const { storageDir, channel, chatId, userId, text, send } = params;
+  const { storageDir, channel, chatId, userId, text, send, allowlistMode, ownerChatId, ownerUserId, isGroup } = params;
   const hit = detectFeedback(text);
   if (!hit) return false;
+
+  const authState = loadAuth(storageDir, ownerChatId, channel);
+  const isOwnerChat = chatId === ownerChatId;
+  const isOwnerUser = ownerUserId ? userId === ownerUserId : userId === ownerChatId;
+  const allowed =
+    allowlistMode === "owner_only"
+      ? (isGroup ? isOwnerUser : isOwnerChat)
+      : authState.allowed.includes(chatId) || isOwnerUser;
+  if (!allowed) {
+    await send(chatId, "无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。");
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "alert_feedback_reject",
+      feedback: hit.kind,
+      raw: hit.normalizedText,
+      reason: "not_allowed",
+    });
+    return true;
+  }
 
   let update: ReturnType<typeof updatePushPolicyTargets> | null = null;
   let error: string | null = null;
@@ -58,7 +91,43 @@ export async function handleFeedbackIfAny(params: {
     console.error("[feedback][WARN] update failed:", error);
   }
 
-  await send(chatId, FEEDBACK_REPLY);
+  let reply = FEEDBACK_REPLY;
+  if (update) reply = buildFeedbackReply(hit.kind, update);
+  if (error || !update) {
+    reply = "已收到反馈，但当前未能更新策略，请稍后重试或联系管理员。";
+  }
+  await send(chatId, reply);
+
+  try {
+    const statePath = path.join(storageDir, "feedback_state.json");
+    const payload = {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_type: isGroup ? "group" : "private",
+      chat_id: chatId,
+      user_id: userId,
+      kind: hit.kind,
+      normalized_text: hit.normalizedText,
+      updated: update?.updated ?? false,
+      cooldown_remaining_sec: update?.cooldownRemainingSec,
+      policy_path: update?.path,
+      policy_version: update?.policyVersion,
+      min_priority_prev: update?.prevMinPriority,
+      min_priority_next: update?.nextMinPriority,
+      push_level_prev: update?.prevPushLevel,
+      push_level_next: update?.nextPushLevel,
+      target_prev: update?.prevTarget,
+      target_next: update?.nextTarget,
+      error: error || undefined,
+    };
+    const tmp = `${statePath}.tmp-${process.pid}-${Date.now()}`;
+    fs.mkdirSync(storageDir, { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf-8");
+    fs.renameSync(tmp, statePath);
+  } catch {
+    // ignore feedback state write errors
+  }
+
   appendLedger(storageDir, {
     ts_utc: new Date().toISOString(),
     channel,
@@ -70,6 +139,13 @@ export async function handleFeedbackIfAny(params: {
     policy_path: update?.path,
     target_prev: update?.prevTarget,
     target_next: update?.nextTarget,
+    min_priority_prev: update?.prevMinPriority,
+    min_priority_next: update?.nextMinPriority,
+    push_level_prev: update?.prevPushLevel,
+    push_level_next: update?.nextPushLevel,
+    policy_version: update?.policyVersion,
+    updated: update?.updated,
+    cooldown_remaining_sec: update?.cooldownRemainingSec,
     error: error || undefined,
   });
 

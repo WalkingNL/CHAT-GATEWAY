@@ -12,6 +12,9 @@ export const FEEDBACK_REPLY =
 const FEEDBACK_TOO_MANY = ["告警太多", "太多了", "一直在刷", "刷屏", "太吵", "好多告警"];
 const FEEDBACK_TOO_FEW = ["告警太少", "太安静", "没动静", "怎么没告警", "是不是坏了", "系统坏了"];
 const DEFAULT_ALERTS_PER_HOUR_TARGET = Number(process.env.ALERTS_PER_HOUR_TARGET || 60);
+const DEFAULT_PUSH_LEVEL = Number(process.env.ALERTS_PUSH_LEVEL_DEFAULT || 50);
+const FEEDBACK_PUSH_LEVEL_DELTA = Number(process.env.ALERTS_PUSH_LEVEL_DELTA || 15);
+const FEEDBACK_COOLDOWN_SEC = Number(process.env.ALERTS_FEEDBACK_COOLDOWN_SEC || 600);
 
 type PolicyState = {
   version?: number;
@@ -20,6 +23,15 @@ type PolicyState = {
     alerts_per_hour_target?: number;
     alerts_per_hour_min?: number;
     alerts_per_hour_max?: number;
+    [key: string]: any;
+  };
+  control?: {
+    push_level?: number;
+    [key: string]: any;
+  };
+  gates?: {
+    min_priority?: string;
+    max_alerts_per_hour?: number | null;
     [key: string]: any;
   };
   history?: any;
@@ -34,9 +46,19 @@ export type FeedbackUpdate = {
   candidate: number;
   nextTarget: number;
   multiplier: number;
+  prevPushLevel: number;
+  nextPushLevel: number;
+  prevMinPriority: string;
+  nextMinPriority: string;
+  prevMaxAlertsPerHour: number | null;
+  nextMaxAlertsPerHour: number | null;
   rate: number;
   rateSource: string;
   clamp?: { min?: number; max?: number };
+  policyVersion: number;
+  updated: boolean;
+  cooldownActive?: boolean;
+  cooldownRemainingSec?: number;
 };
 
 type FeedbackUpdateContext = {
@@ -48,9 +70,7 @@ export function detectFeedback(rawText: string): FeedbackHit | null {
   if (!textNorm) return null;
 
   // feedback command channel (works under Telegram privacy mode in groups)
-  if (textNorm.startsWith("/feedback")) {
-    textNorm = textNorm.replace(/^\/feedback\s*/i, "").trim();
-  }
+  textNorm = textNorm.replace(/^(\/feedback|feedback|反馈)[:：]?\s*/i, "").trim();
   if (!textNorm) return null;
 
   if (FEEDBACK_TOO_MANY.some((k) => textNorm.includes(k))) {
@@ -124,6 +144,47 @@ function roundTarget(v: number): number {
   return Math.max(1, Number(v.toFixed(2)));
 }
 
+function roundPushLevel(v: number): number {
+  if (!Number.isFinite(v)) return DEFAULT_PUSH_LEVEL;
+  const out = Number(v.toFixed(2));
+  return Math.max(0, Math.min(100, out));
+}
+
+function gatesFromPushLevel(pushLevel: number) {
+  const v = Number(pushLevel);
+  if (Number.isFinite(v)) {
+    if (v >= 80) return { min_priority: "LOW", max_alerts_per_hour: null };
+    if (v >= 60) return { min_priority: "MEDIUM", max_alerts_per_hour: 20 };
+    if (v >= 40) return { min_priority: "HIGH", max_alerts_per_hour: 10 };
+  }
+  return { min_priority: "CRITICAL", max_alerts_per_hour: 5 };
+}
+
+function normalizePriority(value: any, fallback: string): string {
+  const v = String(value || "").trim().toUpperCase();
+  return v || fallback;
+}
+
+function parseUtcTs(value: any): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 1e12 ? value : value * 1000;
+  }
+  const s = String(value || "").trim();
+  if (!s) return null;
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : null;
+}
+
+function getLastFeedbackTsMs(history: any): number | null {
+  if (!history || typeof history !== "object") return null;
+  const last = history.last_feedback;
+  if (!last) return null;
+  if (typeof last === "string") return parseUtcTs(last);
+  if (typeof last === "object") return parseUtcTs((last as any).ts_utc);
+  return null;
+}
+
 function parseLimit(v: any): number | null {
   const n = Number(v);
   if (!Number.isFinite(n)) return null;
@@ -154,6 +215,40 @@ function writeJsonAtomic(filePath: string, payload: any) {
   fs.renameSync(tmp, filePath);
 }
 
+function fmtNumber(v: number): string {
+  if (!Number.isFinite(v)) return "0";
+  if (Math.abs(v - Math.round(v)) < 1e-9) return String(Math.round(v));
+  return v.toFixed(2);
+}
+
+export function buildFeedbackReply(kind: FeedbackHit["kind"], update: FeedbackUpdate): string {
+  const action = kind === "too_many" ? "提升" : "降低";
+  const level = update.nextMinPriority || "HIGH";
+  const maxText =
+    update.nextMaxAlertsPerHour === null || update.nextMaxAlertsPerHour === undefined
+      ? "不限频"
+      : `上限 ${fmtNumber(update.nextMaxAlertsPerHour)}/小时`;
+  const lines: string[] = [];
+  if (update.cooldownActive) {
+    const remain = Math.max(0, Math.round(update.cooldownRemainingSec || 0));
+    lines.push("已收到反馈，但处于冷却期，未重复调整。");
+    lines.push(`当前门槛：${level}（仅推送 ${level}+，${maxText}，以实际配置为准）。`);
+    lines.push(
+      `当前值：push_level ${fmtNumber(update.nextPushLevel)}，` +
+        `目标告警频率 ${fmtNumber(update.nextTarget)}/小时。`,
+    );
+    lines.push(`冷却剩余：${remain}s`);
+    return lines.join("\n");
+  }
+  lines.push("已收到反馈。");
+  lines.push(`告警等级门槛已${action}至 ${level}（仅推送 ${level}+，${maxText}，以实际配置为准）。`);
+  lines.push(
+    `反馈值：push_level ${fmtNumber(update.prevPushLevel)}→${fmtNumber(update.nextPushLevel)}，` +
+      `目标告警频率 ${fmtNumber(update.prevTarget)}/小时→${fmtNumber(update.nextTarget)}/小时。`,
+  );
+  return lines.join("\n");
+}
+
 export function updatePushPolicyTargets(
   kind: FeedbackHit["kind"],
   ctx?: FeedbackUpdateContext,
@@ -163,20 +258,73 @@ export function updatePushPolicyTargets(
   const state = loadPolicyState(filePath);
 
   const targets = typeof state.targets === "object" && state.targets ? state.targets : {};
+  const control = typeof state.control === "object" && state.control ? state.control : {};
+  const gates = typeof state.gates === "object" && state.gates ? state.gates : {};
   const prevTargetRaw = Number(targets.alerts_per_hour_target ?? DEFAULT_ALERTS_PER_HOUR_TARGET);
   const prevTarget = Number.isFinite(prevTargetRaw) ? prevTargetRaw : DEFAULT_ALERTS_PER_HOUR_TARGET;
+  const prevPushLevelRaw = Number(control.push_level ?? DEFAULT_PUSH_LEVEL);
+  const prevPushLevel = Number.isFinite(prevPushLevelRaw) ? prevPushLevelRaw : DEFAULT_PUSH_LEVEL;
+  const prevDerivedGates = { ...gatesFromPushLevel(prevPushLevel), ...gates };
+  const prevMinPriority = normalizePriority(prevDerivedGates.min_priority, "HIGH");
+  const prevMaxAlertsPerHour =
+    prevDerivedGates.max_alerts_per_hour === undefined ? null : prevDerivedGates.max_alerts_per_hour;
   const { rate, source: rateSource } = loadStatsRate(statsPath);
+  const policyVersion = Number.isFinite(Number(state.version)) ? Number(state.version) : 0;
+
+  const lastFeedbackMs = getLastFeedbackTsMs(state.history);
+  const nowMs = Date.now();
+  if (
+    Number.isFinite(FEEDBACK_COOLDOWN_SEC) &&
+    FEEDBACK_COOLDOWN_SEC > 0 &&
+    lastFeedbackMs !== null &&
+    nowMs - lastFeedbackMs < FEEDBACK_COOLDOWN_SEC * 1000
+  ) {
+    const remaining = FEEDBACK_COOLDOWN_SEC - Math.floor((nowMs - lastFeedbackMs) / 1000);
+    return {
+      path: filePath,
+      statsPath,
+      prevTarget,
+      candidate: prevTarget,
+      nextTarget: prevTarget,
+      multiplier: 1,
+      prevPushLevel,
+      nextPushLevel: prevPushLevel,
+      prevMinPriority,
+      nextMinPriority: prevMinPriority,
+      prevMaxAlertsPerHour,
+      nextMaxAlertsPerHour: prevMaxAlertsPerHour,
+      rate,
+      rateSource,
+      clamp: resolveClamp(targets),
+      policyVersion,
+      updated: false,
+      cooldownActive: true,
+      cooldownRemainingSec: Math.max(0, remaining),
+    };
+  }
+
   const multiplier = kind === "too_many" ? 0.7 : 1.3;
   const clamp = resolveClamp(targets);
   const candidate = prevTarget * multiplier;
   let nextTarget = applyClamp(candidate, clamp);
   nextTarget = roundTarget(nextTarget);
 
+  const delta = kind === "too_many" ? -FEEDBACK_PUSH_LEVEL_DELTA : FEEDBACK_PUSH_LEVEL_DELTA;
+  const nextPushLevel = roundPushLevel(prevPushLevel + delta);
+  const nextGates = gatesFromPushLevel(nextPushLevel);
+  const nextMinPriority = normalizePriority(nextGates.min_priority, prevMinPriority);
+  const nextMaxAlertsPerHour =
+    nextGates.max_alerts_per_hour === undefined ? null : nextGates.max_alerts_per_hour;
+
   targets.alerts_per_hour_target = nextTarget;
   state.targets = targets;
+  control.push_level = nextPushLevel;
+  state.control = control;
+  state.gates = { ...gates, ...nextGates };
   const updatedAt = new Date().toISOString();
   state.updated_at_utc = updatedAt;
-  state.version = state.version ?? 1;
+  const prevVersion = Number(state.version ?? 0);
+  state.version = Number.isFinite(prevVersion) ? prevVersion + 1 : 1;
 
   const history =
     state.history && typeof state.history === "object" && !Array.isArray(state.history)
@@ -190,19 +338,40 @@ export function updatePushPolicyTargets(
     candidate_target: candidate,
     next_target: nextTarget,
     multiplier,
+    push_level_prev: prevPushLevel,
+    push_level_next: nextPushLevel,
+    min_priority_prev: prevMinPriority,
+    min_priority_next: nextMinPriority,
+    max_alerts_per_hour_prev: prevMaxAlertsPerHour,
+    max_alerts_per_hour_next: nextMaxAlertsPerHour,
     rate,
     rate_source: rateSource,
     clamp_min: clamp.min,
     clamp_max: clamp.max,
     source: "feedback",
   });
-  history.last_feedback = kind;
+  history.last_feedback = {
+    ts_utc: updatedAt,
+    type: kind,
+    delta: delta,
+    push_level: nextPushLevel,
+  };
   history.last_reason = "feedback";
   history.last_updated_by = ctx?.updatedBy || "gateway";
   history.last_updated_at_utc = updatedAt;
+  if (prevMinPriority !== nextMinPriority || prevMaxAlertsPerHour !== nextMaxAlertsPerHour) {
+    history.last_gate_change_at_utc = updatedAt;
+  }
   state.history = history;
   state.history_events = historyEvents;
 
+  if (fs.existsSync(filePath)) {
+    const latestRaw = safeParseJson(fs.readFileSync(filePath, "utf-8"));
+    const latestVersion = Number((latestRaw as any)?.version ?? policyVersion);
+    if (Number.isFinite(latestVersion) && latestVersion !== policyVersion) {
+      throw new Error("policy_state_version_mismatch");
+    }
+  }
   writeJsonAtomic(filePath, state);
 
   return {
@@ -212,8 +381,16 @@ export function updatePushPolicyTargets(
     candidate,
     nextTarget,
     multiplier,
+    prevPushLevel,
+    nextPushLevel,
+    prevMinPriority,
+    nextMinPriority,
+    prevMaxAlertsPerHour,
+    nextMaxAlertsPerHour,
     rate,
     rateSource,
     clamp,
+    policyVersion: state.version ?? policyVersion,
+    updated: true,
   };
 }

@@ -33,9 +33,13 @@ export async function dispatchMessageEvent(ctx: IntegrationContext, event: Messa
 
   if (await handleFeedbackIfAny({
     storageDir,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
     channel,
     chatId: event.chatId,
     userId: event.userId,
+    isGroup: event.isGroup,
     text: event.text,
     send: senders.sendText,
   })) {
