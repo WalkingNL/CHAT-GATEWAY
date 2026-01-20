@@ -71,22 +71,27 @@ export async function handleFeedbackIfAny(params: {
     allowlistMode === "owner_only"
       ? (isGroup ? isOwnerUser : isOwnerChat)
       : authState.allowed.includes(chatId) || isOwnerUser;
-  if (!allowed) {
-    await send(chatId, "无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。");
-    appendLedger(storageDir, {
-      ts_utc: new Date().toISOString(),
-      channel,
-      chat_id: chatId,
-      user_id: userId,
-      kind: "alert_feedback_reject",
-      feedback: hit.kind,
-      raw: hit.normalizedText,
-      reason: "not_allowed",
-    });
-    return true;
-  }
 
   if (levelIntent) {
+    if (!allowed) {
+      await send(chatId, "无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。");
+      const rejectPayload: any = {
+        ts_utc: new Date().toISOString(),
+        channel,
+        chat_id: chatId,
+        user_id: userId,
+        kind: "alert_feedback_reject",
+        reason: "not_allowed",
+      };
+      if ("invalid" in levelIntent) {
+        rejectPayload.feedback = "invalid_level";
+      } else {
+        rejectPayload.feedback = levelIntent.level;
+      }
+      rejectPayload.raw = levelIntent.normalizedText;
+      appendLedger(storageDir, rejectPayload);
+      return true;
+    }
     if ("invalid" in levelIntent) {
       await send(chatId, "已收到反馈，但等级无效/超出范围（仅支持 LOW/MEDIUM/HIGH/CRITICAL），未做调整。");
       appendLedger(storageDir, {
@@ -165,6 +170,22 @@ export async function handleFeedbackIfAny(params: {
       policy_version: update?.policyVersion,
       updated: update?.updated,
       error: error || undefined,
+    });
+    return true;
+  }
+
+  if (!hit) return false;
+  if (!allowed) {
+    await send(chatId, "无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。");
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "alert_feedback_reject",
+      feedback: hit.kind,
+      raw: hit.normalizedText,
+      reason: "not_allowed",
     });
     return true;
   }
