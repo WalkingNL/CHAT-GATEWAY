@@ -6,6 +6,8 @@ export type FeedbackHit = {
   normalizedText: string;
 };
 
+type PriorityLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
+
 export const FEEDBACK_REPLY =
   "已收到反馈。\n我会关注近期告警密度，并在不影响异常捕获的前提下做调整。";
 
@@ -65,6 +67,10 @@ type FeedbackUpdateContext = {
   updatedBy?: string;
 };
 
+export type LevelOverrideHit =
+  | { level: PriorityLevel; normalizedText: string }
+  | { invalid: true; normalizedText: string };
+
 export function detectFeedback(rawText: string): FeedbackHit | null {
   let textNorm = (rawText || "").trim();
   if (!textNorm) return null;
@@ -80,6 +86,23 @@ export function detectFeedback(rawText: string): FeedbackHit | null {
     return { kind: "too_few", normalizedText: textNorm };
   }
   return null;
+}
+
+export function detectLevelOverride(rawText: string): LevelOverrideHit | null {
+  let textNorm = (rawText || "").trim();
+  if (!textNorm) return null;
+
+  textNorm = textNorm.replace(/^(\/feedback|feedback|反馈)[:：]?\s*/i, "").trim();
+  if (!textNorm) return null;
+
+  const lower = textNorm.toLowerCase();
+  const triggers = ["只推", "仅推", "只保留", "仅保留", "only push", "onlypush"];
+  const hasTrigger = triggers.some((t) => lower.includes(t) || textNorm.includes(t));
+  if (!hasTrigger) return null;
+
+  const level = parsePriorityLevel(textNorm);
+  if (!level) return { invalid: true, normalizedText: textNorm };
+  return { level, normalizedText: textNorm };
 }
 
 function resolvePolicyStatePath(): string {
@@ -150,6 +173,13 @@ function roundPushLevel(v: number): number {
   return Math.max(0, Math.min(100, out));
 }
 
+function pushLevelForMinPriority(level: PriorityLevel): number {
+  if (level === "LOW") return 80;
+  if (level === "MEDIUM") return 60;
+  if (level === "HIGH") return 40;
+  return 0;
+}
+
 function gatesFromPushLevel(pushLevel: number) {
   const v = Number(pushLevel);
   if (Number.isFinite(v)) {
@@ -163,6 +193,27 @@ function gatesFromPushLevel(pushLevel: number) {
 function normalizePriority(value: any, fallback: string): string {
   const v = String(value || "").trim().toUpperCase();
   return v || fallback;
+}
+
+function parsePriorityLevel(input: string): PriorityLevel | null {
+  const text = input || "";
+  const lower = text.toLowerCase();
+  const matchEnglish = (token: string) => new RegExp(`\\b${token}\\b`, "i").test(text);
+  const has = (token: string) => text.includes(token);
+
+  if (matchEnglish("CRITICAL") || matchEnglish("CRIT") || has("严重") || has("最高级") || has("最高") || has("致命")) {
+    return "CRITICAL";
+  }
+  if (matchEnglish("HIGH") || has("高级") || has("高等级") || has("高优先级")) {
+    return "HIGH";
+  }
+  if (matchEnglish("MEDIUM") || has("中等") || has("中等级") || has("中优先级")) {
+    return "MEDIUM";
+  }
+  if (matchEnglish("LOW") || has("低级") || has("低等级") || has("低优先级")) {
+    return "LOW";
+  }
+  return null;
 }
 
 function parseUtcTs(value: any): number | null {
@@ -247,6 +298,124 @@ export function buildFeedbackReply(kind: FeedbackHit["kind"], update: FeedbackUp
       `目标告警频率 ${fmtNumber(update.prevTarget)}/小时→${fmtNumber(update.nextTarget)}/小时。`,
   );
   return lines.join("\n");
+}
+
+export function buildLevelOverrideReply(level: PriorityLevel, update: FeedbackUpdate): string {
+  const targetLevel = level;
+  const lines: string[] = [];
+  const changed = update.prevMinPriority !== update.nextMinPriority;
+  lines.push("已收到反馈。");
+  if (changed) {
+    lines.push(`门槛已设置为 ${targetLevel}（仅推送 ${targetLevel}+，以实际配置为准）。`);
+  } else {
+    lines.push(`门槛保持为 ${targetLevel}（未变化，以实际配置为准）。`);
+  }
+  lines.push(
+    `反馈值：push_level ${fmtNumber(update.prevPushLevel)}→${fmtNumber(update.nextPushLevel)}。`,
+  );
+  return lines.join("\n");
+}
+
+export function updatePushPolicyMinPriority(
+  level: PriorityLevel,
+  ctx?: FeedbackUpdateContext,
+): FeedbackUpdate {
+  const filePath = resolvePolicyStatePath();
+  const statsPath = resolveStatsStatePath();
+  const state = loadPolicyState(filePath);
+
+  const targets = typeof state.targets === "object" && state.targets ? state.targets : {};
+  const control = typeof state.control === "object" && state.control ? state.control : {};
+  const gates = typeof state.gates === "object" && state.gates ? state.gates : {};
+  const prevTargetRaw = Number(targets.alerts_per_hour_target ?? DEFAULT_ALERTS_PER_HOUR_TARGET);
+  const prevTarget = Number.isFinite(prevTargetRaw) ? prevTargetRaw : DEFAULT_ALERTS_PER_HOUR_TARGET;
+  const prevPushLevelRaw = Number(control.push_level ?? DEFAULT_PUSH_LEVEL);
+  const prevPushLevel = Number.isFinite(prevPushLevelRaw) ? prevPushLevelRaw : DEFAULT_PUSH_LEVEL;
+  const prevDerivedGates = { ...gatesFromPushLevel(prevPushLevel), ...gates };
+  const prevMinPriority = normalizePriority(prevDerivedGates.min_priority, "HIGH");
+  const prevMaxAlertsPerHour =
+    prevDerivedGates.max_alerts_per_hour === undefined ? null : prevDerivedGates.max_alerts_per_hour;
+  const { rate, source: rateSource } = loadStatsRate(statsPath);
+  const policyVersion = Number.isFinite(Number(state.version)) ? Number(state.version) : 0;
+
+  const nextPushLevel = roundPushLevel(pushLevelForMinPriority(level));
+  const nextMinPriority = level;
+  const nextMaxAlertsPerHour = prevMaxAlertsPerHour;
+
+  state.targets = targets;
+  control.push_level = nextPushLevel;
+  state.control = control;
+  state.gates = { ...gates, min_priority: nextMinPriority };
+  const updatedAt = new Date().toISOString();
+  state.updated_at_utc = updatedAt;
+  const prevVersion = Number(state.version ?? 0);
+  state.version = Number.isFinite(prevVersion) ? prevVersion + 1 : 1;
+
+  const history =
+    state.history && typeof state.history === "object" && !Array.isArray(state.history)
+      ? state.history
+      : {};
+  const historyEvents = Array.isArray(state.history_events) ? state.history_events : [];
+  historyEvents.push({
+    ts_utc: updatedAt,
+    kind: "set_level",
+    prev_target: prevTarget,
+    candidate_target: prevTarget,
+    next_target: prevTarget,
+    multiplier: 1,
+    push_level_prev: prevPushLevel,
+    push_level_next: nextPushLevel,
+    min_priority_prev: prevMinPriority,
+    min_priority_next: nextMinPriority,
+    max_alerts_per_hour_prev: prevMaxAlertsPerHour,
+    max_alerts_per_hour_next: nextMaxAlertsPerHour,
+    rate,
+    rate_source: rateSource,
+    source: "feedback_level_override",
+  });
+  history.last_feedback = {
+    ts_utc: updatedAt,
+    type: "set_level",
+    delta: 0,
+    push_level: nextPushLevel,
+  };
+  history.last_reason = "feedback";
+  history.last_updated_by = ctx?.updatedBy || "gateway";
+  history.last_updated_at_utc = updatedAt;
+  if (prevMinPriority !== nextMinPriority) {
+    history.last_gate_change_at_utc = updatedAt;
+  }
+  state.history = history;
+  state.history_events = historyEvents;
+
+  if (fs.existsSync(filePath)) {
+    const latestRaw = safeParseJson(fs.readFileSync(filePath, "utf-8"));
+    const latestVersion = Number((latestRaw as any)?.version ?? policyVersion);
+    if (Number.isFinite(latestVersion) && latestVersion !== policyVersion) {
+      throw new Error("policy_state_version_mismatch");
+    }
+  }
+  writeJsonAtomic(filePath, state);
+
+  return {
+    path: filePath,
+    statsPath,
+    prevTarget,
+    candidate: prevTarget,
+    nextTarget: prevTarget,
+    multiplier: 1,
+    prevPushLevel,
+    nextPushLevel,
+    prevMinPriority,
+    nextMinPriority,
+    prevMaxAlertsPerHour,
+    nextMaxAlertsPerHour,
+    rate,
+    rateSource,
+    clamp: resolveClamp(targets),
+    policyVersion: state.version ?? policyVersion,
+    updated: true,
+  };
 }
 
 export function updatePushPolicyTargets(

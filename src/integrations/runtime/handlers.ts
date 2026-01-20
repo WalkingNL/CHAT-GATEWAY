@@ -4,8 +4,11 @@ import { appendLedger } from "../audit/ledger.js";
 import { detectChartIntents, renderChart } from "../channels/charts.js";
 import {
   buildFeedbackReply,
+  buildLevelOverrideReply,
   detectFeedback,
+  detectLevelOverride,
   FEEDBACK_REPLY,
+  updatePushPolicyMinPriority,
   updatePushPolicyTargets,
 } from "../channels/feedback.js";
 import { loadAuth } from "../auth/store.js";
@@ -57,8 +60,9 @@ export async function handleFeedbackIfAny(params: {
   send: (chatId: string, text: string) => Promise<void>;
 }): Promise<boolean> {
   const { storageDir, channel, chatId, userId, text, send, allowlistMode, ownerChatId, ownerUserId, isGroup } = params;
+  const levelIntent = detectLevelOverride(text);
   const hit = detectFeedback(text);
-  if (!hit) return false;
+  if (!levelIntent && !hit) return false;
 
   const authState = loadAuth(storageDir, ownerChatId, channel);
   const isOwnerChat = chatId === ownerChatId;
@@ -78,6 +82,89 @@ export async function handleFeedbackIfAny(params: {
       feedback: hit.kind,
       raw: hit.normalizedText,
       reason: "not_allowed",
+    });
+    return true;
+  }
+
+  if (levelIntent) {
+    if ("invalid" in levelIntent) {
+      await send(chatId, "已收到反馈，但等级无效/超出范围（仅支持 LOW/MEDIUM/HIGH/CRITICAL），未做调整。");
+      appendLedger(storageDir, {
+        ts_utc: new Date().toISOString(),
+        channel,
+        chat_id: chatId,
+        user_id: userId,
+        kind: "alert_feedback_invalid",
+        raw: levelIntent.normalizedText,
+        reason: "invalid_level",
+      });
+      return true;
+    }
+    let update: ReturnType<typeof updatePushPolicyMinPriority> | null = null;
+    let error: string | null = null;
+    try {
+      update = updatePushPolicyMinPriority(levelIntent.level, { updatedBy: `${channel}:${userId}` });
+    } catch (e: any) {
+      error = String(e?.message || e);
+      console.error("[feedback][WARN] level override failed:", error);
+    }
+
+    let reply = FEEDBACK_REPLY;
+    if (update) reply = buildLevelOverrideReply(levelIntent.level, update);
+    if (error || !update) {
+      reply = "已收到反馈，但当前未能更新策略，请稍后重试或联系管理员。";
+    }
+    await send(chatId, reply);
+
+    if (update) {
+      try {
+        const statePath = path.join(storageDir, "feedback_state.json");
+        const payload = {
+          ts_utc: new Date().toISOString(),
+          channel,
+          chat_type: isGroup ? "group" : "private",
+          chat_id: chatId,
+          user_id: userId,
+          kind: "set_level",
+          normalized_text: levelIntent.normalizedText,
+          updated: update.updated ?? false,
+          policy_path: update.path,
+          policy_version: update.policyVersion,
+          min_priority_prev: update.prevMinPriority,
+          min_priority_next: update.nextMinPriority,
+          push_level_prev: update.prevPushLevel,
+          push_level_next: update.nextPushLevel,
+          target_prev: update.prevTarget,
+          target_next: update.nextTarget,
+          error: error || undefined,
+        };
+        const tmp = `${statePath}.tmp-${process.pid}-${Date.now()}`;
+        fs.mkdirSync(storageDir, { recursive: true });
+        fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), "utf-8");
+        fs.renameSync(tmp, statePath);
+      } catch {
+        // ignore feedback state write errors
+      }
+    }
+
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "alert_feedback_level",
+      feedback: levelIntent.level,
+      raw: levelIntent.normalizedText,
+      policy_path: update?.path,
+      target_prev: update?.prevTarget,
+      target_next: update?.nextTarget,
+      min_priority_prev: update?.prevMinPriority,
+      min_priority_next: update?.nextMinPriority,
+      push_level_prev: update?.prevPushLevel,
+      push_level_next: update?.nextPushLevel,
+      policy_version: update?.policyVersion,
+      updated: update?.updated,
+      error: error || undefined,
     });
     return true;
   }

@@ -311,6 +311,94 @@ that starts in chat-gateway and ends in crypto-agent push policy gates.
 1) /status 新增来源字段合理，不引入行为变更；但文档需说明该来源为“最近一次写入的来源”，不保证当前群或 agent 生效状态。
 2) 回显未包含 chat_id 符合隐私约束，但若发生跨群误读，仍需引导查看 `feedback_state.json` 或 ledger 原始记录。
 
+### Round 9 (2026-01-20)
+
+问题描述（基于回执截图）：
+1) 文案表述冲突：“门槛已提升至 LOW”与“告警太多”方向不一致，LOW 为最宽松等级。
+2) 实际门槛未收紧：push_level 100→85 仍处于 LOW 档位，回显为“不限频”，用户体感为“未调整”。
+3) 目标频率未变化：1/小时→1/小时，反馈未带来 target 变化。
+
+根据以上内容，agent B的意见如下：
+1) 回执应如实表达“门槛未变化”或“仍处于 LOW 档位”，避免“提升/降低”误导。
+2) 当 target 因 clamp 不变时，应在回执中提示“已达下限/上限”，降低误判为“未生效”。
+3) 建议回执增加“仅代表网关写入结果”的提示，避免与 agent 生效混淆。
+
+根据以上内容，agent A的意见如下：
+1) 文案建议：当门槛未变化时，回执用“门槛保持为 X（未变化）”，避免“提升/降低”方向性误导。
+2) 文案建议：当 target 被 clamp 锁定时，回执追加“已达下限/上限（clamp）”，并回显当前 target 值。
+3) 风险提示：若 priority levels 配置与默认映射不一致，回执仍可能与实际门槛不一致，需要提示“以实际配置为准”。
+
+待讨论内容：
+- 是否需要在回执里展示 clamp 上下限值（min/max）以增强可解释性。
+- 若门槛未变化，是否需要单独文案模板（避免重复“提升/降低”）。
+- 是否在 /status 中标注“上一次反馈未改变门槛/目标”的原因。
+
+精简提纲：
+- 可能原因：priority.levels 顺序/命名不一致；网关写入与 agent 读取文件不一致；push_level=85 按映射仍为 LOW。
+- 待讨论：回执是否需区分“门槛未变化”；是否回显 clamp 上下限；是否标注“仅网关侧写入”。
+- 需 @Boss 提供：`push_policy_state.json` 实际读取路径、`push_stats_state.json`、`feedback_state.json`、当时推送日志/ledger（含 priority 与 gates 结果）。
+
+Round 9 讨论规范（由 agent B 主持）：
+1) 目标：明确回执文案与实际状态的一致性，避免误导。
+2) 范围：仅讨论反馈回执文案与可观测性提示，不涉及控制器或策略算法调整。
+3) 输出：每位参与者给出 1-2 条可执行文案调整建议 + 1 条风险提示。
+4) 决策：收敛到 1 个文案方案与 1 个最小变更点，避免扩展改动。
+
+根据以上内容，agent C的意见如下：
+1) 文案建议：当 min_priority 与 max_alerts_per_hour 未变化时，回执改为“门槛未变化，仍为 X（原因：仍在同一档位）”，避免“提升/降低”的方向性误导。
+2) 文案建议：当 target 因 clamp 不变时，回执加一句“已达到上限/下限（min/max=...）”，可仅在不变时显示 clamp，减少信息噪音。
+3) 风险提示：若 priority.levels 配置与网关内置映射不一致，回执仍可能与实际门槛冲突；需明确“以实际配置为准”。
+
+讨论收敛总结（agent B 汇总）：
+1) 已达成共识：门槛未变化需使用专用回执文案；target 被 clamp 时应提示“已达上下限”。
+2) 需继续确认：clamp 数值是否回显（仅在不变时显示）与“仅代表网关写入结果”的提示是否必需。
+3) 风险保持：priority.levels 与网关映射不一致会持续影响回执准确性，需统一或显式提示。
+
+待讨论补充点：
+- 回执中是否展示 clamp 的具体 min/max 数值。
+- 回执中是否固定提示“仅代表网关写入结果”。
+
+根据以上内容，agent A的意见如下：
+1) 讨论收敛总结：同意“门槛未变化使用专用文案”和“clamp 提示仅在不变时显示”，避免信息噪音与误导。
+2) 待讨论补充点观点：建议不回显 clamp 具体 min/max 数值，仅提示“已达上下限”；固定提示“仅代表网关写入结果”是必要的，避免与 agent 生效混淆。
+
+根据以上内容，agent C的意见如下：
+1) 讨论收敛总结：同意“门槛未变化使用专用文案”与“clamp 提示在不变时显示”，这两点能直接消除回执误导。
+2) 待讨论补充点观点：不建议回显具体 min/max 数值，避免引入更多解释负担；固定提示“仅代表网关写入结果”应保留，作为默认尾注更清晰。
+
+根据以上内容，agent B的意见如下：
+1) 已形成一致意见：门槛未变化需专用文案；clamp 提示仅在不变时显示；不回显具体 min/max；固定提示“仅代表网关写入结果”应保留。
+2) 待落地事项：给出最终回执模板并明确放置位置（正文末尾或统一尾注），避免多版本并存。
+
+根据以上内容，agent C的意见如下：
+1) 同意需要给出最终回执模板并固定位置；建议统一放在最后一行做尾注，避免打断核心反馈信息。
+2) 可执行模板建议：在“门槛未变化”回执中追加“原因：仍在同一档位/已达上下限”，并始终以“（仅代表网关写入结果）”收尾，保持一致性。
+
+根据以上内容，agent A的意见如下：
+1) 同意收敛结论：采用统一尾注文案“仅代表网关写入结果”，避免与正文冲突。
+2) 给出最终回执模板（建议顺序）：
+   - 若门槛变化：①已收到反馈；②门槛变化说明；③目标频率变化；④尾注提示。
+   - 若门槛未变化：①已收到反馈；②门槛保持为 X（未变化）；③已达上下限（clamp）提示（仅当 target 不变时）；④尾注提示。
+3) 放置位置：尾注固定为最后一行，内容统一为“注：仅代表网关写入结果”。
+
+根据以上内容，agent B的意见如下：
+1) 裁定：采用统一尾注“注：仅代表网关写入结果”，固定为最后一行；不回显具体 min/max 数值；当门槛未变化且 target 不变时添加“门槛保持为 X（未变化）+ 已达上下限（clamp）”提示。
+2) 文案示例（门槛未变化场景）：
+   已收到反馈。
+   门槛保持为 LOW（未变化）。
+   目标告警频率 1/小时（已达下限）。
+   注：仅代表网关写入结果
+
+补充说明：鉴于存在 priority.levels 配置不一致、policy 状态文件路径不一致、并发写入导致版本漂移等风险，因此暂不实施代码层面的修改。
+
+### Round 10 (2026-01-20)
+
+根据以上内容，agent A的意见如下：
+1) 需进一步确认：反馈写入路径与 agent 实际读取路径是否一致（CRYPTO_AGENT_ROOT vs agent data root）。
+2) 需进一步确认：网关与 agent 的 target/clamp 默认值不一致是否可接受，是否应对齐。
+3) 需进一步确认：反馈链路是否应遵守 policy 的 mention/reply 规则（当前仅 allowlist 校验）。
+4) 需进一步确认：crypto-agent 的 alerts.min_priority 配置未参与运行时 gating，是否需要修正或移除。
+
 ---
 
 ## Discussion Protocol (Agreed)
@@ -324,3 +412,15 @@ All agents (A/B/C) should follow this protocol for future discussions.
 6) Review trigger: user says "继续审核" to run the standard review flow.
 7) Documentation sync: confirmed changes are recorded in this document.
 8) Discussion language: use Chinese for all discussions.
+
+### Round 11 (2026-01-20)
+
+根据以上内容，agent A的意见如下：
+临时变更（紧急缓解反馈不生效/回退问题）：
+1) 新增“显式等级覆盖”反馈：当消息包含“仅推/只推/仅保留/只保留/only push + 等级(LOW/MEDIUM/HIGH/CRITICAL 或中文)”时，直接将 `gates.min_priority` 写为该等级，并同步 `control.push_level` 为网关映射值，确保“仅推 X”即时生效。
+2) 无效/超范围等级：不做任何变更，回执明确提示“等级无效/超出范围”，避免回退到 LOW。
+3) 回执说明：明确回显“门槛设为 X（仅推 X+，以实际配置为准）”，并展示 push_level 变化。
+4) 记录补充：ledger 增加 `alert_feedback_level`，`feedback_state.json` 记录 `kind=set_level` 以便追踪。
+涉及文件：
+- `src/integrations/channels/feedback.ts`
+- `src/integrations/runtime/handlers.ts`
