@@ -11,12 +11,17 @@ import type { ChatMessage } from "../../core/providers/base.js";
 import { submitTask } from "../../core/internal_client.js";
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
+import { loadProjectRegistry } from "../runtime/project_registry.js";
 import { parseAlertText, LocalFsFactsProvider } from "../facts/index.js";
 import { routeExplain } from "../explain/router_v1.js";
 import { writeExplainTrace, writeExplainFeedback } from "../audit/trace_writer.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
 const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
+const NEWS_SUMMARY_DEFAULT_CHARS = 200;
+const NEWS_SUMMARY_MAX_CHARS = 1200;
+const NEWS_ALERT_MARKERS = ["📰 重要新闻监控触发", "重要新闻监控触发"];
+const NEWS_SUMMARY_KEYWORDS = ["摘要", "总结", "概括", "简要", "简述"];
 
 function nowIso() {
   return new Date().toISOString();
@@ -34,8 +39,117 @@ function clip(s: string, n: number) {
   return t.length <= n ? t : t.slice(0, n) + "…";
 }
 
+function clipToLen(s: string, n: number) {
+  const t = String(s || "");
+  if (t.length <= n) return t;
+  if (n <= 1) return t.slice(0, n);
+  return t.slice(0, n - 1) + "…";
+}
+
 function escapeRegExp(s: string) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isNewsAlert(raw: string): boolean {
+  const s = String(raw || "");
+  if (!s.trim()) return false;
+  if (NEWS_ALERT_MARKERS.some(m => s.includes(m))) return true;
+  const hasBullet = s.includes("• ");
+  const hasLink = s.includes("链接:");
+  return hasBullet && hasLink && s.includes("新闻");
+}
+
+function wantsNewsSummary(text: string): boolean {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  return NEWS_SUMMARY_KEYWORDS.some(k => t.includes(k));
+}
+
+function isExplainRequest(text: string): boolean {
+  const t = String(text || "").trim();
+  return t === "解释一下" || t === "解释" || t === "解释下";
+}
+
+function parseSummaryLength(text: string): number | null {
+  const t = String(text || "");
+  let m = t.match(/(\d{2,4})\s*(字|字符)/);
+  if (m) return Number(m[1]);
+  m = t.match(/(\d{2,4})/);
+  if (m) return Number(m[1]);
+  return null;
+}
+
+function resolveSummaryLength(text: string): number {
+  const n = parseSummaryLength(text);
+  if (!Number.isFinite(n)) return NEWS_SUMMARY_DEFAULT_CHARS;
+  const safe = Math.max(1, Math.min(NEWS_SUMMARY_MAX_CHARS, Number(n)));
+  return safe;
+}
+
+type NewsItem = {
+  title: string;
+  published?: string;
+  source?: string;
+  link?: string;
+};
+
+function parseNewsAlert(rawAlert: string): { items: NewsItem[]; facts: string } {
+  const lines = String(rawAlert || "").split("\n");
+  const items: NewsItem[] = [];
+  let cur: NewsItem | null = null;
+
+  const flush = () => {
+    if (cur && cur.title) items.push(cur);
+    cur = null;
+  };
+
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    if (t.startsWith("• ")) {
+      flush();
+      cur = { title: t.slice(2).trim() };
+      continue;
+    }
+    if (!cur) continue;
+    if (t.startsWith("时间:")) {
+      cur.published = t.slice(3).trim();
+      continue;
+    }
+    if (t.startsWith("来源:")) {
+      cur.source = t.slice(3).trim();
+      continue;
+    }
+    if (t.startsWith("链接:")) {
+      cur.link = t.slice(3).trim();
+      continue;
+    }
+  }
+  flush();
+
+  if (!items.length) {
+    return { items: [], facts: String(rawAlert || "").trim() };
+  }
+
+  const facts: string[] = [];
+  items.forEach((it, idx) => {
+    facts.push(`${idx + 1}) 标题: ${it.title}`);
+    if (it.published) facts.push(`   时间: ${it.published}`);
+    if (it.source) facts.push(`   来源: ${it.source}`);
+  });
+  return { items, facts: facts.join("\n") };
+}
+
+function buildNewsSummaryPrompt(facts: string, maxChars: number): string {
+  return [
+    "你是严格的新闻摘要器。",
+    "只允许基于给定新闻要点压缩，不得新增事实/因果/推断，不得引用外部信息。",
+    `输出一段中文摘要，不超过 ${maxChars} 个中文字符。`,
+    "不要标题，不要列表，不要链接。",
+    "",
+    "新闻要点：",
+    facts || "(无)",
+  ].join("\n");
 }
 
 function resolveProjectId(config?: LoadedConfig): string | null {
@@ -54,6 +168,72 @@ function resolveProjectId(config?: LoadedConfig): string | null {
   }
   const ids = Object.keys(projects);
   return ids.length ? ids[0] : null;
+}
+
+type OnDemandConfig = { url: string; token: string; projectId?: string | null };
+
+function resolveOnDemandConfigForNews(config?: LoadedConfig): OnDemandConfig {
+  const envUrl = String(process.env.CRYPTO_AGENT_ON_DEMAND_URL || "").trim();
+  const envToken = String(process.env.CRYPTO_AGENT_ON_DEMAND_TOKEN || "").trim();
+  if (envUrl && envToken) return { url: envUrl, token: envToken, projectId: resolveProjectId(config) };
+
+  const registry = loadProjectRegistry();
+  const projectId = resolveProjectId(config);
+  const proj = projectId ? registry.projects?.[projectId] : undefined;
+  const anyProj = proj ?? registry.projects?.crypto_agent ?? null;
+  const onDemand = (anyProj as any)?.on_demand ?? {};
+
+  const url = String(
+    onDemand.url
+      || (anyProj as any)?.on_demand_url
+      || envUrl
+      || "http://127.0.0.1:8799",
+  ).trim();
+
+  const tokenEnv = String(
+    onDemand.token_env
+      || (anyProj as any)?.on_demand_token_env
+      || "",
+  ).trim();
+  const token = String(
+    (tokenEnv ? process.env[tokenEnv] : "")
+      || onDemand.token
+      || (anyProj as any)?.on_demand_token
+      || envToken
+      || "",
+  ).trim();
+
+  if (!token) throw new Error("missing on-demand token");
+  return { url, token, projectId };
+}
+
+async function postOnDemandJson(url: string, token: string, body: any, timeoutMs: number): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let data: any = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { ok: false, error: "invalid_json", raw: text };
+    }
+    if (!res.ok) {
+      throw new Error(`on_demand_http_${res.status}: ${data?.error || text}`);
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function getProject(config?: LoadedConfig) {
@@ -424,6 +604,120 @@ async function runExplain(params: {
   lastExplainByChatId.set(chatId, { ts: Date.now(), trace_id: taskId });
 }
 
+async function runNewsSummary(params: {
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  rawAlert: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  channel: string;
+  taskIdPrefix: string;
+  maxChars: number;
+  config?: LoadedConfig;
+}) {
+  const { storageDir, chatId, userId, rawAlert, send, channel, taskIdPrefix, maxChars, config } = params;
+  const t0 = Date.now();
+  const parsed = parseNewsAlert(rawAlert);
+  const taskId = `${taskIdPrefix}_news_summary_${chatId}_${Date.now()}`;
+
+  let summary = "";
+  let ok = false;
+  let errCode = "";
+  let latencyMs = 0;
+  let source = "agent";
+  let agentLatencyMs: number | null = null;
+  let llmLatencyMs: number | null = null;
+  let agentItems: number | null = null;
+
+  try {
+    const cfg = resolveOnDemandConfigForNews(config);
+    const timeoutMs = Number(process.env.CHAT_GATEWAY_NEWS_SUMMARY_TIMEOUT_MS || "8000");
+    const payload: any = {
+      request_id: taskId,
+      max_chars: maxChars,
+      items: parsed.items,
+    };
+    if (!parsed.items.length) payload.raw_alert = rawAlert;
+    if (cfg.projectId) payload.target = { project_id: cfg.projectId };
+
+    const tAgent = Date.now();
+    const res = await postOnDemandJson(`${cfg.url}/v1/news_summary`, cfg.token, payload, timeoutMs);
+    agentLatencyMs = Date.now() - tAgent;
+    if (res?.ok && res?.summary) {
+      summary = String(res.summary || "").trim();
+      ok = Boolean(summary);
+      source = `agent:${String(res?.source || "unknown")}`;
+      agentItems = Number.isFinite(Number(res?.items)) ? Number(res.items) : null;
+      latencyMs = agentLatencyMs || Date.now() - t0;
+    } else {
+      errCode = String(res?.error || "agent_error");
+    }
+  } catch (e: any) {
+    errCode = String(e?.message || e);
+  }
+
+  if (!summary) {
+    const prompt = buildNewsSummaryPrompt(parsed.facts, maxChars);
+    try {
+      const tLlm = Date.now();
+      const res = await submitTask({
+        task_id: taskId,
+        stage: "analyze",
+        prompt,
+        context: {
+          news_items: parsed.items,
+          raw_alert: rawAlert,
+          max_chars: maxChars,
+          channel,
+        },
+      });
+
+      llmLatencyMs = Date.now() - tLlm;
+      latencyMs = Number(res?.latency_ms || Date.now() - t0);
+
+      if (!res?.ok) {
+        errCode = res?.error || "unknown";
+      } else {
+        summary = String(res.summary || "").trim();
+        ok = Boolean(summary);
+        source = "gateway_llm";
+      }
+    } catch (e: any) {
+      latencyMs = Date.now() - t0;
+      errCode = String(e?.message || e);
+    }
+  }
+
+  if (!summary) {
+    const fallback = parsed.items.map(it => it.title).filter(Boolean).join("；");
+    summary = fallback ? `要点：${fallback}` : "暂无可用摘要。";
+    source = "fallback";
+  }
+  if (!latencyMs) latencyMs = Date.now() - t0;
+
+  summary = clipToLen(summary, maxChars);
+  await send(chatId, summary);
+
+  appendLedger(storageDir, {
+    ts_utc: nowIso(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    cmd: "news_summary",
+    requested_chars: maxChars,
+    output_chars: summary.length,
+    items: agentItems ?? parsed.items.length,
+    ok,
+    err: ok ? undefined : errCode || "unknown",
+    latency_ms: latencyMs,
+    trace_id: taskId,
+    source,
+    agent_latency_ms: agentLatencyMs,
+    llm_latency_ms: llmLatencyMs,
+    summary_head: clipToLen(summary, Math.min(240, maxChars)),
+  });
+}
+
 function formatAnalyzeReply(out: string): string {
   // Keep it TG-friendly. Facts-only.
   return [
@@ -790,12 +1084,13 @@ async function handleGroupExplain(params: {
   storageDir: string;
   chatId: string;
   userId: string;
+  trimmedText: string;
   trimmedReplyText: string;
   mentionsBot: boolean;
   send: SendFn;
   config?: LoadedConfig;
 }) {
-  const { channel, taskIdPrefix, storageDir, chatId, userId, trimmedReplyText, mentionsBot, send, config } = params;
+  const { channel, taskIdPrefix, storageDir, chatId, userId, trimmedText, trimmedReplyText, mentionsBot, send, config } = params;
   const res = evaluate(config, {
     channel,
     capability: "alerts.explain",
@@ -809,12 +1104,30 @@ async function handleGroupExplain(params: {
   if (res.require?.mention_bot_for_explain && !mentionsBot) return;
 
   if (res.require?.reply_required_for_explain && !trimmedReplyText) {
-    await send(chatId, "请回复一条告警消息再 @我，我才能解释。");
+    await send(chatId, "请回复一条告警/新闻消息再 @我。");
     return;
   }
 
   if (!res.allowed) {
     await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+    return;
+  }
+
+  const isNews = trimmedReplyText ? isNewsAlert(trimmedReplyText) : false;
+  const summaryRequested = wantsNewsSummary(trimmedText);
+  if (isNews && (summaryRequested || isExplainRequest(trimmedText))) {
+    await send(chatId, "🧠 正在生成新闻摘要…");
+    await runNewsSummary({
+      storageDir,
+      chatId,
+      userId,
+      rawAlert: trimmedReplyText,
+      send,
+      channel,
+      taskIdPrefix,
+      maxChars: resolveSummaryLength(trimmedText),
+      config,
+    });
     return;
   }
 
@@ -861,14 +1174,32 @@ async function handlePrivateMessage(params: {
   }
 
   if (trimmedText === "/help" || trimmedText === "help") {
-    await send(chatId, "用法：回复一条告警，然后发“解释一下/？”即可。");
+    await send(chatId, "用法：回复一条告警发“解释一下”；回复新闻发“摘要 200”。");
     return true;
   }
 
   if (!isCommand) {
     const rawAlert = trimmedReplyText || lastAlertByChatId.get(chatId)?.rawText || "";
     if (!rawAlert) {
-      await send(chatId, "请先回复一条告警消息，然后发一句话（如：解释一下）。");
+      await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下 / 摘要 200）。");
+      return true;
+    }
+
+    const isNews = isNewsAlert(rawAlert);
+    const summaryRequested = wantsNewsSummary(trimmedText);
+    if (isNews && (summaryRequested || isExplainRequest(trimmedText))) {
+      await send(chatId, "🧠 正在生成新闻摘要…");
+      await runNewsSummary({
+        storageDir,
+        chatId,
+        userId,
+        rawAlert,
+        send,
+        channel,
+        taskIdPrefix,
+        maxChars: resolveSummaryLength(trimmedText),
+        config,
+      });
       return true;
     }
 
@@ -1223,6 +1554,7 @@ export async function handleMessage(opts: {
         chatId,
         userId,
         trimmedReplyText,
+        trimmedText,
         mentionsBot,
         send,
         config,
