@@ -56,7 +56,9 @@ function isNewsAlert(raw: string): boolean {
   if (NEWS_ALERT_MARKERS.some(m => s.includes(m))) return true;
   const hasBullet = s.includes("• ");
   const hasLink = s.includes("链接:");
-  return hasBullet && hasLink && s.includes("新闻");
+  if (hasBullet && hasLink && s.includes("新闻")) return true;
+  const parsed = parseNewsAlert(s);
+  return parsed.items.length > 0;
 }
 
 function wantsNewsSummary(text: string): boolean {
@@ -1115,7 +1117,31 @@ async function handleGroupExplain(params: {
 
   const isNews = trimmedReplyText ? isNewsAlert(trimmedReplyText) : false;
   const summaryRequested = wantsNewsSummary(trimmedText);
-  if (isNews && (summaryRequested || isExplainRequest(trimmedText))) {
+  if (summaryRequested) {
+    if (!trimmedReplyText) {
+      await send(chatId, "请回复一条新闻告警再发送摘要请求。");
+      return;
+    }
+    if (!isNews) {
+      await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
+      return;
+    }
+    await send(chatId, "🧠 正在生成新闻摘要…");
+    await runNewsSummary({
+      storageDir,
+      chatId,
+      userId,
+      rawAlert: trimmedReplyText,
+      send,
+      channel,
+      taskIdPrefix,
+      maxChars: resolveSummaryLength(trimmedText),
+      config,
+    });
+    return;
+  }
+
+  if (isNews && isExplainRequest(trimmedText)) {
     await send(chatId, "🧠 正在生成新闻摘要…");
     await runNewsSummary({
       storageDir,
@@ -1187,7 +1213,27 @@ async function handlePrivateMessage(params: {
 
     const isNews = isNewsAlert(rawAlert);
     const summaryRequested = wantsNewsSummary(trimmedText);
-    if (isNews && (summaryRequested || isExplainRequest(trimmedText))) {
+    if (summaryRequested) {
+      if (!isNews) {
+        await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
+        return true;
+      }
+      await send(chatId, "🧠 正在生成新闻摘要…");
+      await runNewsSummary({
+        storageDir,
+        chatId,
+        userId,
+        rawAlert,
+        send,
+        channel,
+        taskIdPrefix,
+        maxChars: resolveSummaryLength(trimmedText),
+        config,
+      });
+      return true;
+    }
+
+    if (isNews && isExplainRequest(trimmedText)) {
       await send(chatId, "🧠 正在生成新闻摘要…");
       await runNewsSummary({
         storageDir,
