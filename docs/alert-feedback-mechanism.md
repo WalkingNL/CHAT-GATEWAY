@@ -413,6 +413,10 @@ All agents (A/B/C) should follow this protocol for future discussions.
 7) Documentation sync: confirmed changes are recorded in this document.
 8) Discussion language: use Chinese for all discussions.
 
+### 问题记录（待讨论）
+
+1) 现有告警等级判定过度依赖成交量异常（volume-only），缺少价格/波动/流动性等信号支撑，容易“拍脑门式”高等级；需讨论是否引入组合信号或降级规则。
+
 ### Round 11 (2026-01-20)
 
 根据以上内容，agent A的意见如下：
