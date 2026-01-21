@@ -131,6 +131,8 @@ export async function requestDashboardExport(params: {
   windowSpecId: string;
   filters: Record<string, any>;
   exportApiVersion?: string;
+  schemaVersion?: string;
+  intentVersion?: string;
   target: { channel: "telegram" | "feishu"; chatId: string };
 }): Promise<DashboardExportResult> {
   try {
@@ -153,6 +155,8 @@ export async function requestDashboardExport(params: {
         chat_id: params.target.chatId,
       },
     };
+    if (params.schemaVersion) payload.schema_version = params.schemaVersion;
+    if (params.intentVersion) payload.intent_version = params.intentVersion;
     const res = await postJson(`${cfg.url}/v1/dashboard_export`, cfg.token, payload);
     return {
       ok: Boolean(res?.ok),

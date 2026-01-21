@@ -27,6 +27,11 @@ type NotifyBaseBody = {
   chat_id?: string | number;
   chat_ids?: Array<string | number> | { telegram?: Array<string | number>; feishu?: Array<string | number> };
   chat_ids_by_target?: { telegram?: Array<string | number>; feishu?: Array<string | number> };
+  meta?: Record<string, any>;
+  delivery_priority?: string;
+  global_min_priority?: string;
+  channel_min_priority?: string;
+  priority?: string;
 };
 
 type NotifyTextBody = NotifyBaseBody & {
@@ -125,6 +130,83 @@ function normalizeTarget(raw: any): NotifyTarget {
   return "both";
 }
 
+const DEFAULT_PRIORITY_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
+const PRIORITY_ORDER = (() => {
+  const raw = String(process.env.CHAT_GATEWAY_PRIORITY_LEVELS || process.env.GW_PRIORITY_LEVELS || "").trim();
+  if (!raw) return DEFAULT_PRIORITY_ORDER;
+  const parts = raw.split(/[\s,]+/).map(p => p.trim().toUpperCase()).filter(Boolean);
+  const out: string[] = [];
+  for (const p of parts) {
+    if (!out.includes(p)) out.push(p);
+  }
+  return out.length ? out : DEFAULT_PRIORITY_ORDER;
+})();
+
+function normalizePriority(raw: any, fallback?: string): string | null {
+  const s = String(raw || "").trim().toUpperCase();
+  if (s && PRIORITY_ORDER.includes(s)) return s;
+  const fb = String(fallback || "").trim().toUpperCase();
+  if (fb && PRIORITY_ORDER.includes(fb)) return fb;
+  return null;
+}
+
+function priorityRank(level: string | null): number {
+  if (!level) return -1;
+  const idx = PRIORITY_ORDER.indexOf(level);
+  return idx >= 0 ? idx : -1;
+}
+
+function maxPriority(...levels: Array<string | null | undefined>): string {
+  const lowest = PRIORITY_ORDER[0] || "LOW";
+  let best: string | null = null;
+  for (const lvl of levels) {
+    const norm = normalizePriority(lvl || "");
+    if (!norm) continue;
+    if (!best || priorityRank(norm) > priorityRank(best)) {
+      best = norm;
+    }
+  }
+  return best || lowest;
+}
+
+function extractGateInfo(body: NotifyBaseBody) {
+  const lowest = PRIORITY_ORDER[0] || "LOW";
+  const meta = body.meta && typeof body.meta === "object" ? body.meta : {};
+  const skipGate = Boolean((meta as any).skip_gate);
+  const deliveryRaw = (meta as any).delivery_priority ?? (body as any).delivery_priority ?? (body as any).priority;
+  const deliveryPriority = normalizePriority(deliveryRaw);
+  if (!deliveryPriority) {
+    return skipGate ? { skip_gate: true as const } : null;
+  }
+
+  const globalMin = normalizePriority((meta as any).global_min_priority ?? (body as any).global_min_priority, lowest) || lowest;
+  const channelMin = normalizePriority((meta as any).channel_min_priority ?? (body as any).channel_min_priority, globalMin) || globalMin;
+  return {
+    skip_gate: skipGate,
+    delivery_priority: deliveryPriority,
+    global_min_priority: globalMin,
+    channel_min_priority: channelMin,
+  };
+}
+
+type GateDecision = {
+  allowed: boolean;
+  effectiveMin: string | null;
+  skipReason: string | null;
+};
+
+function decideGate(gate: ReturnType<typeof extractGateInfo>, override: string | null): GateDecision {
+  if (!gate) {
+    return { allowed: false, effectiveMin: null, skipReason: "missing_gate_meta" };
+  }
+  if (gate.skip_gate) {
+    return { allowed: true, effectiveMin: null, skipReason: "skip_gate" };
+  }
+  const effectiveMin = maxPriority(gate.global_min_priority, gate.channel_min_priority, override);
+  const allowed = priorityRank(gate.delivery_priority || "") >= priorityRank(effectiveMin);
+  return { allowed, effectiveMin, skipReason: allowed ? null : "below_min_priority" };
+}
+
 function extractExplicitChatIds(body: NotifyBaseBody) {
   const directSource = body.chat_id ?? (Array.isArray(body.chat_ids) ? body.chat_ids : undefined);
   const direct = toStrList(directSource);
@@ -197,23 +279,71 @@ async function sendTextToTargets(body: NotifyTextBody, senders: NotifySenders, r
     telegram: buildTargetOverrideMap(overrides, "telegram", resolved.telegram),
     feishu: buildTargetOverrideMap(overrides, "feishu", resolved.feishu),
   };
+  const gate = extractGateInfo(body);
+  const sent: Record<string, Record<string, any>> = { telegram: {}, feishu: {} };
 
   const text = String(body.text || "").trim();
   if (!text) return { ok: false as const, error: "missing_text" };
 
   if ((resolved.target === "telegram" || resolved.target === "both") && senders.telegram) {
     for (const chatId of resolved.telegram) {
+      const override = normalizePriority(overrides.telegram?.[chatId]?.min_priority);
+      const decision = decideGate(gate, override);
+      if (!decision.allowed) {
+        sent.telegram[chatId] = {
+          sent: false,
+          delivery_priority: gate?.delivery_priority ?? null,
+          global_min_priority: gate?.global_min_priority ?? null,
+          channel_min_priority: gate?.channel_min_priority ?? null,
+          target_override_min_priority: override || null,
+          effective_min_priority: decision.effectiveMin,
+          skip_reason: decision.skipReason,
+        };
+        continue;
+      }
       await senders.telegram.sendText(chatId, text);
+      sent.telegram[chatId] = {
+        sent: true,
+        delivery_priority: gate?.delivery_priority ?? null,
+        global_min_priority: gate?.global_min_priority ?? null,
+        channel_min_priority: gate?.channel_min_priority ?? null,
+        target_override_min_priority: override || null,
+        effective_min_priority: decision.effectiveMin,
+        skip_reason: decision.skipReason,
+      };
     }
   }
 
   if ((resolved.target === "feishu" || resolved.target === "both") && senders.feishu) {
     for (const chatId of resolved.feishu) {
+      const override = normalizePriority(overrides.feishu?.[chatId]?.min_priority);
+      const decision = decideGate(gate, override);
+      if (!decision.allowed) {
+        sent.feishu[chatId] = {
+          sent: false,
+          delivery_priority: gate?.delivery_priority ?? null,
+          global_min_priority: gate?.global_min_priority ?? null,
+          channel_min_priority: gate?.channel_min_priority ?? null,
+          target_override_min_priority: override || null,
+          effective_min_priority: decision.effectiveMin,
+          skip_reason: decision.skipReason,
+        };
+        continue;
+      }
       await senders.feishu.sendText(chatId, text);
+      sent.feishu[chatId] = {
+        sent: true,
+        delivery_priority: gate?.delivery_priority ?? null,
+        global_min_priority: gate?.global_min_priority ?? null,
+        channel_min_priority: gate?.channel_min_priority ?? null,
+        target_override_min_priority: override || null,
+        effective_min_priority: decision.effectiveMin,
+        skip_reason: decision.skipReason,
+      };
     }
   }
 
-  return { ok: true as const, target_overrides: targetOverrides };
+  return { ok: true as const, target_overrides: targetOverrides, sent };
 }
 
 async function sendImageToTargets(body: NotifyImageBody, senders: NotifySenders, registry: ReturnType<typeof loadProjectRegistry>) {
@@ -224,6 +354,8 @@ async function sendImageToTargets(body: NotifyImageBody, senders: NotifySenders,
     telegram: buildTargetOverrideMap(overrides, "telegram", resolved.telegram),
     feishu: buildTargetOverrideMap(overrides, "feishu", resolved.feishu),
   };
+  const gate = extractGateInfo(body as NotifyBaseBody);
+  const sent: Record<string, Record<string, any>> = { telegram: {}, feishu: {} };
 
   const caption = body.caption ? String(body.caption) : "";
   const imagePath = body.image_path ? String(body.image_path) : "";
@@ -246,23 +378,69 @@ async function sendImageToTargets(body: NotifyImageBody, senders: NotifySenders,
   try {
     if ((resolved.target === "telegram" || resolved.target === "both") && senders.telegram) {
       for (const chatId of resolved.telegram) {
+        const override = normalizePriority(overrides.telegram?.[chatId]?.min_priority);
+        const decision = decideGate(gate, override);
+        if (!decision.allowed) {
+          sent.telegram[chatId] = {
+            sent: false,
+            delivery_priority: gate?.delivery_priority ?? null,
+            global_min_priority: gate?.global_min_priority ?? null,
+            channel_min_priority: gate?.channel_min_priority ?? null,
+            target_override_min_priority: override || null,
+            effective_min_priority: decision.effectiveMin,
+            skip_reason: decision.skipReason,
+          };
+          continue;
+        }
         await senders.telegram.sendImage(chatId, localPath, caption || undefined);
+        sent.telegram[chatId] = {
+          sent: true,
+          delivery_priority: gate?.delivery_priority ?? null,
+          global_min_priority: gate?.global_min_priority ?? null,
+          channel_min_priority: gate?.channel_min_priority ?? null,
+          target_override_min_priority: override || null,
+          effective_min_priority: decision.effectiveMin,
+          skip_reason: decision.skipReason,
+        };
       }
     }
 
     if ((resolved.target === "feishu" || resolved.target === "both") && senders.feishu) {
       for (const chatId of resolved.feishu) {
+        const override = normalizePriority(overrides.feishu?.[chatId]?.min_priority);
+        const decision = decideGate(gate, override);
+        if (!decision.allowed) {
+          sent.feishu[chatId] = {
+            sent: false,
+            delivery_priority: gate?.delivery_priority ?? null,
+            global_min_priority: gate?.global_min_priority ?? null,
+            channel_min_priority: gate?.channel_min_priority ?? null,
+            target_override_min_priority: override || null,
+            effective_min_priority: decision.effectiveMin,
+            skip_reason: decision.skipReason,
+          };
+          continue;
+        }
         if (caption) {
           await senders.feishu.sendText(chatId, caption);
         }
         await senders.feishu.sendImage(chatId, localPath);
+        sent.feishu[chatId] = {
+          sent: true,
+          delivery_priority: gate?.delivery_priority ?? null,
+          global_min_priority: gate?.global_min_priority ?? null,
+          channel_min_priority: gate?.channel_min_priority ?? null,
+          target_override_min_priority: override || null,
+          effective_min_priority: decision.effectiveMin,
+          skip_reason: decision.skipReason,
+        };
       }
     }
   } finally {
     if (cleanup) cleanup();
   }
 
-  return { ok: true as const, target_overrides: targetOverrides };
+  return { ok: true as const, target_overrides: targetOverrides, sent };
 }
 
 export function startNotifyServer(opts: {

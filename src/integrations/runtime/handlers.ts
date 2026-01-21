@@ -442,6 +442,8 @@ export async function handleDashboardIntentIfAny(params: {
     windowSpecId: intent.params.window_spec_id,
     filters: intent.params.filters,
     exportApiVersion: intent.params.export_api_version,
+    schemaVersion: intent.schema_version,
+    intentVersion: intent.intent_version,
     target: { channel, chatId },
   });
 
