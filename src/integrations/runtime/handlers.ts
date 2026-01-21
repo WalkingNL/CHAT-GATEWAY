@@ -12,6 +12,8 @@ import {
   updatePushPolicyTargets,
 } from "../channels/feedback.js";
 import { loadAuth } from "../auth/store.js";
+import { allowedPanelIds, parseDashboardIntent } from "../../core/intent_schema.js";
+import { requestDashboardExport, resolveDefaultWindowSpecId } from "../../core/intent_router.js";
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
 
@@ -26,6 +28,16 @@ function buildChartRequestId(
   intent: ReturnType<typeof detectChartIntents>[number],
 ) {
   const parts: string[] = [channel, chatId, messageId, intent.kind];
+  return sanitizeRequestId(parts.join(":"));
+}
+
+function buildDashboardRequestId(
+  channel: string,
+  messageId: string,
+  chatId: string,
+  intentKind: string,
+) {
+  const parts: string[] = [channel, chatId, messageId, intentKind];
   return sanitizeRequestId(parts.join(":"));
 }
 
@@ -255,6 +267,220 @@ export async function handleFeedbackIfAny(params: {
     updated: update?.updated,
     cooldown_remaining_sec: update?.cooldownRemainingSec,
     error: error || undefined,
+  });
+
+  return true;
+}
+
+function buildDashboardClarifyMessage(intent: ReturnType<typeof parseDashboardIntent>): string {
+  if (!intent) return "请补充更具体的请求参数。";
+  if (intent.errors.includes("panel_id_not_allowed")) {
+    return `panel_id 无效。允许的 panel_id：${allowedPanelIds().join(", ")}`;
+  }
+  const parts: string[] = [];
+  if (intent.missing.includes("window_spec_id")) parts.push("window_spec_id");
+  if (intent.missing.includes("symbol")) parts.push("symbol（如 BTCUSDT）");
+  if (!parts.length) return "请补充更具体的请求参数。";
+  return `请补充 ${parts.join("、")} 后重试。`;
+}
+
+export async function handleDashboardIntentIfAny(params: {
+  storageDir: string;
+  config: LoadedConfig;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
+  channel: "telegram" | "feishu";
+  chatId: string;
+  messageId: string;
+  replyToId: string;
+  userId: string;
+  text: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  replyText: string;
+  sendText: (chatId: string, text: string) => Promise<void>;
+}): Promise<boolean> {
+  const {
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel,
+    chatId,
+    messageId,
+    replyToId,
+    userId,
+    text,
+    isGroup,
+    mentionsBot,
+    replyText,
+    sendText,
+  } = params;
+
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return false;
+
+  const projectId = resolveProjectId(config);
+  const defaultWindowSpecId = resolveDefaultWindowSpecId(projectId || undefined) || undefined;
+  const intent = parseDashboardIntent(trimmed, { defaultWindowSpecId });
+  if (!intent) return false;
+
+  if (!projectId) {
+    await sendText(chatId, "未配置默认项目，无法生成导出。");
+    return true;
+  }
+
+  const authState = loadAuth(storageDir, ownerChatId, channel);
+  const isOwnerChat = chatId === ownerChatId;
+  const isOwnerUser = ownerUserId ? userId === ownerUserId : userId === ownerChatId;
+  const allowed =
+    allowlistMode === "owner_only"
+      ? (isGroup ? isOwnerUser : isOwnerChat)
+      : authState.allowed.includes(chatId) || isOwnerUser;
+
+  const policyOk = config?.meta?.policyOk === true;
+  const chatType = isGroup ? "group" : "private";
+
+  const checkAllowed = (capability: string) => {
+    const res = evaluate(config, {
+      channel,
+      capability,
+      chat_id: chatId,
+      chat_type: chatType,
+      user_id: userId,
+      mention_bot: mentionsBot,
+      has_reply: Boolean(replyText),
+    });
+    if (!policyOk) return { allowed, res };
+    if (res.allowed) return { allowed: true, res };
+    if (res.require?.mention_bot_for_ops && !mentionsBot) {
+      return { allowed: false, silent: true, res };
+    }
+    if ((res.reason === "not_allowed" || !res.reason) && allowed) {
+      return { allowed: true, res };
+    }
+    return { allowed: false, res };
+  };
+
+  const gate = checkAllowed("ops.dashboard.export");
+  if (!gate.allowed) {
+    if (!gate.silent) {
+      await sendText(
+        chatId,
+        gate.res?.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放。",
+      );
+    }
+    return true;
+  }
+
+  const requestKey = messageId || replyToId;
+  if (!requestKey) {
+    await sendText(chatId, "该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配");
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "dashboard_export_reject",
+      reason: "missing_message_id_and_parent_id",
+      raw: trimmed,
+      schema_version: intent.schema_version,
+      intent_version: intent.intent_version,
+    });
+    return true;
+  }
+
+  const minConfidence = Number(process.env.GW_INTENT_MIN_CONFIDENCE || "0.7");
+  if (intent.errors.length || intent.missing.length || intent.confidence < minConfidence) {
+    const msg = buildDashboardClarifyMessage(intent);
+    await sendText(chatId, msg);
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "dashboard_export_clarify",
+      raw: intent.raw_query,
+      confidence: intent.confidence,
+      errors: intent.errors,
+      missing: intent.missing,
+      panel_id: intent.params.panel_id,
+      window_spec_id: intent.params.window_spec_id,
+      schema_version: intent.schema_version,
+      intent_version: intent.intent_version,
+    });
+    return true;
+  }
+
+  if (!intent.params.panel_id || !intent.params.window_spec_id) {
+    await sendText(chatId, "参数不完整，无法生成导出。");
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "dashboard_export_reject",
+      raw: intent.raw_query,
+      confidence: intent.confidence,
+      errors: intent.errors,
+      missing: intent.missing,
+      panel_id: intent.params.panel_id,
+      window_spec_id: intent.params.window_spec_id,
+      schema_version: intent.schema_version,
+      intent_version: intent.intent_version,
+    });
+    return true;
+  }
+
+  const requestId = buildDashboardRequestId(channel, requestKey, chatId, intent.intent);
+  const result = await requestDashboardExport({
+    projectId,
+    requestId,
+    panelId: intent.params.panel_id,
+    windowSpecId: intent.params.window_spec_id,
+    filters: intent.params.filters,
+    exportApiVersion: intent.params.export_api_version,
+    target: { channel, chatId },
+  });
+
+  if (!result.ok) {
+    const trace = result.traceId ? ` trace_id=${result.traceId}` : "";
+    await sendText(chatId, `导出失败：${result.error || "unknown"}${trace}`.trim());
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "dashboard_export_error",
+      raw: intent.raw_query,
+      confidence: intent.confidence,
+      panel_id: intent.params.panel_id,
+      window_spec_id: intent.params.window_spec_id,
+      request_id: requestId,
+      error: result.error,
+      trace_id: result.traceId,
+      schema_version: intent.schema_version,
+      intent_version: intent.intent_version,
+    });
+    return true;
+  }
+
+  await sendText(chatId, `已请求生成导出，稍后发送。\nrequest_id=${requestId}`);
+  appendLedger(storageDir, {
+    ts_utc: new Date().toISOString(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    kind: "dashboard_export_request",
+    raw: intent.raw_query,
+    confidence: intent.confidence,
+    panel_id: intent.params.panel_id,
+    window_spec_id: intent.params.window_spec_id,
+    request_id: requestId,
+    schema_version: intent.schema_version,
+    intent_version: intent.intent_version,
   });
 
   return true;

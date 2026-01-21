@@ -130,6 +130,14 @@ Registry: `config/projects.yml` auto-reloads on mtime change; `SIGHUP` forces re
   - `project_id` / `chat_id(s)`: same as text
   - extra fields are ignored (reserved for future extensions)
 
+Response (text/image):
+- `ok: true`
+- `target_overrides`: per-target override map (chat_id -> min_priority|null), if configured
+
+Registry extensions (`config/projects.yml`):
+- `on_demand.window_spec_id`: optional default `window_spec_id` for dashboard exports
+- `notify_overrides`: per-target overrides (list or map), used to surface `target_overrides`
+
 ## Failure matrix
 
 | Scenario | Behavior |

@@ -1,5 +1,5 @@
 import { handleMessage } from "../router/router.js";
-import { handleChartIfAny, handleFeedbackIfAny } from "./handlers.js";
+import { handleChartIfAny, handleDashboardIntentIfAny, handleFeedbackIfAny } from "./handlers.js";
 import { handleCognitiveIfAny, handleCognitiveStatusUpdate } from "./cognitive.js";
 import type { IntegrationContext } from "./context.js";
 import type { MessageEvent } from "./message_event.js";
@@ -59,6 +59,26 @@ export async function dispatchMessageEvent(ctx: IntegrationContext, event: Messa
     isGroup: event.isGroup,
     mentionsBot: event.mentionsBot,
     send: senders.sendText,
+  })) {
+    return;
+  }
+
+  if (await handleDashboardIntentIfAny({
+    storageDir,
+    config: loaded,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel: event.channel,
+    chatId: event.chatId,
+    messageId: event.messageId,
+    replyToId: event.replyToId,
+    userId: event.userId,
+    text: event.text,
+    isGroup: event.isGroup,
+    mentionsBot: event.mentionsBot,
+    replyText: event.replyText,
+    sendText: senders.sendText,
   })) {
     return;
   }

@@ -1,0 +1,166 @@
+import { loadProjectRegistry } from "../integrations/runtime/project_registry.js";
+import { EXPORT_API_VERSION, isPanelIdAllowed } from "./intent_schema.js";
+
+type OnDemandSettings = {
+  url?: string;
+  token?: string;
+  windowSpecId?: string;
+};
+
+type OnDemandConfig = {
+  url: string;
+  token: string;
+  windowSpecId?: string;
+};
+
+type DashboardExportResult = {
+  ok: boolean;
+  status?: string;
+  traceId?: string;
+  error?: string;
+};
+
+function resolveOnDemandSettings(projectId?: string | null): OnDemandSettings {
+  const envUrl = String(process.env.CRYPTO_AGENT_ON_DEMAND_URL || "").trim();
+  const envToken = String(process.env.CRYPTO_AGENT_ON_DEMAND_TOKEN || "").trim();
+  const envWindowSpecId = String(
+    process.env.CHAT_GATEWAY_WINDOW_SPEC_ID
+      || process.env.CRYPTO_AGENT_WINDOW_SPEC_ID
+      || "",
+  ).trim();
+  const useEnvAuth = Boolean(envUrl && envToken);
+  const registry = loadProjectRegistry();
+  const proj = projectId ? registry.projects?.[projectId] : undefined;
+  const anyProj = proj ?? registry.projects?.crypto_agent ?? null;
+  const onDemand = (anyProj as any)?.on_demand ?? {};
+
+  const url = String(
+    (useEnvAuth ? envUrl : "")
+      || onDemand.url
+      || (anyProj as any)?.on_demand_url
+      || envUrl
+      || "http://127.0.0.1:8799",
+  ).trim();
+
+  const tokenEnv = String(
+    onDemand.token_env
+      || (anyProj as any)?.on_demand_token_env
+      || "",
+  ).trim();
+  const token = String(
+    (useEnvAuth ? envToken : "")
+      || (tokenEnv ? process.env[tokenEnv] : "")
+      || onDemand.token
+      || (anyProj as any)?.on_demand_token
+      || envToken
+      || "",
+  ).trim();
+
+  const windowSpecId = String(
+    onDemand.window_spec_id
+      || (anyProj as any)?.on_demand_window_spec_id
+      || envWindowSpecId
+      || "",
+  ).trim();
+
+  return {
+    url: url || undefined,
+    token: token || undefined,
+    windowSpecId: windowSpecId || undefined,
+  };
+}
+
+function resolveOnDemandConfig(projectId?: string | null): OnDemandConfig {
+  const settings = resolveOnDemandSettings(projectId);
+  if (!settings.url) throw new Error("missing_on_demand_url");
+  if (!settings.token) throw new Error("missing_on_demand_token");
+  return {
+    url: settings.url,
+    token: settings.token,
+    windowSpecId: settings.windowSpecId,
+  };
+}
+
+export function resolveDefaultWindowSpecId(projectId?: string | null): string | null {
+  const settings = resolveOnDemandSettings(projectId);
+  return settings.windowSpecId || null;
+}
+
+export function sanitizeRequestId(raw: string): string {
+  return raw.replace(/[^A-Za-z0-9._:-]/g, "_").slice(0, 200);
+}
+
+async function postJson(url: string, token: string, body: any): Promise<any> {
+  const timeoutMs = Number(
+    process.env.CHAT_GATEWAY_EXPORT_ACK_TIMEOUT_MS
+      || process.env.CHAT_GATEWAY_CHART_ACK_TIMEOUT_MS
+      || "2000",
+  );
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let data: any = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { ok: false, error: "invalid_json", raw: text };
+    }
+    if (!res.ok) {
+      throw new Error(`on_demand_http_${res.status}: ${data?.error || text}`);
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function requestDashboardExport(params: {
+  projectId: string;
+  requestId: string;
+  panelId: string;
+  windowSpecId: string;
+  filters: Record<string, any>;
+  exportApiVersion?: string;
+  target: { channel: "telegram" | "feishu"; chatId: string };
+}): Promise<DashboardExportResult> {
+  try {
+    if (!isPanelIdAllowed(params.panelId)) {
+      return { ok: false, error: "panel_id_not_allowed" };
+    }
+    if (!params.windowSpecId) {
+      return { ok: false, error: "missing_window_spec_id" };
+    }
+    const cfg = resolveOnDemandConfig(params.projectId);
+    const payload: any = {
+      request_id: params.requestId,
+      panel_id: params.panelId,
+      window_spec_id: params.windowSpecId,
+      filters: params.filters || {},
+      export_api_version: params.exportApiVersion || EXPORT_API_VERSION,
+      target: {
+        project_id: params.projectId,
+        target: params.target.channel,
+        chat_id: params.target.chatId,
+      },
+    };
+    const res = await postJson(`${cfg.url}/v1/dashboard_export`, cfg.token, payload);
+    return {
+      ok: Boolean(res?.ok),
+      status: res?.status ? String(res.status) : undefined,
+      traceId: res?.trace_id ? String(res.trace_id) : undefined,
+      error: res?.error ? String(res.error) : undefined,
+    };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e) };
+  }
+}

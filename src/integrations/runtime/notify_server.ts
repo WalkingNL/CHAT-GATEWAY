@@ -5,6 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileLimited } from "./exec_limiter.js";
 import { loadProjectRegistry, resolveProjectNotifyTargets, tryLoadProjectRegistry } from "./project_registry.js";
+import { resolveTargetOverrides, type TargetOverrides } from "../../core/notify_overrides.js";
 let hupRegistered = false;
 
 export type NotifySenders = {
@@ -37,6 +38,20 @@ type NotifyImageBody = NotifyBaseBody & {
   image_url?: string;
   caption?: string;
 };
+
+function buildTargetOverrideMap(
+  overrides: TargetOverrides,
+  target: "telegram" | "feishu",
+  chatIds: string[],
+): Record<string, string | null> {
+  const out: Record<string, string | null> = {};
+  const map = overrides[target] || {};
+  for (const chatId of chatIds) {
+    const entry = map[chatId];
+    out[chatId] = entry?.min_priority || null;
+  }
+  return out;
+}
 
 function badRequest(res: http.ServerResponse, msg: string) {
   res.statusCode = 400;
@@ -177,6 +192,11 @@ async function downloadToTempFile(url: string): Promise<{ path: string; cleanup:
 async function sendTextToTargets(body: NotifyTextBody, senders: NotifySenders, registry: ReturnType<typeof loadProjectRegistry>) {
   const resolved = resolveChatIds(body, registry);
   if (!resolved.ok) return { ok: false as const, error: resolved.error };
+  const overrides = resolveTargetOverrides(registry, body.project_id);
+  const targetOverrides = {
+    telegram: buildTargetOverrideMap(overrides, "telegram", resolved.telegram),
+    feishu: buildTargetOverrideMap(overrides, "feishu", resolved.feishu),
+  };
 
   const text = String(body.text || "").trim();
   if (!text) return { ok: false as const, error: "missing_text" };
@@ -193,12 +213,17 @@ async function sendTextToTargets(body: NotifyTextBody, senders: NotifySenders, r
     }
   }
 
-  return { ok: true as const };
+  return { ok: true as const, target_overrides: targetOverrides };
 }
 
 async function sendImageToTargets(body: NotifyImageBody, senders: NotifySenders, registry: ReturnType<typeof loadProjectRegistry>) {
   const resolved = resolveChatIds(body, registry);
   if (!resolved.ok) return { ok: false as const, error: resolved.error };
+  const overrides = resolveTargetOverrides(registry, body.project_id);
+  const targetOverrides = {
+    telegram: buildTargetOverrideMap(overrides, "telegram", resolved.telegram),
+    feishu: buildTargetOverrideMap(overrides, "feishu", resolved.feishu),
+  };
 
   const caption = body.caption ? String(body.caption) : "";
   const imagePath = body.image_path ? String(body.image_path) : "";
@@ -237,7 +262,7 @@ async function sendImageToTargets(body: NotifyImageBody, senders: NotifySenders,
     if (cleanup) cleanup();
   }
 
-  return { ok: true as const };
+  return { ok: true as const, target_overrides: targetOverrides };
 }
 
 export function startNotifyServer(opts: {
@@ -316,7 +341,7 @@ export function startNotifyServer(opts: {
       try {
         const out = await sendTextToTargets(body, senders, registry);
         if (!out.ok) return badRequest(res, out.error);
-        return okJson(res, { ok: true });
+        return okJson(res, out);
       } catch (e: any) {
         return badRequest(res, `notify_failed:${String(e?.message || e)}`);
       }
@@ -333,7 +358,7 @@ export function startNotifyServer(opts: {
       try {
         const out = await sendImageToTargets(body, senders, registry);
         if (!out.ok) return badRequest(res, out.error);
-        return okJson(res, { ok: true });
+        return okJson(res, out);
       } catch (e: any) {
         return badRequest(res, `notify_failed:${String(e?.message || e)}`);
       }

@@ -4,8 +4,13 @@ projects:
     on_demand:
       url: "http://127.0.0.1:8799"
       token_env: "CRYPTO_AGENT_ON_DEMAND_TOKEN"
+      window_spec_id: "ws_1bdd62d14831e7b6" # default window_spec_id (interval=1m)
     notify:
       telegram_chat_ids:
         - "-5242302064"
       feishu_chat_ids:
         - "oc_d69f1c419652e849c85e6d15cf467c2f"
+    notify_overrides:
+      # - target: telegram
+      #   chat_id: "-5242302064"
+      #   min_priority: "CRITICAL"
