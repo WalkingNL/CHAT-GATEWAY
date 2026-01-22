@@ -1117,6 +1117,11 @@ async function handleGroupExplain(params: {
 
   const isNews = trimmedReplyText ? isNewsAlert(trimmedReplyText) : false;
   const summaryRequested = wantsNewsSummary(trimmedText);
+  const explainRequested = isExplainRequest(trimmedText);
+  if (isNews && !summaryRequested && !explainRequested) {
+    await send(chatId, "这是新闻告警。请回复“摘要”或“摘要 200”获取摘要。");
+    return;
+  }
   if (summaryRequested) {
     if (!trimmedReplyText) {
       await send(chatId, "请回复一条新闻告警再发送摘要请求。");
@@ -1141,7 +1146,7 @@ async function handleGroupExplain(params: {
     return;
   }
 
-  if (isNews && isExplainRequest(trimmedText)) {
+  if (isNews && explainRequested) {
     await send(chatId, "🧠 正在生成新闻摘要…");
     await runNewsSummary({
       storageDir,
@@ -1208,11 +1213,16 @@ async function handlePrivateMessage(params: {
     const rawAlert = trimmedReplyText || lastAlertByChatId.get(chatId)?.rawText || "";
     if (!rawAlert) {
       await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下 / 摘要 200）。");
-      return true;
-    }
+    return true;
+  }
 
     const isNews = isNewsAlert(rawAlert);
     const summaryRequested = wantsNewsSummary(trimmedText);
+    const explainRequested = isExplainRequest(trimmedText);
+    if (isNews && !summaryRequested && !explainRequested) {
+      await send(chatId, "这是新闻告警。请回复“摘要”或“摘要 200”获取摘要。");
+      return true;
+    }
     if (summaryRequested) {
       if (!isNews) {
         await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
@@ -1233,7 +1243,7 @@ async function handlePrivateMessage(params: {
       return true;
     }
 
-    if (isNews && isExplainRequest(trimmedText)) {
+    if (isNews && explainRequested) {
       await send(chatId, "🧠 正在生成新闻摘要…");
       await runNewsSummary({
         storageDir,
