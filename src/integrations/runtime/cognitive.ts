@@ -24,6 +24,7 @@ const EXPLICIT_INTENTS = [
 ];
 
 const PROBLEM_TRIGGERS = ["为什么", "怎么回事", "有问题", "不对", "失败", "报错", "无法", "缺失"];
+const SUMMARY_KEYWORDS = ["摘要", "总结", "概括", "简要", "简述"];
 
 const STATUS_MAP: Array<{ status: CognitiveStatus; terms: string[] }> = [
   { status: "DONE", terms: ["done", "完成", "已解决", "解决", "关闭"] },
@@ -58,6 +59,14 @@ function normalizeForMatch(text: string): string {
 function detectExplicitIntent(text: string): boolean {
   const t = normalizeForMatch(text);
   return containsAny(t, EXPLICIT_INTENTS.map(s => s.toLowerCase()));
+}
+
+function isSummaryRequest(text: string): boolean {
+  const t = normalizeText(text);
+  if (!t) return false;
+  if (!containsAny(t, SUMMARY_KEYWORDS)) return false;
+  // allow explicit "记录/记一下" to pass through
+  return !detectExplicitIntent(text);
 }
 
 function detectProblemTone(text: string): boolean {
@@ -245,6 +254,7 @@ export async function handleCognitiveStatusUpdate(params: {
   if (isCommand(normalized)) return false;
   if (isGroup && !mentionsBot) return false;
   if (!isAllowed({ storageDir, channel, allowlistMode, ownerChatId, ownerUserId, chatId, userId })) return false;
+  if (isSummaryRequest(normalized)) return false;
 
   const statusUpdate = parseStatusUpdate(normalized);
   if (!statusUpdate) return false;

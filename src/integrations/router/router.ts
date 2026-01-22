@@ -146,7 +146,7 @@ function buildNewsSummaryPrompt(facts: string, maxChars: number): string {
   return [
     "你是严格的新闻摘要器。",
     "只允许基于给定新闻要点压缩，不得新增事实/因果/推断，不得引用外部信息。",
-    `输出一段中文摘要，不超过 ${maxChars} 个中文字符。`,
+    `输出一段中文摘要，不超过 ${maxChars} 个中文字符，尽量贴近上限。`,
     "不要标题，不要列表，不要链接。",
     "",
     "新闻要点：",
