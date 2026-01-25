@@ -10,11 +10,12 @@ export function ledgerPath(storageDir: string) {
 }
 
 export function appendLedger(storageDir: string, obj: any) {
+  const base = obj?.ts_utc ? obj : { ...obj, ts_utc: new Date().toISOString() };
   const meta = {
     ...getCapabilityAuditMeta(),
     ...getAuditMeta(),
   };
-  const merged = { ...obj, ...meta };
+  const merged = { ...base, ...meta };
   const redacted = applyRedaction(merged);
   redacted.entry.redaction_applied = redacted.applied;
 

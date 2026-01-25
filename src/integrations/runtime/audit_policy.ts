@@ -139,7 +139,11 @@ export function checkErrorCodesVersion(expected: string): boolean {
 
 function hashText(value: string, algo: string): string {
   const safeAlgo = algo || "sha256";
-  return crypto.createHash(safeAlgo).update(value).digest("hex");
+  try {
+    return crypto.createHash(safeAlgo).update(value).digest("hex");
+  } catch {
+    return crypto.createHash("sha256").update(value).digest("hex");
+  }
 }
 
 export function applyRedaction(entry: any): { entry: any; applied: boolean } {

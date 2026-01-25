@@ -58,14 +58,15 @@ function loadRedactionPolicy(filePath) {
     const text = fs.readFileSync(filePath, "utf-8");
     const data = YAML.parse(text);
     if (!data || typeof data !== "object") {
-      return { version: "missing", hashAlgo: "sha256", fields: [] };
+      return { version: "missing", hashAlgo: "sha256", fields: [], keepHeadChars: 0 };
     }
     const version = String(data.version || "").trim() || "missing";
     const hashAlgo = String(data.hash_algo || "sha256").trim() || "sha256";
     const fields = Array.isArray(data.fields) ? data.fields.map(String).filter(Boolean) : [];
-    return { version, hashAlgo, fields };
+    const keepHeadChars = Math.max(0, Number(data.keep_head_chars || 0) || 0);
+    return { version, hashAlgo, fields, keepHeadChars };
   } catch {
-    return { version: "missing", hashAlgo: "sha256", fields: [] };
+    return { version: "missing", hashAlgo: "sha256", fields: [], keepHeadChars: 0 };
   }
 }
 
@@ -77,7 +78,7 @@ function hashText(value, algo) {
   }
 }
 
-function applyRawRetention(entry, fields, algo) {
+function applyRawRetention(entry, fields, algo, keepHeadChars) {
   let applied = false;
   for (const field of fields) {
     const val = entry[field];
@@ -85,7 +86,11 @@ function applyRawRetention(entry, fields, algo) {
     if (!entry[`${field}_sha256`]) {
       entry[`${field}_sha256`] = hashText(val, algo);
     }
-    delete entry[field];
+    if (keepHeadChars > 0) {
+      entry[field] = val.slice(0, keepHeadChars);
+    } else {
+      entry[field] = "";
+    }
     applied = true;
   }
   if (applied) entry.redaction_applied = true;
@@ -114,13 +119,20 @@ async function processLedgerFile(filePath, opts, cutoffs, policy) {
       kept += 1;
       continue;
     }
-    const ts = parseTs(entry.ts_utc);
+    let ts = parseTs(entry.ts_utc);
+    let forceRedact = false;
+    if (!ts) {
+      entry.ts_utc = new Date().toISOString();
+      entry.ts_utc_inferred = true;
+      ts = parseTs(entry.ts_utc);
+      forceRedact = true;
+    }
     if (ts && ts.getTime() < cutoffs.audit) {
       dropped += 1;
       continue;
     }
-    if (ts && ts.getTime() < cutoffs.raw && policy.fields.length) {
-      if (applyRawRetention(entry, policy.fields, policy.hashAlgo)) {
+    if ((forceRedact || (ts && ts.getTime() < cutoffs.raw)) && policy.fields.length) {
+      if (applyRawRetention(entry, policy.fields, policy.hashAlgo, policy.keepHeadChars)) {
         redacted += 1;
       }
     }
