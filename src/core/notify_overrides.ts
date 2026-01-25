@@ -1,4 +1,4 @@
-import type { ProjectRegistry } from "../integrations/runtime/project_registry.js";
+import type { ProjectRegistry } from "./project_registry_types.js";
 
 export type TargetOverride = {
   min_priority?: string;
