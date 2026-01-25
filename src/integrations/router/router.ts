@@ -16,7 +16,7 @@ import { parseAlertText, LocalFsFactsProvider } from "../facts/index.js";
 import { routeExplain } from "../explain/router_v1.js";
 import { writeExplainTrace, writeExplainFeedback } from "../audit/trace_writer.js";
 import { resolveDefaultWindowSpecId, sanitizeRequestId } from "../runtime/intent_router.js";
-import { parseDashboardIntent } from "../runtime/intent_schema.js";
+import { INTENT_SCHEMA_VERSION, INTENT_VERSION, parseDashboardIntent } from "../runtime/intent_schema.js";
 import { buildErrorResultRef, buildTextResultRef } from "../runtime/on_demand_mapping.js";
 import { dispatchDashboardExport } from "../runtime/handlers.js";
 import { isIntentEnabled } from "../runtime/capabilities.js";
@@ -751,6 +751,8 @@ async function runNewsSummary(params: {
       cmd: "news_summary_reject",
       reason: "missing_message_id_and_parent_id",
       error_code: "trace_id_missing",
+      schema_version: INTENT_SCHEMA_VERSION,
+      intent_version: INTENT_VERSION,
       raw: rawAlert,
     });
     return;
@@ -776,6 +778,8 @@ async function runNewsSummary(params: {
         request_id_base: requestIdBase,
         adapter_trace_id: requestIdBase,
         attempt,
+        schema_version: INTENT_SCHEMA_VERSION,
+        intent_version: INTENT_VERSION,
         trace_id: requestId,
         requested_chars: maxChars,
         output_chars: clipped.length,
@@ -810,6 +814,8 @@ async function runNewsSummary(params: {
     const timeoutMs = Number(process.env.CHAT_GATEWAY_NEWS_SUMMARY_TIMEOUT_MS || "8000");
     const payload: any = {
       request_id: requestId,
+      schema_version: INTENT_SCHEMA_VERSION,
+      intent_version: INTENT_VERSION,
       max_chars: maxChars,
       items: parsed.items,
     };
@@ -891,6 +897,8 @@ async function runNewsSummary(params: {
     request_id_base: requestIdBase,
     adapter_trace_id: requestIdBase,
     attempt,
+    schema_version: INTENT_SCHEMA_VERSION,
+    intent_version: INTENT_VERSION,
     requested_chars: maxChars,
     output_chars: summary.length,
     items: agentItems ?? parsed.items.length,
@@ -1091,6 +1099,8 @@ export async function handleAdapterIntentIfAny(params: {
       request_id_base: adapterIds.requestIdBase,
       adapter_trace_id: adapterIds.requestIdBase,
       attempt: adapterIds.attempt,
+      schema_version: INTENT_SCHEMA_VERSION,
+      intent_version: INTENT_VERSION,
       error_code: "missing_project_id",
       raw: trimmedText,
       adapter_entry: true,
@@ -1110,6 +1120,8 @@ export async function handleAdapterIntentIfAny(params: {
       request_id_base: adapterIds.requestIdBase,
       adapter_trace_id: adapterIds.requestIdBase,
       attempt: adapterIds.attempt,
+      schema_version: INTENT_SCHEMA_VERSION,
+      intent_version: INTENT_VERSION,
       error_code: "request_id_expired",
       raw: trimmedText,
       adapter_entry: true,
