@@ -329,6 +329,7 @@ export async function dispatchDashboardExport(params: {
   } = params;
 
   const trimmed = String(intent?.raw_query || text || "").trim();
+  const windowSpecIdSource = intent.window_spec_id_source;
 
   const authState = loadAuth(storageDir, ownerChatId, channel);
   const isOwnerChat = chatId === ownerChatId;
@@ -385,6 +386,8 @@ export async function dispatchDashboardExport(params: {
       reason: "missing_message_id_and_parent_id",
       error_code: "trace_id_missing",
       raw: trimmed,
+      window_spec_id: intent.params.window_spec_id,
+      window_spec_id_source: windowSpecIdSource,
       schema_version: intent.schema_version,
       intent_version: intent.intent_version,
       adapter_entry: adapterEntry ? true : undefined,
@@ -410,6 +413,7 @@ export async function dispatchDashboardExport(params: {
       confidence: intent.confidence,
       panel_id: intent.params.panel_id,
       window_spec_id: intent.params.window_spec_id,
+      window_spec_id_source: windowSpecIdSource,
       request_id: requestId,
       request_id_base: requestIdBase,
       adapter_trace_id: requestIdBase,
@@ -434,6 +438,7 @@ export async function dispatchDashboardExport(params: {
       confidence: intent.confidence,
       panel_id: intent.params.panel_id,
       window_spec_id: intent.params.window_spec_id,
+      window_spec_id_source: windowSpecIdSource,
       request_id: requestId,
       request_id_base: requestIdBase,
       adapter_trace_id: requestIdBase,
@@ -462,6 +467,7 @@ export async function dispatchDashboardExport(params: {
       missing: intent.missing,
       panel_id: intent.params.panel_id,
       window_spec_id: intent.params.window_spec_id,
+      window_spec_id_source: windowSpecIdSource,
       request_id: requestId,
       request_id_base: requestIdBase,
       adapter_trace_id: requestIdBase,
@@ -487,6 +493,7 @@ export async function dispatchDashboardExport(params: {
       missing: intent.missing,
       panel_id: intent.params.panel_id,
       window_spec_id: intent.params.window_spec_id,
+      window_spec_id_source: windowSpecIdSource,
       request_id: requestId,
       request_id_base: requestIdBase,
       adapter_trace_id: requestIdBase,
@@ -532,6 +539,7 @@ export async function dispatchDashboardExport(params: {
       confidence: intent.confidence,
       panel_id: intent.params.panel_id,
       window_spec_id: intent.params.window_spec_id,
+      window_spec_id_source: windowSpecIdSource,
       request_id: requestId,
       request_id_base: requestIdBase,
       adapter_trace_id: requestIdBase,
@@ -570,6 +578,7 @@ export async function dispatchDashboardExport(params: {
     confidence: intent.confidence,
     panel_id: intent.params.panel_id,
     window_spec_id: intent.params.window_spec_id,
+    window_spec_id_source: windowSpecIdSource,
     request_id: requestId,
     request_id_base: requestIdBase,
     adapter_trace_id: requestIdBase,

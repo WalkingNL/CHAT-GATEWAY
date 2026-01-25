@@ -29,6 +29,7 @@ export type IntentParseResult = {
   missing: string[];
   errors: string[];
   explicit_panel_id: boolean;
+  window_spec_id_source: "explicit" | "default" | "missing";
 };
 
 const DEFAULT_SYMBOL_MAP: Record<string, string> = {
@@ -132,6 +133,15 @@ function extractWindowSpecId(text: string): string | null {
   return match[1];
 }
 
+function requireExplicitWindowSpecId(): boolean {
+  const raw = String(
+    process.env.GW_REQUIRE_EXPLICIT_WINDOW_SPEC_ID
+      || process.env.CHAT_GATEWAY_REQUIRE_EXPLICIT_WINDOW_SPEC_ID
+      || "",
+  ).trim().toLowerCase();
+  return ["1", "true", "yes", "y", "on"].includes(raw);
+}
+
 export function allowedPanelIds(): PanelId[] {
   return [...PANEL_IDS];
 }
@@ -183,8 +193,21 @@ export function parseDashboardIntent(
     if (date) filters.date_utc = date;
   }
 
-  const windowSpecId = extractWindowSpecId(raw) || String(opts?.defaultWindowSpecId || "").trim() || null;
-  if (!windowSpecId) missing.push("window_spec_id");
+  const explicitWindowSpecId = extractWindowSpecId(raw);
+  const defaultWindowSpecId = String(opts?.defaultWindowSpecId || "").trim();
+  const windowSpecId = explicitWindowSpecId || defaultWindowSpecId || null;
+  let windowSpecIdSource: "explicit" | "default" | "missing" = "missing";
+  if (explicitWindowSpecId) {
+    windowSpecIdSource = "explicit";
+  } else if (windowSpecId) {
+    windowSpecIdSource = "default";
+  }
+
+  if (!windowSpecId) {
+    missing.push("window_spec_id");
+  } else if (windowSpecIdSource === "default" && requireExplicitWindowSpecId()) {
+    missing.push("window_spec_id");
+  }
 
   let confidence = 0.35;
   if (panelId) confidence += 0.3;
@@ -210,5 +233,6 @@ export function parseDashboardIntent(
     missing,
     errors,
     explicit_panel_id: Boolean(explicitPanelId),
+    window_spec_id_source: windowSpecIdSource,
   };
 }
