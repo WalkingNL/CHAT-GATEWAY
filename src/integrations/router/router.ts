@@ -15,6 +15,10 @@ import { loadProjectRegistry } from "../runtime/project_registry.js";
 import { parseAlertText, LocalFsFactsProvider } from "../facts/index.js";
 import { routeExplain } from "../explain/router_v1.js";
 import { writeExplainTrace, writeExplainFeedback } from "../audit/trace_writer.js";
+import { resolveDefaultWindowSpecId, sanitizeRequestId } from "../../core/intent_router.js";
+import { parseDashboardIntent } from "../../core/intent_schema.js";
+import { buildErrorResultRef, buildTextResultRef } from "../runtime/on_demand_mapping.js";
+import { dispatchDashboardExport } from "../runtime/handlers.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
 const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
@@ -22,6 +26,99 @@ const NEWS_SUMMARY_DEFAULT_CHARS = 200;
 const NEWS_SUMMARY_MAX_CHARS = 1200;
 const NEWS_ALERT_MARKERS = ["📰 重要新闻监控触发", "重要新闻监控触发"];
 const NEWS_SUMMARY_KEYWORDS = ["摘要", "总结", "概括", "简要", "简述"];
+const NEWS_SUMMARY_RESULT_CACHE_TTL_SEC = Number(
+  process.env.CHAT_GATEWAY_NEWS_SUMMARY_CACHE_TTL_SEC || "600",
+);
+const newsSummaryCache = new Map<string, { summary: string; source: string; items: number | null; ts: number }>();
+
+type AdapterDedupeState = {
+  firstTs: number;
+  lastTs: number;
+  attempt: number;
+};
+
+const adapterDedupe = new Map<string, AdapterDedupeState>();
+const ADAPTER_DEDUPE_CLEANUP_THRESHOLD = 5000;
+
+function parseIntEnv(name: string, fallback: number): number {
+  const raw = String(process.env[name] || "").trim();
+  if (!raw) return fallback;
+  const val = Number(raw);
+  if (!Number.isFinite(val)) return fallback;
+  return Math.max(0, Math.floor(val));
+}
+
+const ADAPTER_DEDUPE_WINDOW_SEC = parseIntEnv(
+  "DEDUPE_WINDOW_SEC",
+  parseIntEnv("CHAT_GATEWAY_DEDUPE_WINDOW_SEC", 60),
+);
+
+function cleanupAdapterDedupe(now: number) {
+  if (adapterDedupe.size < ADAPTER_DEDUPE_CLEANUP_THRESHOLD) return;
+  const maxAgeSec = Math.max(ADAPTER_DEDUPE_WINDOW_SEC * 2, 600);
+  for (const [key, state] of adapterDedupe) {
+    const ageSec = (now - state.lastTs) / 1000;
+    if (ageSec > maxAgeSec) adapterDedupe.delete(key);
+  }
+}
+
+function buildDispatchRequestId(requestIdBase: string, attempt: number): string {
+  return sanitizeRequestId(`${requestIdBase}:${attempt}`);
+}
+
+function resolveAdapterRequestIds(params: {
+  channel: string;
+  chatId: string;
+  messageId: string;
+  replyToId: string;
+  explicitRetry?: boolean;
+}): { requestIdBase: string; dispatchRequestId: string; attempt: number; expired: boolean; reused: boolean } | null {
+  const requestKey = String(params.messageId || "").trim() || String(params.replyToId || "").trim();
+  if (!requestKey) return null;
+
+  const requestIdBase = sanitizeRequestId([params.channel, params.chatId, requestKey].join(":"));
+  const now = Date.now();
+  const state = adapterDedupe.get(requestIdBase);
+  const explicitRetry = Boolean(params.explicitRetry);
+
+  if (!state) {
+    adapterDedupe.set(requestIdBase, { firstTs: now, lastTs: now, attempt: 1 });
+    cleanupAdapterDedupe(now);
+    return {
+      requestIdBase,
+      dispatchRequestId: buildDispatchRequestId(requestIdBase, 1),
+      attempt: 1,
+      expired: false,
+      reused: false,
+    };
+  }
+
+  if (explicitRetry) {
+    state.attempt += 1;
+    state.firstTs = now;
+    state.lastTs = now;
+    cleanupAdapterDedupe(now);
+    return {
+      requestIdBase,
+      dispatchRequestId: buildDispatchRequestId(requestIdBase, state.attempt),
+      attempt: state.attempt,
+      expired: false,
+      reused: false,
+    };
+  }
+
+  state.lastTs = now;
+  const ageSec = (now - state.firstTs) / 1000;
+  const expired = ADAPTER_DEDUPE_WINDOW_SEC > 0 && ageSec > ADAPTER_DEDUPE_WINDOW_SEC;
+  cleanupAdapterDedupe(now);
+  return {
+    requestIdBase,
+    dispatchRequestId: buildDispatchRequestId(requestIdBase, state.attempt),
+    attempt: state.attempt,
+    expired,
+    reused: true,
+  };
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -70,6 +167,11 @@ function wantsNewsSummary(text: string): boolean {
 function isExplainRequest(text: string): boolean {
   const t = String(text || "").trim();
   return t === "解释一下" || t === "解释" || t === "解释下";
+}
+
+function wantsRetry(text: string): boolean {
+  const t = String(text || "").toLowerCase();
+  return /(?:^|\s)(retry|重试)(?:$|\s)/i.test(t);
 }
 
 function parseSummaryLength(text: string): number | null {
@@ -610,17 +712,88 @@ async function runNewsSummary(params: {
   storageDir: string;
   chatId: string;
   userId: string;
+  messageId: string;
+  replyToId: string;
   rawAlert: string;
   send: (chatId: string, text: string) => Promise<void>;
   channel: string;
-  taskIdPrefix: string;
   maxChars: number;
   config?: LoadedConfig;
+  adapterEntry?: boolean;
+  requestId?: string;
+  requestIdBase?: string;
+  attempt?: number;
 }) {
-  const { storageDir, chatId, userId, rawAlert, send, channel, taskIdPrefix, maxChars, config } = params;
+  const {
+    storageDir,
+    chatId,
+    userId,
+    messageId,
+    replyToId,
+    rawAlert,
+    send,
+    channel,
+    maxChars,
+    config,
+    adapterEntry,
+  } = params;
   const t0 = Date.now();
   const parsed = parseNewsAlert(rawAlert);
-  const taskId = `${taskIdPrefix}_news_summary_${chatId}_${Date.now()}`;
+  const requestKey = String(messageId || "").trim() || String(replyToId || "").trim();
+  if (!requestKey) {
+    await send(chatId, "该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配");
+    appendLedger(storageDir, {
+      ts_utc: nowIso(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      cmd: "news_summary_reject",
+      reason: "missing_message_id_and_parent_id",
+      error_code: "trace_id_missing",
+      raw: rawAlert,
+    });
+    return;
+  }
+
+  const requestIdBase =
+    params.requestIdBase || sanitizeRequestId([channel, chatId, requestKey].filter(Boolean).join(":"));
+  const attempt = params.attempt && params.attempt > 0 ? params.attempt : 1;
+  const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
+  const cached = newsSummaryCache.get(requestId);
+  if (cached) {
+    const ageMs = Date.now() - cached.ts;
+    if (ageMs <= NEWS_SUMMARY_RESULT_CACHE_TTL_SEC * 1000) {
+      const clipped = clipToLen(cached.summary, maxChars);
+      await send(chatId, clipped);
+      const entry: any = {
+        ts_utc: nowIso(),
+        channel,
+        chat_id: chatId,
+        user_id: userId,
+        cmd: "news_summary",
+        request_id: requestId,
+        request_id_base: requestIdBase,
+        adapter_trace_id: requestIdBase,
+        attempt,
+        trace_id: requestId,
+        requested_chars: maxChars,
+        output_chars: clipped.length,
+        items: cached.items,
+        ok: true,
+        err: undefined,
+        latency_ms: Date.now() - t0,
+        source: `cache:${cached.source}`,
+        summary_head: clipToLen(clipped, Math.min(240, maxChars)),
+      };
+      if (adapterEntry) entry.adapter_entry = true;
+      const resultRef = buildTextResultRef(clipped);
+      entry.result_ref = resultRef.result_ref;
+      entry.result_ref_version = resultRef.result_ref_version;
+      appendLedger(storageDir, entry);
+      return;
+    }
+    newsSummaryCache.delete(requestId);
+  }
 
   let summary = "";
   let ok = false;
@@ -635,7 +808,7 @@ async function runNewsSummary(params: {
     const cfg = resolveOnDemandConfigForNews(config);
     const timeoutMs = Number(process.env.CHAT_GATEWAY_NEWS_SUMMARY_TIMEOUT_MS || "8000");
     const payload: any = {
-      request_id: taskId,
+      request_id: requestId,
       max_chars: maxChars,
       items: parsed.items,
     };
@@ -663,7 +836,7 @@ async function runNewsSummary(params: {
     try {
       const tLlm = Date.now();
       const res = await submitTask({
-        task_id: taskId,
+        task_id: requestId,
         stage: "analyze",
         prompt,
         context: {
@@ -697,27 +870,266 @@ async function runNewsSummary(params: {
   }
   if (!latencyMs) latencyMs = Date.now() - t0;
 
-  summary = clipToLen(summary, maxChars);
+  const summaryRaw = summary;
+  summary = clipToLen(summaryRaw, maxChars);
   await send(chatId, summary);
+  newsSummaryCache.set(requestId, {
+    summary: summaryRaw,
+    source,
+    items: agentItems ?? parsed.items.length,
+    ts: Date.now(),
+  });
 
-  appendLedger(storageDir, {
+  const entry: any = {
     ts_utc: nowIso(),
     channel,
     chat_id: chatId,
     user_id: userId,
     cmd: "news_summary",
+    request_id: requestId,
+    request_id_base: requestIdBase,
+    adapter_trace_id: requestIdBase,
+    attempt,
     requested_chars: maxChars,
     output_chars: summary.length,
     items: agentItems ?? parsed.items.length,
     ok,
     err: ok ? undefined : errCode || "unknown",
     latency_ms: latencyMs,
-    trace_id: taskId,
+    trace_id: requestId,
     source,
     agent_latency_ms: agentLatencyMs,
     llm_latency_ms: llmLatencyMs,
     summary_head: clipToLen(summary, Math.min(240, maxChars)),
+  };
+  if (adapterEntry) entry.adapter_entry = true;
+  if (summary) {
+    const resultRef = buildTextResultRef(summary);
+    entry.result_ref = resultRef.result_ref;
+    entry.result_ref_version = resultRef.result_ref_version;
+  } else if (errCode) {
+    const resultRef = buildErrorResultRef(errCode);
+    entry.result_ref = resultRef.result_ref;
+    entry.result_ref_version = resultRef.result_ref_version;
+  }
+  appendLedger(storageDir, entry);
+}
+
+export async function handleAdapterIntentIfAny(params: {
+  storageDir: string;
+  config: LoadedConfig;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
+  channel: "telegram" | "feishu";
+  chatId: string;
+  messageId: string;
+  replyToId: string;
+  userId: string;
+  text: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  replyText: string;
+  send: (chatId: string, text: string) => Promise<void>;
+}): Promise<boolean> {
+  const {
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel,
+    chatId,
+    messageId,
+    replyToId,
+    userId,
+    text,
+    isGroup,
+    mentionsBot,
+    replyText,
+    send,
+  } = params;
+
+  const trimmedText = String(text || "").trim();
+  const trimmedReplyText = String(replyText || "").trim();
+  if (!trimmedText && !trimmedReplyText) return false;
+  const explicitRetry = wantsRetry(trimmedText);
+
+  // v1: dashboard_export（优先于新闻摘要）
+  const projectId = resolveProjectId(config);
+  const defaultWindowSpecId = resolveDefaultWindowSpecId(projectId || undefined) || undefined;
+  const dashIntent = trimmedText ? parseDashboardIntent(trimmedText, { defaultWindowSpecId }) : null;
+  if (dashIntent) {
+    const adapterIds = resolveAdapterRequestIds({
+      channel,
+      chatId,
+      messageId,
+      replyToId,
+      explicitRetry,
+    });
+    return dispatchDashboardExport({
+      storageDir,
+      config,
+      allowlistMode,
+      ownerChatId,
+      ownerUserId,
+      channel,
+      chatId,
+      messageId,
+      replyToId,
+      userId,
+      text,
+      isGroup,
+      mentionsBot,
+      replyText: trimmedReplyText,
+      sendText: send,
+      intent: dashIntent,
+      adapterEntry: true,
+      requestId: adapterIds?.dispatchRequestId,
+      requestIdBase: adapterIds?.requestIdBase,
+      attempt: adapterIds?.attempt,
+      requestExpired: adapterIds?.expired,
+    });
+  }
+
+  // v1: news_summary（仅在明确请求摘要时进入 adapter）
+  const summaryRequested = wantsNewsSummary(trimmedText);
+  const explainRequested = isExplainRequest(trimmedText);
+  if (!summaryRequested && !explainRequested) return false;
+
+  let rawAlert = trimmedReplyText;
+  if (!rawAlert && !isGroup) {
+    rawAlert = lastAlertByChatId.get(chatId)?.rawText || "";
+  }
+  if (!rawAlert) {
+    if (isGroup) {
+      await send(chatId, "请回复一条新闻告警再发送摘要请求。");
+    } else {
+      await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下 / 摘要 200）。");
+    }
+    return true;
+  }
+
+  const isNews = isNewsAlert(rawAlert);
+  const summaryIntent = summaryRequested || (isNews && explainRequested);
+  if (!summaryIntent) return false;
+
+  if (!isNews) {
+    await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
+    return true;
+  }
+
+  if (isGroup) {
+    const res = evaluate(config, {
+      channel,
+      capability: "alerts.explain",
+      chat_id: chatId,
+      chat_type: "group",
+      user_id: userId,
+      mention_bot: mentionsBot,
+      has_reply: Boolean(trimmedReplyText),
+    });
+    if (res.require?.mention_bot_for_explain && !mentionsBot) return false;
+    if (res.require?.reply_required_for_explain && !trimmedReplyText) {
+      await send(chatId, "请回复一条告警/新闻消息再 @我。");
+      return true;
+    }
+    if (!res.allowed) {
+      await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      return true;
+    }
+  } else {
+    const authState = loadAuth(storageDir, ownerChatId, channel);
+    const resolvedOwnerUserId = String(ownerUserId || "");
+    const isOwnerChat = chatId === ownerChatId;
+    const isOwnerUser = resolvedOwnerUserId ? userId === resolvedOwnerUserId : false;
+    const allowed =
+      allowlistMode === "owner_only"
+        ? (isGroup ? isOwnerUser : isOwnerChat)
+        : authState.allowed.includes(chatId) || isOwnerUser;
+    if (!allowed) return true;
+  }
+
+  const adapterIds = resolveAdapterRequestIds({
+    channel,
+    chatId,
+    messageId,
+    replyToId,
+    explicitRetry,
   });
+  if (!adapterIds) {
+    await runNewsSummary({
+      storageDir,
+      chatId,
+      userId,
+      messageId,
+      replyToId,
+      rawAlert,
+      send,
+      channel,
+      maxChars: resolveSummaryLength(trimmedText),
+      config,
+      adapterEntry: true,
+    });
+    return true;
+  }
+
+  if (!projectId) {
+    await send(chatId, "未配置默认项目，无法生成摘要。");
+    appendLedger(storageDir, {
+      ts_utc: nowIso(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      cmd: "news_summary_reject",
+      request_id: adapterIds.dispatchRequestId,
+      request_id_base: adapterIds.requestIdBase,
+      adapter_trace_id: adapterIds.requestIdBase,
+      attempt: adapterIds.attempt,
+      error_code: "missing_project_id",
+      raw: trimmedText,
+      adapter_entry: true,
+    });
+    return true;
+  }
+
+  if (adapterIds.expired) {
+    await send(chatId, "请求已过期，请重新发起摘要。");
+    appendLedger(storageDir, {
+      ts_utc: nowIso(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      cmd: "news_summary_reject",
+      request_id: adapterIds.dispatchRequestId,
+      request_id_base: adapterIds.requestIdBase,
+      adapter_trace_id: adapterIds.requestIdBase,
+      attempt: adapterIds.attempt,
+      error_code: "request_id_expired",
+      raw: trimmedText,
+      adapter_entry: true,
+    });
+    return true;
+  }
+
+  await send(chatId, "🧠 正在生成新闻摘要…");
+  await runNewsSummary({
+    storageDir,
+    chatId,
+    userId,
+    messageId,
+    replyToId,
+    rawAlert,
+    send,
+    channel,
+    maxChars: resolveSummaryLength(trimmedText),
+    config,
+    adapterEntry: true,
+    requestId: adapterIds?.dispatchRequestId,
+    requestIdBase: adapterIds?.requestIdBase,
+    attempt: adapterIds?.attempt,
+  });
+  return true;
 }
 
 function formatAnalyzeReply(out: string): string {
@@ -1086,13 +1498,15 @@ async function handleGroupExplain(params: {
   storageDir: string;
   chatId: string;
   userId: string;
+  messageId: string;
+  replyToId: string;
   trimmedText: string;
   trimmedReplyText: string;
   mentionsBot: boolean;
   send: SendFn;
   config?: LoadedConfig;
 }) {
-  const { channel, taskIdPrefix, storageDir, chatId, userId, trimmedText, trimmedReplyText, mentionsBot, send, config } = params;
+  const { channel, taskIdPrefix, storageDir, chatId, userId, messageId, replyToId, trimmedText, trimmedReplyText, mentionsBot, send, config } = params;
   const res = evaluate(config, {
     channel,
     capability: "alerts.explain",
@@ -1136,10 +1550,11 @@ async function handleGroupExplain(params: {
       storageDir,
       chatId,
       userId,
+      messageId,
+      replyToId,
       rawAlert: trimmedReplyText,
       send,
       channel,
-      taskIdPrefix,
       maxChars: resolveSummaryLength(trimmedText),
       config,
     });
@@ -1152,10 +1567,11 @@ async function handleGroupExplain(params: {
       storageDir,
       chatId,
       userId,
+      messageId,
+      replyToId,
       rawAlert: trimmedReplyText,
       send,
       channel,
-      taskIdPrefix,
       maxChars: resolveSummaryLength(trimmedText),
       config,
     });
@@ -1181,6 +1597,8 @@ async function handlePrivateMessage(params: {
   storageDir: string;
   chatId: string;
   userId: string;
+  messageId: string;
+  replyToId: string;
   trimmedText: string;
   trimmedReplyText: string;
   isCommand: boolean;
@@ -1193,6 +1611,8 @@ async function handlePrivateMessage(params: {
     storageDir,
     chatId,
     userId,
+    messageId,
+    replyToId,
     trimmedText,
     trimmedReplyText,
     isCommand,
@@ -1233,10 +1653,11 @@ async function handlePrivateMessage(params: {
         storageDir,
         chatId,
         userId,
+        messageId,
+        replyToId,
         rawAlert,
         send,
         channel,
-        taskIdPrefix,
         maxChars: resolveSummaryLength(trimmedText),
         config,
       });
@@ -1249,10 +1670,11 @@ async function handlePrivateMessage(params: {
         storageDir,
         chatId,
         userId,
+        messageId,
+        replyToId,
         rawAlert,
         send,
         channel,
-        taskIdPrefix,
         maxChars: resolveSummaryLength(trimmedText),
         config,
       });
@@ -1500,6 +1922,8 @@ export async function handleMessage(opts: {
   limiter: RateLimiter;
   chatId: string;
   userId: string;
+  messageId: string;
+  replyToId: string;
   text: string;
   replyText?: string;
   isGroup?: boolean;
@@ -1515,13 +1939,15 @@ export async function handleMessage(opts: {
     config,
     chatId,
     userId,
+    messageId,
+    replyToId,
     text,
     replyText = "",
     isGroup = false,
-  mentionsBot = false,
-  send,
-  limiter,
-} = opts;
+    mentionsBot = false,
+    send,
+    limiter,
+  } = opts;
 
   const trimmedText = (text || "").trim();
   const authState = loadAuth(storageDir, ownerChatId, channel);
@@ -1609,6 +2035,8 @@ export async function handleMessage(opts: {
         storageDir,
         chatId,
         userId,
+        messageId,
+        replyToId,
         trimmedReplyText,
         trimmedText,
         mentionsBot,
@@ -1628,6 +2056,8 @@ export async function handleMessage(opts: {
       storageDir,
       chatId,
       userId,
+      messageId,
+      replyToId,
       trimmedText,
       trimmedReplyText,
       isCommand,

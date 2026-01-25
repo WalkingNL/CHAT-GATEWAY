@@ -430,6 +430,7 @@ export async function handleCognitiveIfAny(params: {
       user_id: userId,
       kind: "cognitive_reject",
       reason: "missing_message_id_and_parent_id",
+      error_code: "trace_id_missing",
       raw: normalized,
     });
     return true;

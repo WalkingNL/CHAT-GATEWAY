@@ -18,6 +18,9 @@ type DashboardExportResult = {
   status?: string;
   traceId?: string;
   error?: string;
+  imagePath?: string;
+  undetermined?: boolean;
+  filtersDropped?: string[];
 };
 
 function resolveOnDemandSettings(projectId?: string | null): OnDemandSettings {
@@ -90,6 +93,29 @@ export function sanitizeRequestId(raw: string): string {
   return raw.replace(/[^A-Za-z0-9._:-]/g, "_").slice(0, 200);
 }
 
+const FILTER_ALLOWED_KEYS = new Set(["symbol", "window_minutes", "window_hours", "date_utc", "date"]);
+
+function sanitizeFilters(raw: Record<string, any> | undefined): { filters: Record<string, any>; dropped: string[] } {
+  if (!raw || typeof raw !== "object") return { filters: {}, dropped: [] };
+  const out: Record<string, any> = {};
+  const dropped: string[] = [];
+  for (const [key, value] of Object.entries(raw)) {
+    if (!FILTER_ALLOWED_KEYS.has(key)) {
+      dropped.push(key);
+      continue;
+    }
+    let val = value;
+    if (val == null) continue;
+    if (typeof val === "string") {
+      val = val.trim();
+      if (!val) continue;
+    }
+    out[key] = val;
+  }
+  if (dropped.length) dropped.sort();
+  return { filters: out, dropped };
+}
+
 async function postJson(url: string, token: string, body: any): Promise<any> {
   const timeoutMs = Number(
     process.env.CHAT_GATEWAY_EXPORT_ACK_TIMEOUT_MS
@@ -135,19 +161,21 @@ export async function requestDashboardExport(params: {
   intentVersion?: string;
   target: { channel: "telegram" | "feishu"; chatId: string };
 }): Promise<DashboardExportResult> {
+  const sanitized = sanitizeFilters(params.filters);
+  const filtersDropped = sanitized.dropped.length ? sanitized.dropped : undefined;
   try {
     if (!isPanelIdAllowed(params.panelId)) {
-      return { ok: false, error: "panel_id_not_allowed" };
+      return { ok: false, error: "panel_id_not_allowed", filtersDropped };
     }
     if (!params.windowSpecId) {
-      return { ok: false, error: "missing_window_spec_id" };
+      return { ok: false, error: "missing_window_spec_id", filtersDropped };
     }
     const cfg = resolveOnDemandConfig(params.projectId);
     const payload: any = {
       request_id: params.requestId,
       panel_id: params.panelId,
       window_spec_id: params.windowSpecId,
-      filters: params.filters || {},
+      filters: sanitized.filters,
       export_api_version: params.exportApiVersion || EXPORT_API_VERSION,
       target: {
         project_id: params.projectId,
@@ -163,8 +191,11 @@ export async function requestDashboardExport(params: {
       status: res?.status ? String(res.status) : undefined,
       traceId: res?.trace_id ? String(res.trace_id) : undefined,
       error: res?.error ? String(res.error) : undefined,
+      imagePath: res?.image_path ? String(res.image_path) : undefined,
+      undetermined: Boolean(res?.undetermined),
+      filtersDropped,
     };
   } catch (e: any) {
-    return { ok: false, error: String(e?.message || e) };
+    return { ok: false, error: String(e?.message || e), filtersDropped };
   }
 }

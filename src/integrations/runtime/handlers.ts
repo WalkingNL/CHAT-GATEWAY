@@ -16,6 +16,7 @@ import { allowedPanelIds, parseDashboardIntent } from "../../core/intent_schema.
 import { requestDashboardExport, resolveDefaultWindowSpecId } from "../../core/intent_router.js";
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
+import { buildErrorResultRef, buildImageResultRef, mapOnDemandStatus } from "./on_demand_mapping.js";
 
 function sanitizeRequestId(raw: string): string {
   return raw.replace(/[^A-Za-z0-9._:-]/g, "_").slice(0, 200);
@@ -31,14 +32,8 @@ function buildChartRequestId(
   return sanitizeRequestId(parts.join(":"));
 }
 
-function buildDashboardRequestId(
-  channel: string,
-  messageId: string,
-  chatId: string,
-  intentKind: string,
-) {
-  const parts: string[] = [channel, chatId, messageId, intentKind];
-  return sanitizeRequestId(parts.join(":"));
+function buildDashboardRequestId(requestIdBase: string, attempt: number) {
+  return sanitizeRequestId(`${requestIdBase}:${attempt}`);
 }
 
 function resolveProjectId(config?: LoadedConfig): string | null {
@@ -284,7 +279,9 @@ function buildDashboardClarifyMessage(intent: ReturnType<typeof parseDashboardIn
   return `请补充 ${parts.join("、")} 后重试。`;
 }
 
-export async function handleDashboardIntentIfAny(params: {
+type DashboardIntent = NonNullable<ReturnType<typeof parseDashboardIntent>>;
+
+export async function dispatchDashboardExport(params: {
   storageDir: string;
   config: LoadedConfig;
   allowlistMode: "owner_only" | "auth";
@@ -300,6 +297,12 @@ export async function handleDashboardIntentIfAny(params: {
   mentionsBot: boolean;
   replyText: string;
   sendText: (chatId: string, text: string) => Promise<void>;
+  intent: DashboardIntent;
+  adapterEntry?: boolean;
+  requestId?: string;
+  requestIdBase?: string;
+  attempt?: number;
+  requestExpired?: boolean;
 }): Promise<boolean> {
   const {
     storageDir,
@@ -317,20 +320,15 @@ export async function handleDashboardIntentIfAny(params: {
     mentionsBot,
     replyText,
     sendText,
+    intent,
+    adapterEntry,
+    requestId: requestIdOverride,
+    requestIdBase: requestIdBaseOverride,
+    attempt: attemptOverride,
+    requestExpired,
   } = params;
 
-  const trimmed = String(text || "").trim();
-  if (!trimmed) return false;
-
-  const projectId = resolveProjectId(config);
-  const defaultWindowSpecId = resolveDefaultWindowSpecId(projectId || undefined) || undefined;
-  const intent = parseDashboardIntent(trimmed, { defaultWindowSpecId });
-  if (!intent) return false;
-
-  if (!projectId) {
-    await sendText(chatId, "未配置默认项目，无法生成导出。");
-    return true;
-  }
+  const trimmed = String(intent?.raw_query || text || "").trim();
 
   const authState = loadAuth(storageDir, ownerChatId, channel);
   const isOwnerChat = chatId === ownerChatId;
@@ -385,9 +383,65 @@ export async function handleDashboardIntentIfAny(params: {
       user_id: userId,
       kind: "dashboard_export_reject",
       reason: "missing_message_id_and_parent_id",
+      error_code: "trace_id_missing",
       raw: trimmed,
       schema_version: intent.schema_version,
       intent_version: intent.intent_version,
+      adapter_entry: adapterEntry ? true : undefined,
+    });
+    return true;
+  }
+
+  const requestIdBase =
+    requestIdBaseOverride || sanitizeRequestId([channel, chatId, requestKey].filter(Boolean).join(":"));
+  const attempt = attemptOverride && attemptOverride > 0 ? attemptOverride : 1;
+  const requestId = requestIdOverride || buildDashboardRequestId(requestIdBase, attempt);
+
+  const projectId = resolveProjectId(config);
+  if (!projectId) {
+    await sendText(chatId, "未配置默认项目，无法生成导出。");
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "dashboard_export_reject",
+      raw: intent.raw_query,
+      confidence: intent.confidence,
+      panel_id: intent.params.panel_id,
+      window_spec_id: intent.params.window_spec_id,
+      request_id: requestId,
+      request_id_base: requestIdBase,
+      adapter_trace_id: requestIdBase,
+      attempt,
+      error_code: "missing_project_id",
+      schema_version: intent.schema_version,
+      intent_version: intent.intent_version,
+      adapter_entry: adapterEntry ? true : undefined,
+    });
+    return true;
+  }
+
+  if (requestExpired) {
+    await sendText(chatId, "请求已过期，请重新发起导出。");
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "dashboard_export_reject",
+      raw: intent.raw_query,
+      confidence: intent.confidence,
+      panel_id: intent.params.panel_id,
+      window_spec_id: intent.params.window_spec_id,
+      request_id: requestId,
+      request_id_base: requestIdBase,
+      adapter_trace_id: requestIdBase,
+      attempt,
+      error_code: "request_id_expired",
+      schema_version: intent.schema_version,
+      intent_version: intent.intent_version,
+      adapter_entry: adapterEntry ? true : undefined,
     });
     return true;
   }
@@ -408,8 +462,13 @@ export async function handleDashboardIntentIfAny(params: {
       missing: intent.missing,
       panel_id: intent.params.panel_id,
       window_spec_id: intent.params.window_spec_id,
+      request_id: requestId,
+      request_id_base: requestIdBase,
+      adapter_trace_id: requestIdBase,
+      attempt,
       schema_version: intent.schema_version,
       intent_version: intent.intent_version,
+      adapter_entry: adapterEntry ? true : undefined,
     });
     return true;
   }
@@ -428,13 +487,17 @@ export async function handleDashboardIntentIfAny(params: {
       missing: intent.missing,
       panel_id: intent.params.panel_id,
       window_spec_id: intent.params.window_spec_id,
+      request_id: requestId,
+      request_id_base: requestIdBase,
+      adapter_trace_id: requestIdBase,
+      attempt,
       schema_version: intent.schema_version,
       intent_version: intent.intent_version,
+      adapter_entry: adapterEntry ? true : undefined,
     });
     return true;
   }
 
-  const requestId = buildDashboardRequestId(channel, requestKey, chatId, intent.intent);
   const result = await requestDashboardExport({
     projectId,
     requestId,
@@ -446,11 +509,20 @@ export async function handleDashboardIntentIfAny(params: {
     intentVersion: intent.intent_version,
     target: { channel, chatId },
   });
+  const dispatchStatus = mapOnDemandStatus({
+    status: result.status,
+    error: result.error,
+    undetermined: result.undetermined,
+  });
+  let resultRefMeta = result.imagePath ? buildImageResultRef(result.imagePath) : null;
+  if (!resultRefMeta && result.error) {
+    resultRefMeta = buildErrorResultRef(result.error);
+  }
 
   if (!result.ok) {
     const trace = result.traceId ? ` trace_id=${result.traceId}` : "";
     await sendText(chatId, `导出失败：${result.error || "unknown"}${trace}`.trim());
-    appendLedger(storageDir, {
+    const entry: any = {
       ts_utc: new Date().toISOString(),
       channel,
       chat_id: chatId,
@@ -461,16 +533,34 @@ export async function handleDashboardIntentIfAny(params: {
       panel_id: intent.params.panel_id,
       window_spec_id: intent.params.window_spec_id,
       request_id: requestId,
+      request_id_base: requestIdBase,
+      adapter_trace_id: requestIdBase,
+      attempt,
       error: result.error,
       trace_id: result.traceId,
+      on_demand_status: result.status,
+      dispatch_status: dispatchStatus,
       schema_version: intent.schema_version,
       intent_version: intent.intent_version,
-    });
+    };
+    if (adapterEntry) {
+      entry.adapter_entry = true;
+    }
+    if (result.filtersDropped?.length) {
+      entry.filters_dropped = result.filtersDropped;
+    }
+    if (resultRefMeta) {
+      entry.result_ref = resultRefMeta.result_ref;
+      entry.result_ref_version = resultRefMeta.result_ref_version;
+      entry.result_ref_ttl_sec = resultRefMeta.result_ref_ttl_sec;
+      entry.result_ref_expires_at = resultRefMeta.result_ref_expires_at;
+    }
+    appendLedger(storageDir, entry);
     return true;
   }
 
   await sendText(chatId, `已请求生成导出，稍后发送。\nrequest_id=${requestId}`);
-  appendLedger(storageDir, {
+  const entry: any = {
     ts_utc: new Date().toISOString(),
     channel,
     chat_id: chatId,
@@ -481,11 +571,92 @@ export async function handleDashboardIntentIfAny(params: {
     panel_id: intent.params.panel_id,
     window_spec_id: intent.params.window_spec_id,
     request_id: requestId,
+    request_id_base: requestIdBase,
+    adapter_trace_id: requestIdBase,
+    attempt,
+    on_demand_status: result.status,
+    dispatch_status: dispatchStatus,
     schema_version: intent.schema_version,
     intent_version: intent.intent_version,
-  });
+  };
+  if (adapterEntry) {
+    entry.adapter_entry = true;
+  }
+  if (result.filtersDropped?.length) {
+    entry.filters_dropped = result.filtersDropped;
+  }
+  if (resultRefMeta) {
+    entry.result_ref = resultRefMeta.result_ref;
+    entry.result_ref_version = resultRefMeta.result_ref_version;
+    entry.result_ref_ttl_sec = resultRefMeta.result_ref_ttl_sec;
+    entry.result_ref_expires_at = resultRefMeta.result_ref_expires_at;
+  }
+  appendLedger(storageDir, entry);
 
   return true;
+}
+
+export async function handleDashboardIntentIfAny(params: {
+  storageDir: string;
+  config: LoadedConfig;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
+  channel: "telegram" | "feishu";
+  chatId: string;
+  messageId: string;
+  replyToId: string;
+  userId: string;
+  text: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  replyText: string;
+  sendText: (chatId: string, text: string) => Promise<void>;
+}): Promise<boolean> {
+  const {
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel,
+    chatId,
+    messageId,
+    replyToId,
+    userId,
+    text,
+    isGroup,
+    mentionsBot,
+    replyText,
+    sendText,
+  } = params;
+
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return false;
+
+  const projectId = resolveProjectId(config);
+  const defaultWindowSpecId = resolveDefaultWindowSpecId(projectId || undefined) || undefined;
+  const intent = parseDashboardIntent(trimmed, { defaultWindowSpecId });
+  if (!intent) return false;
+
+  return dispatchDashboardExport({
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel,
+    chatId,
+    messageId,
+    replyToId,
+    userId,
+    text,
+    isGroup,
+    mentionsBot,
+    replyText,
+    sendText,
+    intent,
+  });
 }
 
 export async function handleChartIfAny(params: {
@@ -571,6 +742,7 @@ export async function handleChartIfAny(params: {
       user_id: userId,
       kind: "chart_reject",
       reason: "missing_message_id_and_parent_id",
+      error_code: "trace_id_missing",
       raw: trimmed,
     });
     return true;

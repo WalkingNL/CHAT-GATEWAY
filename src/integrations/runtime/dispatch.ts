@@ -1,4 +1,4 @@
-import { handleMessage } from "../router/router.js";
+import { handleAdapterIntentIfAny, handleMessage } from "../router/router.js";
 import { handleChartIfAny, handleDashboardIntentIfAny, handleFeedbackIfAny } from "./handlers.js";
 import { handleCognitiveIfAny, handleCognitiveStatusUpdate } from "./cognitive.js";
 import type { IntegrationContext } from "./context.js";
@@ -58,6 +58,26 @@ export async function dispatchMessageEvent(ctx: IntegrationContext, event: Messa
     text: event.text,
     isGroup: event.isGroup,
     mentionsBot: event.mentionsBot,
+    send: senders.sendText,
+  })) {
+    return;
+  }
+
+  if (await handleAdapterIntentIfAny({
+    storageDir,
+    config: loaded,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel: event.channel,
+    chatId: event.chatId,
+    messageId: event.messageId,
+    replyToId: event.replyToId,
+    userId: event.userId,
+    text: event.text,
+    isGroup: event.isGroup,
+    mentionsBot: event.mentionsBot,
+    replyText: event.replyText,
     send: senders.sendText,
   })) {
     return;
@@ -135,6 +155,8 @@ export async function dispatchMessageEvent(ctx: IntegrationContext, event: Messa
     limiter,
     chatId: event.chatId,
     userId: event.userId,
+    messageId: event.messageId,
+    replyToId: event.replyToId,
     text: event.text,
     replyText: event.replyText,
     isGroup: event.isGroup,
