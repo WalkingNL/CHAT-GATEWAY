@@ -1,4 +1,4 @@
-import { loadProjectRegistry } from "../integrations/runtime/project_registry.js";
+import { loadProjectRegistry } from "./project_registry.js";
 import { EXPORT_API_VERSION, isPanelIdAllowed } from "./intent_schema.js";
 
 type OnDemandSettings = {

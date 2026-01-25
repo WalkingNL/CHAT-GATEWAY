@@ -62,14 +62,14 @@ function resolveSymbol(text: string): string | null {
 
 function parseHours(text: string): number | null {
   const t = String(text || "");
-  const hrMatch = t.match(/(?:past|last|recent)?\s*(\d+)\s*(?:h|hr|hour|hours|\u5c0f\u65f6)\b/i);
+  const hrMatch = t.match(/(?:past|last|recent)?\s*(\d+)\s*(?:h|hr|hour|hours|小时)\b/i);
   if (hrMatch) {
     const n = Number(hrMatch[1]);
     if (Number.isFinite(n) && n > 0) return n;
   }
-  if (/(?:3|three)\s*(?:d|day|days|\u5929)/i.test(t)) return 72;
-  if (/(?:7|seven)\s*(?:d|day|days|\u5468)/i.test(t)) return 168;
-  if (/(?:1|one)\s*(?:d|day|days|\u5929)/i.test(t)) return 24;
+  if (/(?:3|three)\s*(?:d|day|days|天)/i.test(t)) return 72;
+  if (/(?:7|seven)\s*(?:d|day|days|周)/i.test(t)) return 168;
+  if (/(?:1|one)\s*(?:d|day|days|天)/i.test(t)) return 24;
   return null;
 }
 
@@ -91,7 +91,7 @@ function parseDate(text: string, now: Date): string {
       return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
     }
   }
-  if (/\u6628\u5929/.test(t) || /\byesterday\b/i.test(t)) {
+  if (/昨天/.test(t) || /\byesterday\b/i.test(t)) {
     const d = new Date(now.getTime() - 24 * 60 * 60 * 1000);
     return formatUtcDate(d);
   }
@@ -104,9 +104,9 @@ function isFactorTimeline(text: string): boolean {
     return true;
   }
   if (lower.includes("timeline")) return true;
-  if (/\u65f6\u95f4\u7ebf/.test(text)) return true;
-  if (/\u70b9\u72b6\u56fe/.test(text)) return true;
-  if (/\u56e0\u5b50/.test(text) && /\u7ebf/.test(text)) return true;
+  if (/时间线/.test(text)) return true;
+  if (/点状图/.test(text)) return true;
+  if (/因子/.test(text) && /线/.test(text)) return true;
   return false;
 }
 
@@ -114,9 +114,9 @@ function isDailyActivity(text: string): boolean {
   const lower = String(text || "").toLowerCase();
   if (lower.includes("daily activity")) return true;
   if (lower.includes("activity")) return true;
-  if (/\u6d3b\u8dc3/.test(text)) return true;
-  if (/\u6d3b\u8dc3\u5ea6/.test(text)) return true;
-  if (/\u6d3b\u8dc3\u65f6\u6bb5/.test(text)) return true;
+  if (/活跃/.test(text)) return true;
+  if (/活跃度/.test(text)) return true;
+  if (/活跃时段/.test(text)) return true;
   return false;
 }
 

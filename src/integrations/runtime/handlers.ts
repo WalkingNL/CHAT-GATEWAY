@@ -12,8 +12,8 @@ import {
   updatePushPolicyTargets,
 } from "../channels/feedback.js";
 import { loadAuth } from "../auth/store.js";
-import { allowedPanelIds, parseDashboardIntent } from "../../core/intent_schema.js";
-import { requestDashboardExport, resolveDefaultWindowSpecId } from "../../core/intent_router.js";
+import { allowedPanelIds, parseDashboardIntent } from "./intent_schema.js";
+import { requestDashboardExport, resolveDefaultWindowSpecId } from "./intent_router.js";
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
 import { buildErrorResultRef, buildImageResultRef, mapOnDemandStatus } from "./on_demand_mapping.js";
