@@ -6,6 +6,8 @@ import type { LoadedConfig } from "../../core/config/types.js";
 import { RateLimiter } from "../../core/rateLimit/limiter.js";
 import { listPaths } from "../explain/path_registry.js";
 import { registerDefaultPaths } from "../explain/paths/index.js";
+import { checkErrorCodesVersion, loadAuditPolicyOnce, startAuditPolicyWatcher } from "./audit_policy.js";
+import { loadCapabilitiesOnce, startCapabilitiesWatcher } from "./capabilities.js";
 
 export type IntegrationContext = {
   cfg: any;
@@ -15,6 +17,22 @@ export type IntegrationContext = {
 };
 
 export function buildIntegrationContext(configPath = "config.yaml"): IntegrationContext {
+  loadCapabilitiesOnce();
+  startCapabilitiesWatcher();
+  loadAuditPolicyOnce();
+  startAuditPolicyWatcher();
+  const requiredErrorCodesVersion = String(process.env.ERROR_CODES_VERSION_REQUIRED || "").trim();
+  if (requiredErrorCodesVersion && !checkErrorCodesVersion(requiredErrorCodesVersion)) {
+    console.error(
+      "[audit][ERROR] error_codes_version mismatch",
+      "required=" + requiredErrorCodesVersion,
+    );
+    const strict = String(process.env.ERROR_CODES_STRICT || "").trim().toLowerCase();
+    if (["1", "true", "yes", "y", "on"].includes(strict)) {
+      throw new Error("error_codes_version mismatch");
+    }
+  }
+
   const cfg = loadConfig(configPath);
   const loaded = loadAllConfig();
   registerDefaultPaths();

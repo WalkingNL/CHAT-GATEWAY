@@ -1,0 +1,31 @@
+version: "v1"
+codes:
+  - request_id_expired
+  - trace_id_missing
+  - missing_request_id
+  - missing_project_id
+  - missing_window_spec_id
+  - missing_panel_id
+  - missing_items
+  - missing_symbol_or_window
+  - panel_id_not_allowed
+  - invalid_panel_id
+  - invalid_symbol
+  - invalid_window_minutes
+  - invalid_date_utc
+  - invalid_kind
+  - unauthorized
+  - forbidden
+  - not_found
+  - payload_too_large
+  - invalid_json
+  - config_load_failed
+  - executor_unavailable
+  - agent_error
+  - llm_failed
+  - on_demand_http_400
+  - on_demand_http_401
+  - on_demand_http_403
+  - on_demand_http_404
+  - on_demand_http_429
+  - on_demand_http_500

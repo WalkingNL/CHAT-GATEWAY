@@ -1,0 +1,13 @@
+version: "v1"
+enabled: true
+keep_head_chars: 240
+hash_algo: "sha256"
+fields:
+  - raw
+  - reply_text
+  - reply_raw
+  - normalized_text
+  - summary
+  - summary_head
+  - raw_alert
+  - facts

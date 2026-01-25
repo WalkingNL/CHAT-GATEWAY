@@ -19,6 +19,7 @@ import { resolveDefaultWindowSpecId, sanitizeRequestId } from "../../core/intent
 import { parseDashboardIntent } from "../../core/intent_schema.js";
 import { buildErrorResultRef, buildTextResultRef } from "../runtime/on_demand_mapping.js";
 import { dispatchDashboardExport } from "../runtime/handlers.js";
+import { isIntentEnabled } from "../runtime/capabilities.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
 const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
@@ -958,7 +959,10 @@ export async function handleAdapterIntentIfAny(params: {
   // v1: dashboard_export（优先于新闻摘要）
   const projectId = resolveProjectId(config);
   const defaultWindowSpecId = resolveDefaultWindowSpecId(projectId || undefined) || undefined;
-  const dashIntent = trimmedText ? parseDashboardIntent(trimmedText, { defaultWindowSpecId }) : null;
+  const dashboardEnabled = isIntentEnabled("dashboard_export");
+  const dashIntent = dashboardEnabled && trimmedText
+    ? parseDashboardIntent(trimmedText, { defaultWindowSpecId })
+    : null;
   if (dashIntent) {
     const adapterIds = resolveAdapterRequestIds({
       channel,
@@ -993,6 +997,7 @@ export async function handleAdapterIntentIfAny(params: {
   }
 
   // v1: news_summary（仅在明确请求摘要时进入 adapter）
+  if (!isIntentEnabled("news_summary")) return false;
   const summaryRequested = wantsNewsSummary(trimmedText);
   const explainRequested = isExplainRequest(trimmedText);
   if (!summaryRequested && !explainRequested) return false;

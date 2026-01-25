@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
+import { getAuditMeta, applyRedaction } from "../runtime/audit_policy.js";
+import { getCapabilityAuditMeta } from "../runtime/capabilities.js";
 
 export function ledgerPath(storageDir: string) {
   const d = new Date();
@@ -8,6 +10,14 @@ export function ledgerPath(storageDir: string) {
 }
 
 export function appendLedger(storageDir: string, obj: any) {
+  const meta = {
+    ...getCapabilityAuditMeta(),
+    ...getAuditMeta(),
+  };
+  const merged = { ...obj, ...meta };
+  const redacted = applyRedaction(merged);
+  redacted.entry.redaction_applied = redacted.applied;
+
   fs.mkdirSync(storageDir, { recursive: true });
-  fs.appendFileSync(ledgerPath(storageDir), JSON.stringify(obj) + "\n", "utf-8");
+  fs.appendFileSync(ledgerPath(storageDir), JSON.stringify(redacted.entry) + "\n", "utf-8");
 }

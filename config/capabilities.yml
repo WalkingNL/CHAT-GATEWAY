@@ -1,0 +1,12 @@
+version: "2025-01-25"
+retry_policy_version: "v1"
+
+intents:
+  dashboard_export:
+    enabled: true
+    panel_id_allowlist:
+      - "signals.factor_timeline"
+      - "overview.daily_activity"
+      - "signals.daily_activity"
+  news_summary:
+    enabled: true
