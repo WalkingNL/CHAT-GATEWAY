@@ -21,6 +21,8 @@ import { buildErrorResultRef, buildTextResultRef } from "../runtime/on_demand_ma
 import { errorText, rejectText } from "../runtime/response_templates.js";
 import { dispatchDashboardExport } from "../runtime/handlers.js";
 import { isIntentEnabled } from "../runtime/capabilities.js";
+import { handleStrategyIfAny } from "../runtime/strategy.js";
+import { handleQueryIfAny } from "../runtime/query.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
 const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
@@ -636,7 +638,7 @@ async function runExplain(params: {
   config?: LoadedConfig;
   channel: string;
   taskIdPrefix: string;
-}) {
+}): Promise<{ ok: boolean; summary: string; errCode: string; latencyMs: number }> {
   const { storageDir, chatId, userId, rawAlert, send, config, channel, taskIdPrefix } = params;
   const t0 = Date.now();
   const ctx = await buildExplainContext(rawAlert, config);
@@ -708,6 +710,8 @@ async function runExplain(params: {
 
   writeExplainTrace(storageDir, trace);
   lastExplainByChatId.set(chatId, { ts: Date.now(), trace_id: taskId });
+
+  return { ok, summary, errCode, latencyMs };
 }
 
 async function runNewsSummary(params: {
@@ -965,6 +969,64 @@ export async function handleAdapterIntentIfAny(params: {
   if (!trimmedText && !trimmedReplyText) return false;
   const explicitRetry = wantsRetry(trimmedText);
 
+  const strategyRequested = /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i.test(trimmedText);
+  if (strategyRequested && isIntentEnabled("alert_strategy")) {
+    const adapterIds = resolveAdapterRequestIds({
+      channel,
+      chatId,
+      messageId,
+      replyToId,
+      explicitRetry,
+    });
+    return handleStrategyIfAny({
+      storageDir,
+      config,
+      allowlistMode,
+      ownerChatId,
+      ownerUserId,
+      channel,
+      chatId,
+      userId,
+      isGroup,
+      mentionsBot,
+      text: trimmedText,
+      send,
+      adapterEntry: true,
+      requestId: adapterIds?.dispatchRequestId,
+      requestIdBase: adapterIds?.requestIdBase,
+      attempt: adapterIds?.attempt,
+    });
+  }
+
+  const queryRequested = /^\/(event|evidence|gate|eval|evaluation|reliability|config|health)\b/i.test(trimmedText);
+  if (queryRequested && isIntentEnabled("alert_query")) {
+    const adapterIds = resolveAdapterRequestIds({
+      channel,
+      chatId,
+      messageId,
+      replyToId,
+      explicitRetry,
+    });
+    return handleQueryIfAny({
+      storageDir,
+      config,
+      allowlistMode,
+      ownerChatId,
+      ownerUserId,
+      channel,
+      chatId,
+      userId,
+      isGroup,
+      mentionsBot,
+      text: trimmedText,
+      send,
+      adapterEntry: true,
+      requestId: adapterIds?.dispatchRequestId,
+      requestIdBase: adapterIds?.requestIdBase,
+      attempt: adapterIds?.attempt,
+    });
+  }
+
   // v1: dashboard_export（优先于新闻摘要）
   const projectId = resolveProjectId(config);
   const defaultWindowSpecId = resolveDefaultWindowSpecId(projectId || undefined) || undefined;
@@ -1005,10 +1067,116 @@ export async function handleAdapterIntentIfAny(params: {
     });
   }
 
+  const explainRequested = isExplainRequest(trimmedText);
+  if (explainRequested && isIntentEnabled("alert_explain")) {
+    let rawAlert = trimmedReplyText;
+    if (!rawAlert && !isGroup) {
+      rawAlert = lastAlertByChatId.get(chatId)?.rawText || "";
+    }
+    if (!rawAlert) {
+      if (isGroup) {
+        await send(chatId, "请回复一条告警/新闻消息再 @我。");
+      } else {
+        await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下）。");
+      }
+      return true;
+    }
+
+    if (!isNewsAlert(rawAlert)) {
+      if (isGroup) {
+        const res = evaluate(config, {
+          channel,
+          capability: "alerts.explain",
+          chat_id: chatId,
+          chat_type: "group",
+          user_id: userId,
+          mention_bot: mentionsBot,
+          has_reply: Boolean(trimmedReplyText),
+        });
+        if (res.require?.mention_bot_for_explain && !mentionsBot) return false;
+        if (res.require?.reply_required_for_explain && !trimmedReplyText) {
+          await send(chatId, "请回复一条告警/新闻消息再 @我。");
+          return true;
+        }
+        if (!res.allowed) {
+          await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
+          return true;
+        }
+      } else {
+        const authState = loadAuth(storageDir, ownerChatId, channel);
+        const resolvedOwnerUserId = String(ownerUserId || "");
+        const isOwnerChat = chatId === ownerChatId;
+        const isOwnerUser = resolvedOwnerUserId ? userId === resolvedOwnerUserId : false;
+        const allowed =
+          allowlistMode === "owner_only"
+            ? (isGroup ? isOwnerUser : isOwnerChat)
+            : authState.allowed.includes(chatId) || isOwnerUser;
+        if (!allowed) return true;
+      }
+
+      const adapterIds = resolveAdapterRequestIds({
+        channel,
+        chatId,
+        messageId,
+        replyToId,
+        explicitRetry,
+      });
+      if (adapterIds?.expired) {
+        await send(chatId, rejectText("请求已过期，请重新发起解释。"));
+        appendLedger(storageDir, {
+          ts_utc: nowIso(),
+          channel,
+          chat_id: chatId,
+          user_id: userId,
+          cmd: "alert_explain_reject",
+          request_id: adapterIds.dispatchRequestId,
+          request_id_base: adapterIds.requestIdBase,
+          adapter_trace_id: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+          schema_version: INTENT_SCHEMA_VERSION,
+          intent_version: INTENT_VERSION,
+          error_code: "request_id_expired",
+          raw: trimmedText,
+          adapter_entry: true,
+        });
+        return true;
+      }
+
+      await send(chatId, "🧠 我看一下…");
+      const explainResult = await runExplain({
+        storageDir,
+        chatId,
+        userId,
+        rawAlert,
+        send,
+        config,
+        channel,
+        taskIdPrefix: `${taskPrefix(channel)}_explain`,
+      });
+      appendLedger(storageDir, {
+        ts_utc: nowIso(),
+        channel,
+        chat_id: chatId,
+        user_id: userId,
+        cmd: "alert_explain",
+        request_id: adapterIds?.dispatchRequestId,
+        request_id_base: adapterIds?.requestIdBase,
+        adapter_trace_id: adapterIds?.requestIdBase,
+        attempt: adapterIds?.attempt,
+        schema_version: INTENT_SCHEMA_VERSION,
+        intent_version: INTENT_VERSION,
+        ok: explainResult.ok,
+        err: explainResult.ok ? undefined : explainResult.errCode || "unknown",
+        latency_ms: explainResult.latencyMs,
+        adapter_entry: true,
+      });
+      return true;
+    }
+  }
+
   // v1: news_summary（仅在明确请求摘要时进入 adapter）
   if (!isIntentEnabled("news_summary")) return false;
   const summaryRequested = wantsNewsSummary(trimmedText);
-  const explainRequested = isExplainRequest(trimmedText);
   if (!summaryRequested && !explainRequested) return false;
 
   let rawAlert = trimmedReplyText;
