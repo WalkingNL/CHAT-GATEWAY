@@ -3,6 +3,8 @@ enabled: true
 
 capabilities:
   - alerts.explain
+  - alerts.strategy
+  - alerts.query
   - ops.status
   - ops.logs
   - ops.ps
@@ -24,6 +26,8 @@ rules:
       user_id: "1864053991"
     allow:
       - alerts.explain
+      - alerts.strategy
+      - alerts.query
       - ops.status
       - ops.logs
       - ops.ps
@@ -46,6 +50,8 @@ rules:
       user_id: "1864053991"
     allow:
       - alerts.explain
+      - alerts.strategy
+      - alerts.query
       - ops.status
       - ops.logs
       - ops.ps
