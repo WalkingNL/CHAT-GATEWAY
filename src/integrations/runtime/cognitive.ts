@@ -12,6 +12,7 @@ import {
   type CognitiveSource,
 } from "../../core/cognitive_store.js";
 import { submitTask } from "../../core/internal_client.js";
+import { rejectText } from "./response_templates.js";
 
 const EXPLICIT_INTENTS = [
   "记一下",
@@ -422,7 +423,7 @@ export async function handleCognitiveIfAny(params: {
     replyToId,
   );
   if (!issueId) {
-    await send(chatId, "该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配");
+    await send(chatId, rejectText("该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配"));
     appendLedger(storageDir, {
       ts_utc: nowUtc(),
       channel,

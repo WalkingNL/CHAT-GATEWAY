@@ -17,6 +17,7 @@ import { requestDashboardExport, resolveDefaultWindowSpecId } from "./intent_rou
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
 import { buildErrorResultRef, buildImageResultRef, mapOnDemandStatus } from "./on_demand_mapping.js";
+import { errorText, rejectText } from "./response_templates.js";
 
 function sanitizeRequestId(raw: string): string {
   return raw.replace(/[^A-Za-z0-9._:-]/g, "_").slice(0, 200);
@@ -81,7 +82,7 @@ export async function handleFeedbackIfAny(params: {
 
   if (levelIntent) {
     if (!allowed) {
-      await send(chatId, "无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。");
+      await send(chatId, rejectText("无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。"));
       const rejectPayload: any = {
         ts_utc: new Date().toISOString(),
         channel,
@@ -100,7 +101,7 @@ export async function handleFeedbackIfAny(params: {
       return true;
     }
     if ("invalid" in levelIntent) {
-      await send(chatId, "已收到反馈，但等级无效/超出范围（仅支持 LOW/MEDIUM/HIGH/CRITICAL），未做调整。");
+      await send(chatId, rejectText("等级无效/超出范围（仅支持 LOW/MEDIUM/HIGH/CRITICAL），未做调整。"));
       appendLedger(storageDir, {
         ts_utc: new Date().toISOString(),
         channel,
@@ -124,7 +125,7 @@ export async function handleFeedbackIfAny(params: {
     let reply = FEEDBACK_REPLY;
     if (update) reply = buildLevelOverrideReply(levelIntent.level, update);
     if (error || !update) {
-      reply = "已收到反馈，但当前未能更新策略，请稍后重试或联系管理员。";
+      reply = errorText("未能更新策略，请稍后重试或联系管理员。");
     }
     await send(chatId, reply);
 
@@ -183,7 +184,7 @@ export async function handleFeedbackIfAny(params: {
 
   if (!hit) return false;
   if (!allowed) {
-    await send(chatId, "无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。");
+    await send(chatId, rejectText("无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),
       channel,
@@ -209,7 +210,7 @@ export async function handleFeedbackIfAny(params: {
   let reply = FEEDBACK_REPLY;
   if (update) reply = buildFeedbackReply(hit.kind, update);
   if (error || !update) {
-    reply = "已收到反馈，但当前未能更新策略，请稍后重试或联系管理员。";
+    reply = errorText("未能更新策略，请稍后重试或联系管理员。");
   }
   await send(chatId, reply);
 
@@ -368,7 +369,7 @@ export async function dispatchDashboardExport(params: {
     if (!gate.silent) {
       await sendText(
         chatId,
-        gate.res?.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放。",
+        gate.res?.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放。"),
       );
     }
     return true;
@@ -376,7 +377,7 @@ export async function dispatchDashboardExport(params: {
 
   const requestKey = messageId || replyToId;
   if (!requestKey) {
-    await sendText(chatId, "该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配");
+    await sendText(chatId, rejectText("该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),
       channel,
@@ -402,7 +403,7 @@ export async function dispatchDashboardExport(params: {
 
   const projectId = resolveProjectId(config);
   if (!projectId) {
-    await sendText(chatId, "未配置默认项目，无法生成导出。");
+    await sendText(chatId, rejectText("未配置默认项目，无法生成导出。"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),
       channel,
@@ -427,7 +428,7 @@ export async function dispatchDashboardExport(params: {
   }
 
   if (requestExpired) {
-    await sendText(chatId, "请求已过期，请重新发起导出。");
+    await sendText(chatId, rejectText("请求已过期，请重新发起导出。"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),
       channel,
@@ -480,7 +481,7 @@ export async function dispatchDashboardExport(params: {
   }
 
   if (!intent.params.panel_id || !intent.params.window_spec_id) {
-    await sendText(chatId, "参数不完整，无法生成导出。");
+    await sendText(chatId, rejectText("参数不完整，无法生成导出。"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),
       channel,
@@ -528,7 +529,7 @@ export async function dispatchDashboardExport(params: {
 
   if (!result.ok) {
     const trace = result.traceId ? ` trace_id=${result.traceId}` : "";
-    await sendText(chatId, `导出失败：${result.error || "unknown"}${trace}`.trim());
+    await sendText(chatId, errorText(`导出失败：${result.error || "unknown"}${trace}`.trim()));
     const entry: any = {
       ts_utc: new Date().toISOString(),
       channel,
@@ -743,7 +744,7 @@ export async function handleChartIfAny(params: {
 
   const requestKey = messageId || replyToId;
   if (!requestKey) {
-    await sendTelegramText(chatId, "该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配");
+    await sendTelegramText(chatId, rejectText("该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),
       channel,
@@ -769,7 +770,7 @@ export async function handleChartIfAny(params: {
   const projectId = resolveProjectId(config);
 
   if (!projectId) {
-    await sendTelegramText(chatId, "未配置默认项目，无法生成图表");
+    await sendTelegramText(chatId, rejectText("未配置默认项目，无法生成图表"));
     return true;
   }
 
@@ -804,7 +805,7 @@ export async function handleChartIfAny(params: {
       if (!gate.silent) {
         await sendTelegramText(
           chatId,
-          gate.res?.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放。",
+          gate.res?.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放。"),
         );
       }
       return true;
@@ -824,7 +825,7 @@ export async function handleChartIfAny(params: {
       }
       await sendTelegramText(chatId, "已请求生成图表，稍后发送");
     } catch (e: any) {
-      await sendTelegramText(chatId, `图表生成失败：${String(e?.message || e)}`);
+      await sendTelegramText(chatId, errorText(`图表生成失败：${String(e?.message || e)}`));
       return true;
     }
   }

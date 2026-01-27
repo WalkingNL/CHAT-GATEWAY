@@ -18,6 +18,7 @@ import { writeExplainTrace, writeExplainFeedback } from "../audit/trace_writer.j
 import { resolveDefaultWindowSpecId, sanitizeRequestId } from "../runtime/intent_router.js";
 import { INTENT_SCHEMA_VERSION, INTENT_VERSION, parseDashboardIntent } from "../runtime/intent_schema.js";
 import { buildErrorResultRef, buildTextResultRef } from "../runtime/on_demand_mapping.js";
+import { errorText, rejectText } from "../runtime/response_templates.js";
 import { dispatchDashboardExport } from "../runtime/handlers.js";
 import { isIntentEnabled } from "../runtime/capabilities.js";
 
@@ -661,7 +662,7 @@ async function runExplain(params: {
 
     if (!res?.ok) {
       errCode = res?.error || "unknown";
-      await send(chatId, `解释失败：${errCode}`);
+      await send(chatId, errorText(`解释失败：${errCode}`));
     } else {
       ok = true;
       summary = String(res.summary || "");
@@ -673,7 +674,7 @@ async function runExplain(params: {
   } catch (e: any) {
     latencyMs = Date.now() - t0;
     errCode = String(e?.message || e);
-    await send(chatId, `解释异常：${errCode}`);
+    await send(chatId, errorText(`解释异常：${errCode}`));
   }
 
   const parsed = ctx.parsed;
@@ -742,7 +743,7 @@ async function runNewsSummary(params: {
   const parsed = parseNewsAlert(rawAlert);
   const requestKey = String(messageId || "").trim() || String(replyToId || "").trim();
   if (!requestKey) {
-    await send(chatId, "该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配");
+    await send(chatId, rejectText("该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配"));
     appendLedger(storageDir, {
       ts_utc: nowIso(),
       channel,
@@ -1048,7 +1049,7 @@ export async function handleAdapterIntentIfAny(params: {
       return true;
     }
     if (!res.allowed) {
-      await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
       return true;
     }
   } else {
@@ -1088,7 +1089,7 @@ export async function handleAdapterIntentIfAny(params: {
   }
 
   if (!projectId) {
-    await send(chatId, "未配置默认项目，无法生成摘要。");
+    await send(chatId, rejectText("未配置默认项目，无法生成摘要。"));
     appendLedger(storageDir, {
       ts_utc: nowIso(),
       channel,
@@ -1109,7 +1110,7 @@ export async function handleAdapterIntentIfAny(params: {
   }
 
   if (adapterIds.expired) {
-    await send(chatId, "请求已过期，请重新发起摘要。");
+    await send(chatId, rejectText("请求已过期，请重新发起摘要。"));
     appendLedger(storageDir, {
       ts_utc: nowIso(),
       channel,
@@ -1451,7 +1452,7 @@ async function handleOpsCommand(params: {
     if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
     const isAllowed = policyOk ? res.allowed : allowed;
     if (!isAllowed) {
-      await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
       return true;
     }
     const status = renderStatus(pm2PsNames);
@@ -1466,7 +1467,7 @@ async function handleOpsCommand(params: {
     if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
     const isAllowed = policyOk ? res.allowed : allowed;
     if (!isAllowed) {
-      await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
       return true;
     }
     await send(chatId, renderPs(pm2PsNames));
@@ -1478,7 +1479,7 @@ async function handleOpsCommand(params: {
     if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
     const isAllowed = policyOk ? res.allowed : allowed;
     if (!isAllowed) {
-      await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+      await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
       return true;
     }
     const parts = cleanedText.split(/\s+/).filter(Boolean);
@@ -1542,7 +1543,7 @@ async function handleGroupExplain(params: {
   }
 
   if (!res.allowed) {
-    await send(chatId, res.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+    await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
     return;
   }
 
@@ -1732,7 +1733,7 @@ async function handleParsedCommand(params: {
 
   // auth commands only owner
   if (cmd.kind.startsWith("auth_") && !isOwner) {
-    await send(chatId, "permission denied");
+    await send(chatId, rejectText("permission denied"));
     return;
   }
 
@@ -1773,7 +1774,7 @@ async function handleParsedCommand(params: {
         const msg = digest.error === "signals_dir_missing"
           ? "signals data dir missing"
           : "signals source not configured";
-        await send(chatId, msg);
+        await send(chatId, errorText(msg));
         return;
       }
 
@@ -1789,7 +1790,7 @@ async function handleParsedCommand(params: {
         top_kinds: digest.summary.topKinds,
       });
     } catch (e: any) {
-      await send(chatId, `signals read failed: ${String(e?.message || e)}`);
+      await send(chatId, errorText(`signals read failed: ${String(e?.message || e)}`));
     }
     return;
 
@@ -1826,14 +1827,14 @@ async function handleParsedCommand(params: {
       });
 
       if (!res?.ok) {
-        await send(chatId, `❌ Gateway error: ${res?.error || "unknown"}`);
+        await send(chatId, errorText(`Gateway error: ${res?.error || "unknown"}`));
         appendLedger(storageDir, { ...baseAudit, cmd: "analyze", taskId, ok: false, error: res?.error || "unknown" });
         return;
       }
 
       await send(chatId, `🧠 Analysis (facts-only)\n\n${res.summary}`);
     } catch (e: any) {
-      await send(chatId, `❌ analyze failed: ${String(e?.message || e)}`);
+      await send(chatId, errorText(`analyze failed: ${String(e?.message || e)}`));
     }
 
     appendLedger(storageDir, { ...baseAudit, cmd: "analyze", taskId });
@@ -1861,7 +1862,7 @@ async function handleParsedCommand(params: {
       });
 
       if (!res?.ok) {
-        await send(chatId, `❌ Gateway error: ${res?.error || "unknown"}`);
+        await send(chatId, errorText(`Gateway error: ${res?.error || "unknown"}`));
         appendLedger(storageDir, { ...baseAudit, cmd: "suggest", taskId, ok: false, error: res?.error || "unknown" });
         return;
       }
@@ -1886,7 +1887,7 @@ async function handleParsedCommand(params: {
 
       await send(chatId, out);
     } catch (e: any) {
-      await send(chatId, `❌ suggest failed: ${String(e?.message || e)}`);
+      await send(chatId, errorText(`suggest failed: ${String(e?.message || e)}`));
     }
 
     appendLedger(storageDir, { ...baseAudit, cmd: "suggest", taskId });
