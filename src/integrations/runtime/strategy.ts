@@ -21,6 +21,10 @@ type StrategyApplyResult = {
   policyPath?: string;
   snapshotPath?: string;
   changes?: Record<string, { prev: any; next: any }>;
+  warnings?: string[];
+  sync_gates?: boolean;
+  strict_sync?: boolean;
+  derived_gates?: { min_priority: string; max_alerts_per_hour: number | null } | null;
 };
 
 type PolicyState = {
@@ -177,6 +181,23 @@ function parseNumber(value: any): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+function parseBool(value: any): boolean {
+  if (value == null) return false;
+  const v = String(value).trim().toLowerCase();
+  if (!v) return false;
+  if (["1", "true", "yes", "y", "on"].includes(v)) return true;
+  if (["0", "false", "no", "n", "off"].includes(v)) return false;
+  return false;
+}
+
+function normalizeMaxAlerts(value: any): number | null {
+  if (value == null) return null;
+  const v = String(value).trim().toLowerCase();
+  if (!v || v === "null") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 function validatePriority(value: any): string | null {
   const v = normalizePriority(value, "");
   if (!v) return null;
@@ -264,6 +285,7 @@ function applyStrategyUpdate(cmd: StrategyCommand): StrategyApplyResult {
   const policyPath = resolvePolicyStatePath();
   const historyPath = resolveStrategyHistoryPath();
   const lockPath = resolveStrategyLockPath();
+  const strictSync = parseBool(process.env.STRATEGY_STRICT_SYNC);
 
   if (!fs.existsSync(path.dirname(policyPath))) {
     return { ok: false, message: "策略路径不可用，请配置 CRYPTO_AGENT_ROOT", error: "missing_root" };
@@ -277,11 +299,13 @@ function applyStrategyUpdate(cmd: StrategyCommand): StrategyApplyResult {
   const prevGates = { ...(state.gates || {}) };
 
   const changes: Record<string, { prev: any; next: any }> = {};
+  const warnings: string[] = [];
 
   const minPriority = cmd.params.min_priority || cmd.params.minpriority || cmd.params.minPriority;
   const maxAlertsPerHour = cmd.params.max_alerts_per_hour ?? cmd.params.max_alerts_per_h;
   const alertsTarget = cmd.params.alerts_per_hour_target ?? cmd.params.alerts_target;
   const pushLevel = cmd.params.push_level ?? cmd.params.pushLevel;
+  const syncDerived = parseBool(cmd.params.sync_gates ?? cmd.params.apply_derived ?? cmd.params.sync);
 
   if (minPriority != null) {
     const next = validatePriority(minPriority);
@@ -317,7 +341,7 @@ function applyStrategyUpdate(cmd: StrategyCommand): StrategyApplyResult {
   }
 
   const derived = pushLevel != null ? gatesFromPushLevel(Number(pushLevel)) : null;
-  if (derived) {
+  if (derived && syncDerived) {
     const derivedMin = normalizePriority(derived.min_priority, "HIGH");
     if (minPriority != null && normalizePriority(minPriority, "HIGH") !== derivedMin) {
       return { ok: false, message: "min_priority 与 push_level 冲突", error: "conflict_min_priority_push_level" };
@@ -335,8 +359,41 @@ function applyStrategyUpdate(cmd: StrategyCommand): StrategyApplyResult {
     }
   }
 
+  if (derived) {
+    const derivedMin = normalizePriority(derived.min_priority, "");
+    const derivedMax = normalizeMaxAlerts(derived.max_alerts_per_hour);
+    const gateState = state.gates || {};
+    const gateMin = normalizePriority(gateState.min_priority, "");
+    const gateMax = normalizeMaxAlerts(gateState.max_alerts_per_hour);
+    const mismatch = gateMin !== derivedMin || gateMax !== derivedMax;
+    if (!syncDerived && mismatch) {
+      if (strictSync) {
+        return {
+          ok: false,
+          message: "push_level 已更新但 gates 未同步（strict 模式禁止）。请加 sync_gates=1 或显式设置 min_priority/max_alerts_per_hour",
+          error: "push_level_gates_diverged",
+          policyPath,
+          changes,
+          sync_gates: syncDerived,
+          strict_sync: strictSync,
+          derived_gates: { min_priority: derivedMin, max_alerts_per_hour: derivedMax },
+        };
+      }
+      warnings.push("push_level 已更新但 gates 未同步；如需同步请加 sync_gates=1。");
+    }
+  }
+
   if (!Object.keys(changes).length) {
-    return { ok: false, message: "未检测到可应用的策略项", error: "empty_update" };
+    return {
+      ok: false,
+      message: "未检测到可应用的策略项",
+      error: "empty_update",
+      sync_gates: syncDerived,
+      strict_sync: strictSync,
+      derived_gates: derived
+        ? { min_priority: normalizePriority(derived.min_priority, ""), max_alerts_per_hour: normalizeMaxAlerts(derived.max_alerts_per_hour) }
+        : null,
+    };
   }
 
   const updatedAt = nowIso();
@@ -360,6 +417,12 @@ function applyStrategyUpdate(cmd: StrategyCommand): StrategyApplyResult {
       updated: false,
       changes,
       policyPath,
+      warnings,
+      sync_gates: syncDerived,
+      strict_sync: strictSync,
+      derived_gates: derived
+        ? { min_priority: normalizePriority(derived.min_priority, ""), max_alerts_per_hour: normalizeMaxAlerts(derived.max_alerts_per_hour) }
+        : null,
     };
   }
 
@@ -379,6 +442,12 @@ function applyStrategyUpdate(cmd: StrategyCommand): StrategyApplyResult {
     changes,
     policyPath,
     snapshotPath: historyPath,
+    warnings,
+    sync_gates: syncDerived,
+    strict_sync: strictSync,
+    derived_gates: derived
+      ? { min_priority: normalizePriority(derived.min_priority, ""), max_alerts_per_hour: normalizeMaxAlerts(derived.max_alerts_per_hour) }
+      : null,
   };
 }
 
@@ -413,6 +482,12 @@ function formatChanges(changes?: Record<string, { prev: any; next: any }>) {
     lines.push(`- ${k}: ${String(v.prev)} → ${String(v.next)}`);
   }
   return lines.join("\n");
+}
+
+function formatWarnings(warnings?: string[]) {
+  if (!warnings || !warnings.length) return "";
+  if (warnings.length === 1) return `注意：${warnings[0]}`;
+  return ["注意：", ...warnings.map(w => `- ${w}`)].join("\n");
 }
 
 export async function handleStrategyIfAny(params: {
@@ -504,7 +579,7 @@ export async function handleStrategyIfAny(params: {
   }
 
   const reply = result.ok
-    ? `${result.message}\n${formatChanges(result.changes)}`
+    ? [result.message, formatChanges(result.changes), formatWarnings(result.warnings)].filter(Boolean).join("\n")
     : errorText(result.message);
   await send(chatId, reply);
 
@@ -523,6 +598,10 @@ export async function handleStrategyIfAny(params: {
     changes: result.changes,
     policy_path: result.policyPath,
     history_path: result.snapshotPath,
+    warnings: result.warnings,
+    sync_gates: result.sync_gates,
+    strict_sync: result.strict_sync,
+    derived_gates: result.derived_gates,
     schema_version: INTENT_SCHEMA_VERSION,
     intent_version: INTENT_VERSION,
     adapter_entry: adapterEntry,
