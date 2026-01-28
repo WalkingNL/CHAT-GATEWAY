@@ -71,12 +71,17 @@ export type LevelOverrideHit =
   | { level: PriorityLevel; normalizedText: string }
   | { invalid: true; normalizedText: string };
 
-export function detectFeedback(rawText: string): FeedbackHit | null {
+function stripFeedbackPrefix(rawText: string): string {
   let textNorm = (rawText || "").trim();
-  if (!textNorm) return null;
+  if (!textNorm) return "";
 
   // feedback command channel (works under Telegram privacy mode in groups)
-  textNorm = textNorm.replace(/^(\/feedback|feedback|反馈)[:：]?\s*/i, "").trim();
+  textNorm = textNorm.replace(/^(\/feedback(?:@[A-Za-z0-9_]+)?|feedback|反馈)[:：]?\s*/i, "").trim();
+  return textNorm;
+}
+
+export function detectFeedback(rawText: string): FeedbackHit | null {
+  const textNorm = stripFeedbackPrefix(rawText);
   if (!textNorm) return null;
 
   if (FEEDBACK_TOO_MANY.some((k) => textNorm.includes(k))) {
@@ -89,10 +94,7 @@ export function detectFeedback(rawText: string): FeedbackHit | null {
 }
 
 export function detectLevelOverride(rawText: string): LevelOverrideHit | null {
-  let textNorm = (rawText || "").trim();
-  if (!textNorm) return null;
-
-  textNorm = textNorm.replace(/^(\/feedback|feedback|反馈)[:：]?\s*/i, "").trim();
+  const textNorm = stripFeedbackPrefix(rawText);
   if (!textNorm) return null;
 
   const lower = textNorm.toLowerCase();
@@ -105,14 +107,22 @@ export function detectLevelOverride(rawText: string): LevelOverrideHit | null {
   return { level, normalizedText: textNorm };
 }
 
+function resolveRoot(): string {
+  const root = String(process.env.CRYPTO_AGENT_ROOT || "").trim();
+  if (root) return root;
+  const cwd = process.cwd();
+  if (cwd.includes("chat-gateway")) {
+    return path.resolve(cwd, "..", "crypto_agent");
+  }
+  return cwd;
+}
+
 function resolvePolicyStatePath(): string {
-  const root = String(process.env.CRYPTO_AGENT_ROOT || "").trim() || "/srv/crypto_agent";
-  return path.join(root, "data/metrics/push_policy_state.json");
+  return path.join(resolveRoot(), "data/metrics/push_policy_state.json");
 }
 
 function resolveStatsStatePath(): string {
-  const root = String(process.env.CRYPTO_AGENT_ROOT || "").trim() || "/srv/crypto_agent";
-  return path.join(root, "data/metrics/push_stats_state.json");
+  return path.join(resolveRoot(), "data/metrics/push_stats_state.json");
 }
 
 function safeParseJson(input: string): any | null {

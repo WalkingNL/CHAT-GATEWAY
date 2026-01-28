@@ -23,6 +23,7 @@ rules:
     match:
       channel: telegram
       user_id: "1864053991"
+      capability: "alerts.strategy"
     allow:
       - alerts.strategy
     require:

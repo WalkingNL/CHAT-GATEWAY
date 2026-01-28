@@ -458,7 +458,11 @@ function resolveSignalsRoot(config?: LoadedConfig): string | null {
   if (root) return root;
   const env = String(process.env.CRYPTO_AGENT_ROOT || "").trim();
   if (env) return env;
-  return "/srv/crypto_agent";
+  const cwd = process.cwd();
+  if (cwd.includes("chat-gateway")) {
+    return path.resolve(cwd, "..", "crypto_agent");
+  }
+  return cwd;
 }
 
 function parseSignalTsMs(row: SignalRow): number | null {
@@ -967,9 +971,22 @@ export async function handleAdapterIntentIfAny(params: {
   const trimmedText = String(text || "").trim();
   const trimmedReplyText = String(replyText || "").trim();
   if (!trimmedText && !trimmedReplyText) return false;
-  const explicitRetry = wantsRetry(trimmedText);
 
-  const strategyRequested = /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i.test(trimmedText);
+  const botUsername = channel === "telegram"
+    ? String(process.env.TELEGRAM_BOT_USERNAME || "SoliaNLBot")
+    : "";
+  const mentionToken = botUsername
+    ? (botUsername.startsWith("@") ? botUsername : `@${botUsername}`)
+    : "";
+  const mentionPattern = mentionToken ? new RegExp(escapeRegExp(mentionToken), "gi") : null;
+  const cleanedText =
+    channel === "telegram" && isGroup && mentionsBot && mentionPattern
+      ? trimmedText.replace(mentionPattern, "").trim()
+      : trimmedText;
+
+  const explicitRetry = wantsRetry(cleanedText);
+
+  const strategyRequested = /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i.test(cleanedText);
   if (strategyRequested && isIntentEnabled("alert_strategy")) {
     const adapterIds = resolveAdapterRequestIds({
       channel,
@@ -989,7 +1006,7 @@ export async function handleAdapterIntentIfAny(params: {
       userId,
       isGroup,
       mentionsBot,
-      text: trimmedText,
+      text: cleanedText,
       send,
       adapterEntry: true,
       requestId: adapterIds?.dispatchRequestId,
@@ -998,7 +1015,7 @@ export async function handleAdapterIntentIfAny(params: {
     });
   }
 
-  const queryRequested = /^\/(event|evidence|gate|eval|evaluation|reliability|config|health)\b/i.test(trimmedText);
+  const queryRequested = /^\/(event|evidence|gate|eval|evaluation|reliability|config|health)\b/i.test(cleanedText);
   if (queryRequested && isIntentEnabled("alert_query")) {
     const adapterIds = resolveAdapterRequestIds({
       channel,
@@ -1018,7 +1035,7 @@ export async function handleAdapterIntentIfAny(params: {
       userId,
       isGroup,
       mentionsBot,
-      text: trimmedText,
+      text: cleanedText,
       send,
       adapterEntry: true,
       requestId: adapterIds?.dispatchRequestId,
@@ -1067,7 +1084,7 @@ export async function handleAdapterIntentIfAny(params: {
     });
   }
 
-  const explainRequested = isExplainRequest(trimmedText);
+  const explainRequested = isExplainRequest(cleanedText);
   if (explainRequested && isIntentEnabled("alert_explain")) {
     let rawAlert = trimmedReplyText;
     if (!rawAlert && !isGroup) {
