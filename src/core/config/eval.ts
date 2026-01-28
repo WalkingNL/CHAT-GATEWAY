@@ -44,6 +44,14 @@ function matchRule(rule: any, inp: EvalInput): boolean {
   if (resolvedMatch.chat_id && String(resolvedMatch.chat_id) !== String(inp.chat_id)) return false;
   if (resolvedMatch.chat_type && String(resolvedMatch.chat_type) !== String(inp.chat_type)) return false;
   if (resolvedMatch.user_id && String(resolvedMatch.user_id) !== String(inp.user_id)) return false;
+  if (resolvedMatch.capability) {
+    const cap = resolvedMatch.capability;
+    if (Array.isArray(cap)) {
+      if (!cap.map(String).includes(String(inp.capability))) return false;
+    } else if (String(cap) !== String(inp.capability)) {
+      return false;
+    }
+  }
   return true;
 }
 
