@@ -89,7 +89,7 @@ export class TelegramPolling {
       const messageId = String(m.message_id ?? "");
       const replyToId = String(m.reply_to_message?.message_id ?? "");
       const text = String(m.text || "");
-      const replyText = String(m.reply_to_message?.text || "");
+      const replyText = String(m.reply_to_message?.text || m.reply_to_message?.caption || "");
       const chatType = String(m.chat?.type || "");
       const isGroup = chatType !== "private";
       const entities = Array.isArray(m.entities) ? m.entities : [];
