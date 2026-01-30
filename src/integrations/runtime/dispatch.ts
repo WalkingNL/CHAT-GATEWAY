@@ -1,6 +1,5 @@
 import { handleAdapterIntentIfAny, handleMessage } from "../router/router.js";
 import { handleChartIfAny, handleDashboardIntentIfAny, handleFeedbackIfAny } from "./handlers.js";
-import { handleCognitiveIfAny, handleCognitiveStatusUpdate } from "./cognitive.js";
 import type { IntegrationContext } from "./context.js";
 import type { MessageEvent } from "./message_event.js";
 
@@ -41,23 +40,6 @@ export async function dispatchMessageEvent(ctx: IntegrationContext, event: Messa
     userId: event.userId,
     isGroup: event.isGroup,
     text: event.text,
-    send: senders.sendText,
-  })) {
-    return;
-  }
-
-  if (await handleCognitiveStatusUpdate({
-    storageDir,
-    config: loaded,
-    allowlistMode,
-    ownerChatId,
-    ownerUserId,
-    channel: event.channel,
-    chatId: event.chatId,
-    userId: event.userId,
-    text: event.text,
-    isGroup: event.isGroup,
-    mentionsBot: event.mentionsBot,
     send: senders.sendText,
   })) {
     return;
@@ -123,26 +105,6 @@ export async function dispatchMessageEvent(ctx: IntegrationContext, event: Messa
     })) {
       return;
     }
-  }
-
-  if (await handleCognitiveIfAny({
-    storageDir,
-    config: loaded,
-    allowlistMode,
-    ownerChatId,
-    ownerUserId,
-    channel: event.channel,
-    chatId: event.chatId,
-    userId: event.userId,
-    messageId: event.messageId,
-    replyToId: event.replyToId,
-    replyText: event.replyText,
-    text: event.text,
-    isGroup: event.isGroup,
-    mentionsBot: event.mentionsBot,
-    send: senders.sendText,
-  })) {
-    return;
   }
 
   await handleMessage({
