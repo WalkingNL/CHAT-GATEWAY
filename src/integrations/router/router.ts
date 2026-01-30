@@ -18,7 +18,7 @@ import { writeExplainTrace, writeExplainFeedback } from "../audit/trace_writer.j
 import { requestIntentResolve, resolveDefaultWindowSpecId, sanitizeRequestId } from "../runtime/intent_router.js";
 import { INTENT_SCHEMA_VERSION, INTENT_VERSION, parseDashboardIntent } from "../runtime/intent_schema.js";
 import { buildErrorResultRef, buildTextResultRef } from "../runtime/on_demand_mapping.js";
-import { errorText, rejectText } from "../runtime/response_templates.js";
+import { clarifyText, errorText, rejectText } from "../runtime/response_templates.js";
 import { buildDashboardIntentFromResolve, dispatchDashboardExport } from "../runtime/handlers.js";
 import { isIntentEnabled } from "../runtime/capabilities.js";
 import { handleStrategyIfAny } from "../runtime/strategy.js";
@@ -1200,13 +1200,24 @@ export async function handleAdapterIntentIfAny(params: {
         const resolvedParams = resolveRes.params && typeof resolveRes.params === "object"
           ? resolveRes.params
           : {};
-        const resolvedText = typeof resolvedParams.text === "string"
-          ? resolvedParams.text.trim()
-          : "";
-        const useReplyOverride = resolvedParams.text_source === "reply";
-        const rawConf = Number(resolveRes.confidence);
-        const confidence = Number.isFinite(rawConf) ? Math.max(0, Math.min(1, rawConf)) : 0.9;
-        const action = resolveRes.needClarify || confidence < 0.6 ? "ask_clarify" : "record";
+        const resolvedText = typeof resolvedParams.record_text === "string"
+          ? resolvedParams.record_text.trim()
+          : typeof resolvedParams.text === "string"
+            ? resolvedParams.text.trim()
+            : typeof resolvedParams.content === "string"
+              ? resolvedParams.content.trim()
+              : "";
+        const recordSource = typeof resolvedParams.record_source === "string"
+          ? resolvedParams.record_source.trim().toLowerCase()
+          : typeof resolvedParams.text_source === "string"
+            ? resolvedParams.text_source.trim().toLowerCase()
+            : "";
+        const useReplyOverride = recordSource === "reply";
+        const inputText = resolvedText || (useReplyOverride ? trimmedReplyText : "");
+        if (resolveRes.needClarify || !inputText) {
+          await send(chatId, "请明确要记录的内容（例如：记录一下 XXX）。");
+          return true;
+        }
         const handled = await handleCognitiveIfAny({
           storageDir,
           config,
@@ -1219,15 +1230,15 @@ export async function handleAdapterIntentIfAny(params: {
           messageId,
           replyToId,
           replyText: trimmedReplyText,
-          text: resolvedText || resolveText || cleanedText,
+          text: inputText,
           isGroup,
           mentionsBot,
           send,
           useReplyOverride,
           decisionOverride: {
-            action,
-            confidence,
-            reason: resolveRes.reason || (action === "ask_clarify" ? "need_clarify" : "intent_resolve"),
+            action: "record",
+            confidence: Math.max(0, Number(resolveRes.confidence) || 0),
+            reason: resolveRes.reason || "intent_resolve",
           },
         });
         if (handled) {
@@ -1292,7 +1303,7 @@ export async function handleAdapterIntentIfAny(params: {
       }
 
       if (resolveRes.ok && (resolveRes.needClarify || resolveRes.intent === "unknown")) {
-        pendingResolveResponse = "请补充更具体的请求（例如：给我看下某个图表）。";
+        pendingResolveResponse = clarifyText("我没有理解你的意图，请用一句话明确你要做的事。");
       } else if (!resolveRes.ok && feedbackStripped.used) {
         pendingResolveResponse = errorText("当前解析失败，请稍后重试。");
       }
