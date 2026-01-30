@@ -23,6 +23,7 @@ import { buildDashboardIntentFromResolve, dispatchDashboardExport } from "../run
 import { isIntentEnabled } from "../runtime/capabilities.js";
 import { handleStrategyIfAny } from "../runtime/strategy.js";
 import { handleQueryIfAny } from "../runtime/query.js";
+import { handleCognitiveIfAny } from "../runtime/cognitive.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
 const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
@@ -1192,6 +1193,37 @@ export async function handleAdapterIntentIfAny(params: {
           attempt: adapterIds.attempt,
           requestExpired: adapterIds.expired,
         });
+      }
+
+      if (resolveRes.ok && resolveRes.intent === "cognitive_record") {
+        const rawConf = Number(resolveRes.confidence);
+        const confidence = Number.isFinite(rawConf) ? Math.max(0, Math.min(1, rawConf)) : 0.9;
+        const action = resolveRes.needClarify || confidence < 0.6 ? "ask_clarify" : "record";
+        const handled = await handleCognitiveIfAny({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          messageId,
+          replyToId,
+          replyText: trimmedReplyText,
+          text: resolveText || cleanedText,
+          isGroup,
+          mentionsBot,
+          send,
+          decisionOverride: {
+            action,
+            confidence,
+            reason: resolveRes.reason || (action === "ask_clarify" ? "need_clarify" : "intent_resolve"),
+          },
+        });
+        if (handled) {
+          return true;
+        }
       }
 
       if (resolveRes.ok && (resolveRes.needClarify || resolveRes.intent === "unknown")) {

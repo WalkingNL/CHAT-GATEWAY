@@ -280,6 +280,8 @@ export async function handleCognitiveStatusUpdate(params: {
   return true;
 }
 
+type CognitiveDecision = { action: "record" | "ignore" | "ask_clarify"; confidence: number; reason: string };
+
 export async function handleCognitiveIfAny(params: {
   storageDir: string;
   config: LoadedConfig;
@@ -295,6 +297,7 @@ export async function handleCognitiveIfAny(params: {
   text: string;
   isGroup: boolean;
   mentionsBot: boolean;
+  decisionOverride?: CognitiveDecision;
   send: (chatId: string, text: string) => Promise<void>;
 }): Promise<boolean> {
   const {
@@ -311,6 +314,7 @@ export async function handleCognitiveIfAny(params: {
     text,
     isGroup,
     mentionsBot,
+    decisionOverride,
     send,
   } = params;
 
@@ -361,7 +365,7 @@ export async function handleCognitiveIfAny(params: {
   }
 
   const ruleDecision = classifyByRules(normalized);
-  let decision: { action: "record" | "ignore" | "ask_clarify"; confidence: number; reason: string } | null = null;
+  let decision: CognitiveDecision | null = null;
 
   const stripIntentPrefix = (textValue: string): { matched: boolean; rest: string } => {
     const t = normalizeText(textValue);
@@ -379,7 +383,9 @@ export async function handleCognitiveIfAny(params: {
 
   const intentStrip = stripIntentPrefix(normalized);
 
-  if (ruleDecision.action === "record") {
+  if (decisionOverride) {
+    decision = decisionOverride;
+  } else if (ruleDecision.action === "record") {
     decision = { ...ruleDecision, action: "record" };
   } else if (normalized.length < MIN_PROBLEM_LEN) {
     decision = { action: "ignore", confidence: 0.3, reason: "too_short" };
