@@ -12,7 +12,7 @@ import {
   updatePushPolicyTargets,
 } from "../channels/feedback.js";
 import { loadAuth } from "../auth/store.js";
-import { allowedPanelIds, parseDashboardIntent } from "./intent_schema.js";
+import { EXPORT_API_VERSION, parseDashboardIntent } from "./intent_schema.js";
 import { requestDashboardExport, resolveDefaultWindowSpecId } from "./intent_router.js";
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
@@ -270,17 +270,77 @@ export async function handleFeedbackIfAny(params: {
 
 function buildDashboardClarifyMessage(intent: ReturnType<typeof parseDashboardIntent>): string {
   if (!intent) return "请补充更具体的请求参数。";
-  if (intent.errors.includes("panel_id_not_allowed")) {
-    return `panel_id 无效。允许的 panel_id：${allowedPanelIds().join(", ")}`;
-  }
   const parts: string[] = [];
-  if (intent.missing.includes("window_spec_id")) parts.push("window_spec_id");
-  if (intent.missing.includes("symbol")) parts.push("symbol（如 BTCUSDT）");
+  if (intent.missing.includes("symbol")) parts.push("symbol");
   if (!parts.length) return "请补充更具体的请求参数。";
   return `请补充 ${parts.join("、")} 后重试。`;
 }
 
 type DashboardIntent = NonNullable<ReturnType<typeof parseDashboardIntent>>;
+type ResolvedIntentPayload = {
+  intent?: string;
+  params?: Record<string, any>;
+  confidence?: number;
+  reason?: string;
+  schemaVersion?: string;
+  intentVersion?: string;
+};
+
+function clampConfidence(value: unknown, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(0.99, n));
+}
+
+export function buildDashboardIntentFromResolve(opts: {
+  resolved: ResolvedIntentPayload;
+  rawQuery: string;
+  defaultWindowSpecId?: string;
+}): DashboardIntent | null {
+  const resolved = opts.resolved || {};
+  if (String(resolved.intent || "") !== "dashboard_export") return null;
+  const params = resolved.params && typeof resolved.params === "object" ? resolved.params : {};
+  const panelIdRaw = params.panel_id ?? params.panel ?? null;
+  const panelId = typeof panelIdRaw === "string" ? panelIdRaw.trim() : null;
+  const explicitWindowSpec = typeof params.window_spec_id === "string" ? params.window_spec_id.trim() : "";
+  const windowSpecId = explicitWindowSpec || String(opts.defaultWindowSpecId || "").trim() || null;
+  const windowSpecIdSource: "explicit" | "default" | "missing" =
+    explicitWindowSpec ? "explicit" : windowSpecId ? "default" : "missing";
+
+  const filters: Record<string, any> = {};
+  if (params.filters && typeof params.filters === "object") {
+    Object.assign(filters, params.filters);
+  }
+  if (typeof params.symbol === "string") filters.symbol = params.symbol.trim();
+  if (params.window_hours != null) filters.window_hours = params.window_hours;
+  if (params.window_minutes != null) filters.window_minutes = params.window_minutes;
+  if (typeof params.date_utc === "string") filters.date_utc = params.date_utc.trim();
+
+  const missing: string[] = [];
+  if (!panelId) missing.push("panel_id");
+
+  const confidence = clampConfidence(resolved.confidence, 0.75);
+  const schemaVersion = String(resolved.schemaVersion || "v1");
+  const intentVersion = String(resolved.intentVersion || "v1");
+
+  return {
+    intent: "dashboard_export",
+    params: {
+      panel_id: panelId,
+      window_spec_id: windowSpecId,
+      filters,
+      export_api_version: EXPORT_API_VERSION,
+    },
+    confidence,
+    schema_version: schemaVersion,
+    intent_version: intentVersion,
+    raw_query: String(opts.rawQuery || "").trim(),
+    missing,
+    errors: [],
+    explicit_panel_id: Boolean(panelId),
+    window_spec_id_source: windowSpecIdSource,
+  };
+}
 
 export async function dispatchDashboardExport(params: {
   storageDir: string;
@@ -480,7 +540,7 @@ export async function dispatchDashboardExport(params: {
     return true;
   }
 
-  if (!intent.params.panel_id || !intent.params.window_spec_id) {
+  if (!intent.params.panel_id) {
     await sendText(chatId, rejectText("参数不完整，无法生成导出。"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),

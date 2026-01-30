@@ -1,5 +1,5 @@
 import { loadProjectRegistry } from "./project_registry.js";
-import { EXPORT_API_VERSION, isPanelIdAllowed } from "./intent_schema.js";
+import { EXPORT_API_VERSION } from "./intent_schema.js";
 
 type OnDemandSettings = {
   url?: string;
@@ -21,6 +21,20 @@ type DashboardExportResult = {
   imagePath?: string;
   undetermined?: boolean;
   filtersDropped?: string[];
+};
+
+type IntentResolveResult = {
+  ok: boolean;
+  intent?: string;
+  params?: Record<string, any>;
+  confidence?: number;
+  needClarify?: boolean;
+  reason?: string;
+  unknownReason?: string;
+  schemaVersion?: string;
+  intentVersion?: string;
+  error?: string;
+  traceId?: string;
 };
 
 function resolveOnDemandSettings(projectId?: string | null): OnDemandSettings {
@@ -116,14 +130,15 @@ function sanitizeFilters(raw: Record<string, any> | undefined): { filters: Recor
   return { filters: out, dropped };
 }
 
-async function postJson(url: string, token: string, body: any): Promise<any> {
-  const timeoutMs = Number(
-    process.env.CHAT_GATEWAY_EXPORT_ACK_TIMEOUT_MS
-      || process.env.CHAT_GATEWAY_CHART_ACK_TIMEOUT_MS
-      || "2000",
+async function postJson(url: string, token: string, body: any, timeoutMs?: number): Promise<any> {
+  const timeout = Number(
+    timeoutMs
+      ?? process.env.CHAT_GATEWAY_EXPORT_ACK_TIMEOUT_MS
+      ?? process.env.CHAT_GATEWAY_CHART_ACK_TIMEOUT_MS
+      ?? "2000",
   );
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeout);
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -154,7 +169,7 @@ export async function requestDashboardExport(params: {
   projectId: string;
   requestId: string;
   panelId: string;
-  windowSpecId: string;
+  windowSpecId?: string | null;
   filters: Record<string, any>;
   exportApiVersion?: string;
   schemaVersion?: string;
@@ -164,17 +179,10 @@ export async function requestDashboardExport(params: {
   const sanitized = sanitizeFilters(params.filters);
   const filtersDropped = sanitized.dropped.length ? sanitized.dropped : undefined;
   try {
-    if (!isPanelIdAllowed(params.panelId)) {
-      return { ok: false, error: "panel_id_not_allowed", filtersDropped };
-    }
-    if (!params.windowSpecId) {
-      return { ok: false, error: "missing_window_spec_id", filtersDropped };
-    }
     const cfg = resolveOnDemandConfig(params.projectId);
     const payload: any = {
       request_id: params.requestId,
       panel_id: params.panelId,
-      window_spec_id: params.windowSpecId,
       filters: sanitized.filters,
       export_api_version: params.exportApiVersion || EXPORT_API_VERSION,
       target: {
@@ -183,6 +191,7 @@ export async function requestDashboardExport(params: {
         chat_id: params.target.chatId,
       },
     };
+    if (params.windowSpecId) payload.window_spec_id = params.windowSpecId;
     if (params.schemaVersion) payload.schema_version = params.schemaVersion;
     if (params.intentVersion) payload.intent_version = params.intentVersion;
     const res = await postJson(`${cfg.url}/v1/dashboard_export`, cfg.token, payload);
@@ -197,5 +206,41 @@ export async function requestDashboardExport(params: {
     };
   } catch (e: any) {
     return { ok: false, error: String(e?.message || e), filtersDropped };
+  }
+}
+
+export async function requestIntentResolve(params: {
+  projectId: string;
+  requestId: string;
+  rawQuery: string;
+  channel: string;
+  chatId: string;
+  userId: string;
+}): Promise<IntentResolveResult> {
+  try {
+    const cfg = resolveOnDemandConfig(params.projectId);
+    const timeoutMs = Number(process.env.CHAT_GATEWAY_INTENT_RESOLVE_TIMEOUT_MS || "8000");
+    const payload = {
+      request_id: params.requestId,
+      raw_query: params.rawQuery,
+      channel: params.channel,
+      chat_id: params.chatId,
+      user_id: params.userId,
+    };
+    const res = await postJson(`${cfg.url}/v1/intent/resolve`, cfg.token, payload, timeoutMs);
+    return {
+      ok: Boolean(res?.ok),
+      intent: res?.intent ? String(res.intent) : undefined,
+      params: res?.params && typeof res.params === "object" ? res.params : undefined,
+      confidence: typeof res?.confidence === "number" ? res.confidence : undefined,
+      needClarify: Boolean(res?.need_clarify),
+      reason: res?.reason ? String(res.reason) : undefined,
+      unknownReason: res?.unknown_reason ? String(res.unknown_reason) : undefined,
+      schemaVersion: res?.schema_version ? String(res.schema_version) : undefined,
+      intentVersion: res?.intent_version ? String(res.intent_version) : undefined,
+      traceId: res?.trace_id ? String(res.trace_id) : undefined,
+    };
+  } catch (e: any) {
+    return { ok: false, error: String(e?.message || e) };
   }
 }

@@ -15,11 +15,11 @@ import { loadProjectRegistry } from "../runtime/project_registry.js";
 import { parseAlertText, LocalFsFactsProvider } from "../facts/index.js";
 import { routeExplain } from "../explain/router_v1.js";
 import { writeExplainTrace, writeExplainFeedback } from "../audit/trace_writer.js";
-import { resolveDefaultWindowSpecId, sanitizeRequestId } from "../runtime/intent_router.js";
+import { requestIntentResolve, resolveDefaultWindowSpecId, sanitizeRequestId } from "../runtime/intent_router.js";
 import { INTENT_SCHEMA_VERSION, INTENT_VERSION, parseDashboardIntent } from "../runtime/intent_schema.js";
 import { buildErrorResultRef, buildTextResultRef } from "../runtime/on_demand_mapping.js";
 import { errorText, rejectText } from "../runtime/response_templates.js";
-import { dispatchDashboardExport } from "../runtime/handlers.js";
+import { buildDashboardIntentFromResolve, dispatchDashboardExport } from "../runtime/handlers.js";
 import { isIntentEnabled } from "../runtime/capabilities.js";
 import { handleStrategyIfAny } from "../runtime/strategy.js";
 import { handleQueryIfAny } from "../runtime/query.js";
@@ -276,6 +276,31 @@ function resolveProjectId(config?: LoadedConfig): string | null {
   }
   const ids = Object.keys(projects);
   return ids.length ? ids[0] : null;
+}
+
+function stripFeedbackPrefix(rawText: string): { text: string; used: boolean } {
+  const raw = String(rawText || "");
+  const trimmed = raw.trim();
+  if (!trimmed) return { text: "", used: false };
+  const replaced = trimmed.replace(/^(\/feedback(?:@[A-Za-z0-9_]+)?|feedback|反馈)[:：]?\s*/i, "");
+  if (replaced === trimmed) return { text: trimmed, used: false };
+  return { text: replaced.trim(), used: true };
+}
+
+function shouldAttemptResolve(params: {
+  rawText: string;
+  strippedText: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  replyToId: string;
+  usedFeedbackPrefix: boolean;
+}): boolean {
+  const raw = String(params.rawText || "").trim();
+  if (!raw) return false;
+  const isCommand = raw.startsWith("/") && !params.usedFeedbackPrefix;
+  if (isCommand) return false;
+  if (params.isGroup && !params.mentionsBot && !params.replyToId && !params.usedFeedbackPrefix) return false;
+  return Boolean(params.strippedText);
 }
 
 type OnDemandConfig = { url: string; token: string; projectId?: string | null };
@@ -985,6 +1010,7 @@ export async function handleAdapterIntentIfAny(params: {
       : trimmedText;
 
   const explicitRetry = wantsRetry(cleanedText);
+  const summaryRequested = wantsNewsSummary(cleanedText);
 
   const strategyRequested = /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i.test(cleanedText);
   if (strategyRequested && isIntentEnabled("alert_strategy")) {
@@ -1085,6 +1111,97 @@ export async function handleAdapterIntentIfAny(params: {
   }
 
   const explainRequested = isExplainRequest(cleanedText);
+  const feedbackStripped = stripFeedbackPrefix(cleanedText);
+  const resolveText = feedbackStripped.text;
+  const allowResolve = shouldAttemptResolve({
+    rawText: cleanedText,
+    strippedText: resolveText,
+    isGroup,
+    mentionsBot,
+    replyToId,
+    usedFeedbackPrefix: feedbackStripped.used,
+  }) && !summaryRequested && !explainRequested;
+  let pendingResolveResponse: string | null = null;
+
+  if (allowResolve && dashboardEnabled) {
+    const adapterIds = resolveAdapterRequestIds({
+      channel,
+      chatId,
+      messageId,
+      replyToId,
+      explicitRetry,
+    });
+    if (adapterIds && projectId) {
+      const resolveRes = await requestIntentResolve({
+        projectId,
+        requestId: adapterIds.requestIdBase,
+        rawQuery: resolveText,
+        channel,
+        chatId,
+        userId,
+      });
+
+      appendLedger(storageDir, {
+        ts_utc: nowIso(),
+        channel,
+        chat_id: chatId,
+        user_id: userId,
+        cmd: "intent_resolve",
+        raw: resolveText,
+        intent: resolveRes.intent,
+        params: resolveRes.params,
+        confidence: resolveRes.confidence,
+        reason: resolveRes.reason,
+        unknown_reason: resolveRes.unknownReason,
+        request_id: adapterIds.dispatchRequestId,
+        request_id_base: adapterIds.requestIdBase,
+        adapter_trace_id: adapterIds.requestIdBase,
+        attempt: adapterIds.attempt,
+        schema_version: resolveRes.schemaVersion || INTENT_SCHEMA_VERSION,
+        intent_version: resolveRes.intentVersion || INTENT_VERSION,
+        adapter_entry: true,
+      });
+
+      const resolvedIntent = buildDashboardIntentFromResolve({
+        resolved: resolveRes,
+        rawQuery: resolveText,
+        defaultWindowSpecId,
+      });
+
+      if (resolvedIntent) {
+        return dispatchDashboardExport({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          messageId,
+          replyToId,
+          userId,
+          text,
+          isGroup,
+          mentionsBot,
+          replyText: trimmedReplyText,
+          sendText: send,
+          intent: resolvedIntent,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+          requestExpired: adapterIds.expired,
+        });
+      }
+
+      if (resolveRes.ok && (resolveRes.needClarify || resolveRes.intent === "unknown")) {
+        pendingResolveResponse = "请补充更具体的请求（例如：给我看下某个图表）。";
+      } else if (!resolveRes.ok && feedbackStripped.used) {
+        pendingResolveResponse = errorText("当前解析失败，请稍后重试。");
+      }
+    }
+  }
+
   if (explainRequested && isIntentEnabled("alert_explain")) {
     let rawAlert = trimmedReplyText;
     if (!rawAlert && !isGroup) {
@@ -1192,9 +1309,20 @@ export async function handleAdapterIntentIfAny(params: {
   }
 
   // v1: news_summary（仅在明确请求摘要时进入 adapter）
-  if (!isIntentEnabled("news_summary")) return false;
-  const summaryRequested = wantsNewsSummary(trimmedText);
-  if (!summaryRequested && !explainRequested) return false;
+  if (!isIntentEnabled("news_summary")) {
+    if (pendingResolveResponse) {
+      await send(chatId, pendingResolveResponse);
+      return true;
+    }
+    return false;
+  }
+  if (!summaryRequested && !explainRequested) {
+    if (pendingResolveResponse) {
+      await send(chatId, pendingResolveResponse);
+      return true;
+    }
+    return false;
+  }
 
   let rawAlert = trimmedReplyText;
   if (!rawAlert && !isGroup) {
