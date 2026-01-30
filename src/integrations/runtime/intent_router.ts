@@ -213,6 +213,7 @@ export async function requestIntentResolve(params: {
   projectId: string;
   requestId: string;
   rawQuery: string;
+  replyText?: string;
   channel: string;
   chatId: string;
   userId: string;
@@ -220,13 +221,14 @@ export async function requestIntentResolve(params: {
   try {
     const cfg = resolveOnDemandConfig(params.projectId);
     const timeoutMs = Number(process.env.CHAT_GATEWAY_INTENT_RESOLVE_TIMEOUT_MS || "8000");
-    const payload = {
+    const payload: any = {
       request_id: params.requestId,
       raw_query: params.rawQuery,
       channel: params.channel,
       chat_id: params.chatId,
       user_id: params.userId,
     };
+    if (params.replyText) payload.reply_text = params.replyText;
     const res = await postJson(`${cfg.url}/v1/intent/resolve`, cfg.token, payload, timeoutMs);
     return {
       ok: Boolean(res?.ok),

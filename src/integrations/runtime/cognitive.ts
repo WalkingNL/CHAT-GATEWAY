@@ -35,6 +35,16 @@ const STATUS_MAP: Array<{ status: CognitiveStatus; terms: string[] }> = [
   { status: "OPEN", terms: ["open", "打开", "未解决", "待处理"] },
 ];
 
+function normalizeStatusOverride(value: string): CognitiveStatus | null {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const upper = raw.toUpperCase().replace(/\s+/g, "_");
+  if (STATUS_MAP.some(item => item.status === upper)) {
+    return upper as CognitiveStatus;
+  }
+  return null;
+}
+
 const MIN_PROBLEM_LEN = 12;
 const DEFAULT_REMIND_HOURS = 72;
 const PENDING_TTL_MS = 10 * 60 * 1000;
@@ -246,9 +256,10 @@ export async function handleCognitiveStatusUpdate(params: {
   text: string;
   isGroup: boolean;
   mentionsBot: boolean;
+  statusOverride?: { id: string; status: string };
   send: (chatId: string, text: string) => Promise<void>;
 }): Promise<boolean> {
-  const { storageDir, allowlistMode, ownerChatId, ownerUserId, channel, chatId, userId, text, isGroup, mentionsBot, send } =
+  const { storageDir, allowlistMode, ownerChatId, ownerUserId, channel, chatId, userId, text, isGroup, mentionsBot, statusOverride, send } =
     params;
   const normalized = normalizeText(text);
   if (!normalized) return false;
@@ -257,7 +268,10 @@ export async function handleCognitiveStatusUpdate(params: {
   if (!isAllowed({ storageDir, channel, allowlistMode, ownerChatId, ownerUserId, chatId, userId })) return false;
   if (isSummaryRequest(normalized)) return false;
 
-  const statusUpdate = parseStatusUpdate(normalized);
+  const normalizedStatus = statusOverride ? normalizeStatusOverride(statusOverride.status) : null;
+  const statusUpdate = normalizedStatus
+    ? { id: statusOverride!.id, status: normalizedStatus }
+    : parseStatusUpdate(normalized);
   if (!statusUpdate) return false;
 
   const store = new CognitiveStore(storageDir);
@@ -282,6 +296,8 @@ export async function handleCognitiveStatusUpdate(params: {
 
 type CognitiveDecision = { action: "record" | "ignore" | "ask_clarify"; confidence: number; reason: string };
 
+type CognitiveConfirmAction = "record" | "ignore";
+
 export async function handleCognitiveIfAny(params: {
   storageDir: string;
   config: LoadedConfig;
@@ -297,7 +313,9 @@ export async function handleCognitiveIfAny(params: {
   text: string;
   isGroup: boolean;
   mentionsBot: boolean;
+  confirmOverride?: CognitiveConfirmAction;
   decisionOverride?: CognitiveDecision;
+  useReplyOverride?: boolean;
   send: (chatId: string, text: string) => Promise<void>;
 }): Promise<boolean> {
   const {
@@ -314,7 +332,9 @@ export async function handleCognitiveIfAny(params: {
     text,
     isGroup,
     mentionsBot,
+    confirmOverride,
     decisionOverride,
+    useReplyOverride,
     send,
   } = params;
 
@@ -329,7 +349,7 @@ export async function handleCognitiveIfAny(params: {
 
   const store = new CognitiveStore(storageDir);
   const pendingKey = `${channel}:${chatId}:${userId}`;
-  const confirm = parseConfirm(normalized);
+  const confirm = confirmOverride || parseConfirm(normalized);
   if (confirm) {
     const pending = await store.getPending(pendingKey);
     if (!pending) return false;
@@ -408,7 +428,11 @@ export async function handleCognitiveIfAny(params: {
   let targetNormalized = normalized;
   let useReplyId = false;
 
-  if (intentStrip.matched) {
+  if (useReplyOverride && replyNormalized) {
+    targetRawText = replyRaw;
+    targetNormalized = replyNormalized;
+    useReplyId = Boolean(replyToId);
+  } else if (intentStrip.matched) {
     if (intentStrip.rest) {
       targetRawText = intentStrip.rest;
       targetNormalized = normalizeText(intentStrip.rest);

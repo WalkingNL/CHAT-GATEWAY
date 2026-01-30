@@ -23,7 +23,7 @@ import { buildDashboardIntentFromResolve, dispatchDashboardExport } from "../run
 import { isIntentEnabled } from "../runtime/capabilities.js";
 import { handleStrategyIfAny } from "../runtime/strategy.js";
 import { handleQueryIfAny } from "../runtime/query.js";
-import { handleCognitiveIfAny } from "../runtime/cognitive.js";
+import { handleCognitiveIfAny, handleCognitiveStatusUpdate } from "../runtime/cognitive.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
 const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
@@ -1137,6 +1137,7 @@ export async function handleAdapterIntentIfAny(params: {
         projectId,
         requestId: adapterIds.requestIdBase,
         rawQuery: resolveText,
+        replyText: trimmedReplyText,
         channel,
         chatId,
         userId,
@@ -1196,6 +1197,13 @@ export async function handleAdapterIntentIfAny(params: {
       }
 
       if (resolveRes.ok && resolveRes.intent === "cognitive_record") {
+        const resolvedParams = resolveRes.params && typeof resolveRes.params === "object"
+          ? resolveRes.params
+          : {};
+        const resolvedText = typeof resolvedParams.text === "string"
+          ? resolvedParams.text.trim()
+          : "";
+        const useReplyOverride = resolvedParams.text_source === "reply";
         const rawConf = Number(resolveRes.confidence);
         const confidence = Number.isFinite(rawConf) ? Math.max(0, Math.min(1, rawConf)) : 0.9;
         const action = resolveRes.needClarify || confidence < 0.6 ? "ask_clarify" : "record";
@@ -1211,10 +1219,11 @@ export async function handleAdapterIntentIfAny(params: {
           messageId,
           replyToId,
           replyText: trimmedReplyText,
-          text: resolveText || cleanedText,
+          text: resolvedText || resolveText || cleanedText,
           isGroup,
           mentionsBot,
           send,
+          useReplyOverride,
           decisionOverride: {
             action,
             confidence,
@@ -1223,6 +1232,62 @@ export async function handleAdapterIntentIfAny(params: {
         });
         if (handled) {
           return true;
+        }
+      }
+
+      if (resolveRes.ok && resolveRes.intent === "cognitive_confirm") {
+        const action = resolveRes.params?.action;
+        if (action === "record" || action === "ignore") {
+          const handled = await handleCognitiveIfAny({
+            storageDir,
+            config,
+            allowlistMode,
+            ownerChatId,
+            ownerUserId,
+            channel,
+            chatId,
+            userId,
+            messageId,
+            replyToId,
+            replyText: trimmedReplyText,
+            text: resolveText || cleanedText,
+            isGroup,
+            mentionsBot,
+            send,
+            confirmOverride: action,
+          });
+          if (handled) {
+            return true;
+          }
+        } else if (resolveRes.needClarify) {
+          pendingResolveResponse = "请回复：记 / 不记";
+        }
+      }
+
+      if (resolveRes.ok && resolveRes.intent === "cognitive_status_update") {
+        const issueId = typeof resolveRes.params?.id === "string" ? resolveRes.params.id.trim() : "";
+        const status = typeof resolveRes.params?.status === "string" ? resolveRes.params.status.trim() : "";
+        if (issueId && status) {
+          const handled = await handleCognitiveStatusUpdate({
+            storageDir,
+            config,
+            allowlistMode,
+            ownerChatId,
+            ownerUserId,
+            channel,
+            chatId,
+            userId,
+            text: resolveText || cleanedText,
+            isGroup,
+            mentionsBot,
+            send,
+            statusOverride: { id: issueId, status },
+          });
+          if (handled) {
+            return true;
+          }
+        } else if (resolveRes.needClarify) {
+          pendingResolveResponse = "请补充记录编号与状态（例如：C-20260130-001 DONE）";
         }
       }
 
