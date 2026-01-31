@@ -188,15 +188,35 @@ async function postJson(url: string, token: string, body: any): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (e: any) {
+      const cause = e?.cause;
+      const info = {
+        url,
+        timeoutMs,
+        error: String(e?.message || e),
+        cause: cause
+          ? {
+              message: String(cause?.message || cause),
+              code: String(cause?.code || ""),
+              errno: String(cause?.errno || ""),
+              syscall: String(cause?.syscall || ""),
+            }
+          : undefined,
+      };
+      console.error("[chart][fetch] failed", info);
+      throw e;
+    }
     const text = await res.text();
     let data: any = {};
     try {
