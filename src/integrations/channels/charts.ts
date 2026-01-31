@@ -184,7 +184,7 @@ function buildRenderPayload(intent: ChartIntent, projectId: string | undefined, 
 }
 
 async function postJson(url: string, token: string, body: any): Promise<any> {
-  const timeoutMs = Number(process.env.CHAT_GATEWAY_CHART_ACK_TIMEOUT_MS || "2000");
+  const timeoutMs = Number(process.env.CHAT_GATEWAY_CHART_ACK_TIMEOUT_MS || "8000");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
