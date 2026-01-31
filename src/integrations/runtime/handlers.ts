@@ -5,8 +5,6 @@ import { type ChartIntent, renderChart } from "../channels/charts.js";
 import {
   buildFeedbackReply,
   buildLevelOverrideReply,
-  detectFeedback,
-  detectLevelOverride,
   FEEDBACK_REPLY,
   updatePushPolicyMinPriority,
   updatePushPolicyTargets,
@@ -68,6 +66,7 @@ function resolveProjectId(config?: LoadedConfig): string | null {
 
 export async function handleFeedbackIfAny(params: {
   storageDir: string;
+  config: LoadedConfig;
   allowlistMode: "owner_only" | "auth";
   ownerChatId: string;
   ownerUserId: string;
@@ -78,10 +77,18 @@ export async function handleFeedbackIfAny(params: {
   text: string;
   send: (chatId: string, text: string) => Promise<void>;
 }): Promise<boolean> {
-  const { storageDir, channel, chatId, userId, text, send, allowlistMode, ownerChatId, ownerUserId, isGroup } = params;
-  const levelIntent = detectLevelOverride(text);
-  const hit = detectFeedback(text);
-  if (!levelIntent && !hit) return false;
+  const { storageDir, config, channel, chatId, userId, text, send, allowlistMode, ownerChatId, ownerUserId, isGroup } =
+    params;
+  const raw = String(text || "");
+  const feedbackMatch = raw.match(/^\s*(\/feedback(?:@[A-Za-z0-9_]+)?|feedback|反馈)\b/i);
+  if (!feedbackMatch) return false;
+  if (isGroup && !raw.trim().toLowerCase().startsWith("/feedback")) return false;
+
+  const stripped = raw.replace(/^\s*(\/feedback(?:@[A-Za-z0-9_]+)?|feedback|反馈)[:：]?\s*/i, "").trim();
+  if (!stripped) {
+    await send(chatId, "Usage: /feedback <描述>（例如：告警太多了 / 只推高等级）");
+    return true;
+  }
 
   const authState = loadAuth(storageDir, ownerChatId, channel);
   const isOwnerChat = chatId === ownerChatId;
@@ -91,27 +98,143 @@ export async function handleFeedbackIfAny(params: {
       ? (isGroup ? isOwnerUser : isOwnerChat)
       : authState.allowed.includes(chatId) || isOwnerUser;
 
-  if (levelIntent) {
-    if (!allowed) {
-      await send(chatId, rejectText("无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。"));
-      const rejectPayload: any = {
-        ts_utc: new Date().toISOString(),
-        channel,
-        chat_id: chatId,
-        user_id: userId,
-        kind: "alert_feedback_reject",
-        reason: "not_allowed",
-      };
-      if ("invalid" in levelIntent) {
-        rejectPayload.feedback = "invalid_level";
-      } else {
-        rejectPayload.feedback = levelIntent.level;
-      }
-      rejectPayload.raw = levelIntent.normalizedText;
-      appendLedger(storageDir, rejectPayload);
-      return true;
-    }
-    if ("invalid" in levelIntent) {
+  if (!allowed) {
+    await send(chatId, rejectText("无权限。请联系管理员加入允许列表；群聊请用 /feedback 触发。"));
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "alert_feedback_reject",
+      feedback: "not_allowed",
+      raw: stripped,
+      reason: "not_allowed",
+    });
+    return true;
+  }
+
+  const projectId = resolveProjectId(config);
+  if (!projectId) {
+    await send(chatId, rejectText("未配置默认项目，无法解析反馈。"));
+    return true;
+  }
+
+  const resolveRequestId = sanitizeRequestId(`feedback:${channel}:${chatId}:${Date.now()}`);
+  let resolveRes: any;
+  try {
+    resolveRes = await requestIntentResolve({
+      projectId,
+      requestId: resolveRequestId,
+      rawQuery: stripped,
+      replyText: "",
+      channel,
+      chatId,
+      userId,
+    });
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      cmd: "intent_resolve",
+      raw: stripped,
+      intent: resolveRes.intent,
+      params: resolveRes.params,
+      confidence: resolveRes.confidence,
+      reason: resolveRes.reason,
+      unknown_reason: resolveRes.unknownReason,
+      request_id: resolveRequestId,
+      request_id_base: resolveRequestId,
+      adapter_trace_id: resolveRequestId,
+      attempt: 1,
+      schema_version: resolveRes.schemaVersion,
+      intent_version: resolveRes.intentVersion,
+      adapter_entry: true,
+    });
+  } catch (e: any) {
+    await send(chatId, errorText(`反馈解析失败：${String(e?.message || e)}`));
+    return true;
+  }
+
+  if (!resolveRes?.ok || resolveRes.intent !== "alert_feedback") {
+    await send(chatId, "请明确反馈（例如：告警太多/告警太少/只推高等级）。");
+    return true;
+  }
+
+  const handled = await handleAlertFeedbackIntent({
+    storageDir,
+    channel,
+    chatId,
+    userId,
+    isGroup,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    send,
+    rawText: stripped,
+    feedbackKind: resolveRes.params?.feedback_kind,
+    minPriority: resolveRes.params?.min_priority,
+  });
+  return handled;
+}
+
+export async function handleAlertFeedbackIntent(params: {
+  storageDir: string;
+  channel: string;
+  chatId: string;
+  userId: string;
+  isGroup: boolean;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  rawText: string;
+  feedbackKind?: string;
+  minPriority?: string;
+}): Promise<boolean> {
+  const {
+    storageDir,
+    channel,
+    chatId,
+    userId,
+    isGroup,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    send,
+    rawText,
+    feedbackKind,
+    minPriority,
+  } = params;
+
+  const authState = loadAuth(storageDir, ownerChatId, channel);
+  const isOwnerChat = chatId === ownerChatId;
+  const isOwnerUser = ownerUserId ? userId === ownerUserId : userId === ownerChatId;
+  const allowed =
+    allowlistMode === "owner_only"
+      ? (isGroup ? isOwnerUser : isOwnerChat)
+      : authState.allowed.includes(chatId) || isOwnerUser;
+  if (!allowed) {
+    await send(chatId, rejectText("无权限。请联系管理员加入允许列表；群聊请用 /feedback 触发。"));
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "alert_feedback_reject",
+      feedback: "not_allowed",
+      raw: rawText,
+      reason: "not_allowed",
+    });
+    return true;
+  }
+
+  const kind = typeof feedbackKind === "string" ? feedbackKind.trim().toLowerCase() : "";
+  const priority = typeof minPriority === "string" ? minPriority.trim().toUpperCase() : "";
+  const validPriority = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
+
+  if (priority) {
+    if (!validPriority.includes(priority)) {
       await send(chatId, rejectText("等级无效/超出范围（仅支持 LOW/MEDIUM/HIGH/CRITICAL），未做调整。"));
       appendLedger(storageDir, {
         ts_utc: new Date().toISOString(),
@@ -119,22 +242,23 @@ export async function handleFeedbackIfAny(params: {
         chat_id: chatId,
         user_id: userId,
         kind: "alert_feedback_invalid",
-        raw: levelIntent.normalizedText,
+        raw: rawText,
         reason: "invalid_level",
       });
       return true;
     }
+
     let update: ReturnType<typeof updatePushPolicyMinPriority> | null = null;
     let error: string | null = null;
     try {
-      update = updatePushPolicyMinPriority(levelIntent.level, { updatedBy: `${channel}:${userId}` });
+      update = updatePushPolicyMinPriority(priority as any, { updatedBy: `${channel}:${userId}` });
     } catch (e: any) {
       error = String(e?.message || e);
       console.error("[feedback][WARN] level override failed:", error);
     }
 
     let reply = FEEDBACK_REPLY;
-    if (update) reply = buildLevelOverrideReply(levelIntent.level, update);
+    if (update) reply = buildLevelOverrideReply(priority as any, update);
     if (error || !update) {
       reply = errorText("未能更新策略，请稍后重试或联系管理员。");
     }
@@ -150,7 +274,7 @@ export async function handleFeedbackIfAny(params: {
           chat_id: chatId,
           user_id: userId,
           kind: "set_level",
-          normalized_text: levelIntent.normalizedText,
+          normalized_text: rawText,
           updated: update.updated ?? false,
           policy_path: update.path,
           policy_version: update.policyVersion,
@@ -177,8 +301,8 @@ export async function handleFeedbackIfAny(params: {
       chat_id: chatId,
       user_id: userId,
       kind: "alert_feedback_level",
-      feedback: levelIntent.level,
-      raw: levelIntent.normalizedText,
+      feedback: priority,
+      raw: rawText,
       policy_path: update?.path,
       target_prev: update?.prevTarget,
       target_next: update?.nextTarget,
@@ -193,33 +317,22 @@ export async function handleFeedbackIfAny(params: {
     return true;
   }
 
-  if (!hit) return false;
-  if (!allowed) {
-    await send(chatId, rejectText("无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。"));
-    appendLedger(storageDir, {
-      ts_utc: new Date().toISOString(),
-      channel,
-      chat_id: chatId,
-      user_id: userId,
-      kind: "alert_feedback_reject",
-      feedback: hit.kind,
-      raw: hit.normalizedText,
-      reason: "not_allowed",
-    });
+  if (kind !== "too_many" && kind !== "too_few") {
+    await send(chatId, "请明确反馈（例如：告警太多/告警太少/只推高等级）。");
     return true;
   }
 
   let update: ReturnType<typeof updatePushPolicyTargets> | null = null;
   let error: string | null = null;
   try {
-    update = updatePushPolicyTargets(hit.kind, { updatedBy: `${channel}:${userId}` });
+    update = updatePushPolicyTargets(kind as any, { updatedBy: `${channel}:${userId}` });
   } catch (e: any) {
     error = String(e?.message || e);
     console.error("[feedback][WARN] update failed:", error);
   }
 
   let reply = FEEDBACK_REPLY;
-  if (update) reply = buildFeedbackReply(hit.kind, update);
+  if (update) reply = buildFeedbackReply(kind as any, update);
   if (error || !update) {
     reply = errorText("未能更新策略，请稍后重试或联系管理员。");
   }
@@ -233,8 +346,8 @@ export async function handleFeedbackIfAny(params: {
       chat_type: isGroup ? "group" : "private",
       chat_id: chatId,
       user_id: userId,
-      kind: hit.kind,
-      normalized_text: hit.normalizedText,
+      kind,
+      normalized_text: rawText,
       updated: update?.updated ?? false,
       cooldown_remaining_sec: update?.cooldownRemainingSec,
       policy_path: update?.path,
@@ -261,8 +374,8 @@ export async function handleFeedbackIfAny(params: {
     chat_id: chatId,
     user_id: userId,
     kind: "alert_feedback",
-    feedback: hit.kind,
-    raw: hit.normalizedText,
+    feedback: kind,
+    raw: rawText,
     policy_path: update?.path,
     target_prev: update?.prevTarget,
     target_next: update?.nextTarget,

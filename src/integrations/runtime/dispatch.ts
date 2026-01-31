@@ -32,6 +32,7 @@ export async function dispatchMessageEvent(ctx: IntegrationContext, event: Messa
 
   if (await handleFeedbackIfAny({
     storageDir,
+    config: loaded,
     allowlistMode,
     ownerChatId,
     ownerUserId,

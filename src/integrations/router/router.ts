@@ -19,7 +19,7 @@ import { requestIntentResolve, resolveDefaultWindowSpecId, sanitizeRequestId } f
 import { INTENT_SCHEMA_VERSION, INTENT_VERSION, parseDashboardIntent } from "../runtime/intent_schema.js";
 import { buildErrorResultRef, buildTextResultRef } from "../runtime/on_demand_mapping.js";
 import { clarifyText, errorText, rejectText } from "../runtime/response_templates.js";
-import { buildDashboardIntentFromResolve, dispatchDashboardExport, handleResolvedChartIntent } from "../runtime/handlers.js";
+import { buildDashboardIntentFromResolve, dispatchDashboardExport, handleAlertFeedbackIntent, handleResolvedChartIntent } from "../runtime/handlers.js";
 import { isIntentEnabled } from "../runtime/capabilities.js";
 import { handleStrategyIfAny } from "../runtime/strategy.js";
 import { handleQueryIfAny } from "../runtime/query.js";
@@ -1506,6 +1506,28 @@ export async function handleAdapterIntentIfAny(params: {
         if (handled) {
           return true;
         }
+      }
+
+      if (resolveRes.ok && resolveRes.intent === "alert_feedback") {
+        if (isGroup) {
+          await send(chatId, "群聊请用 /feedback <描述>。");
+          return true;
+        }
+        const handled = await handleAlertFeedbackIntent({
+          storageDir,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          send,
+          rawText: resolveText || cleanedText,
+          feedbackKind: resolveRes.params?.feedback_kind,
+          minPriority: resolveRes.params?.min_priority,
+        });
+        if (handled) return true;
       }
 
       if (resolveRes.ok && resolveRes.intent === "news_summary") {
