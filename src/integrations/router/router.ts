@@ -149,10 +149,6 @@ function clipToLen(s: string, n: number) {
   return t.slice(0, n - 1) + "…";
 }
 
-function sanitizeRequestId(raw: string): string {
-  return raw.replace(/[^A-Za-z0-9._:-]/g, "_").slice(0, 200);
-}
-
 function buildChartRequestId(channel: string, messageId: string, chatId: string, kind: string): string {
   const parts: string[] = [channel, chatId, messageId, kind];
   return sanitizeRequestId(parts.join(":"));
