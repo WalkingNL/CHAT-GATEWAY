@@ -876,7 +876,12 @@ export async function handleChartIfAny(params: {
 
     try {
       const reqId = buildChartRequestId(channel || "telegram", requestKey, chatId, intent);
-      const rendered = await renderChart(intent, { projectId, requestId: reqId });
+      const rendered = await renderChart(intent, {
+        projectId,
+        requestId: reqId,
+        channel: "telegram",
+        chatId,
+      });
       if (!rendered.ok) {
         const trace = rendered.traceId ? ` trace_id=${rendered.traceId}` : "";
         throw new Error(`${rendered.error || "render_failed"}${trace}`.trim());

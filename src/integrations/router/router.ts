@@ -1423,7 +1423,12 @@ export async function handleAdapterIntentIfAny(params: {
                       date,
                       caption: `Daily Activity (UTC, ${date})`,
                     };
-              const rendered = await renderChart(intent, { projectId: projectId || undefined, requestId: reqId });
+              const rendered = await renderChart(intent, {
+                projectId: projectId || undefined,
+                requestId: reqId,
+                channel,
+                chatId,
+              });
               if (!rendered.ok) {
                 const trace = rendered.traceId ? ` trace_id=${rendered.traceId}` : "";
                 throw new Error(`${rendered.error || "render_failed"}${trace}`.trim());
