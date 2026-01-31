@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { appendLedger } from "../audit/ledger.js";
-import { detectChartIntents, renderChart } from "../channels/charts.js";
+import { type ChartIntent, renderChart } from "../channels/charts.js";
 import {
   buildFeedbackReply,
   buildLevelOverrideReply,
@@ -13,7 +13,7 @@ import {
 } from "../channels/feedback.js";
 import { loadAuth } from "../auth/store.js";
 import { EXPORT_API_VERSION, parseDashboardIntent } from "./intent_schema.js";
-import { requestDashboardExport, resolveDefaultWindowSpecId } from "./intent_router.js";
+import { requestDashboardExport, requestIntentResolve, resolveDefaultWindowSpecId } from "./intent_router.js";
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
 import { buildErrorResultRef, buildImageResultRef, mapOnDemandStatus } from "./on_demand_mapping.js";
@@ -27,7 +27,7 @@ function buildChartRequestId(
   channel: string,
   messageId: string,
   chatId: string,
-  intent: ReturnType<typeof detectChartIntents>[number],
+  intent: ChartIntent,
 ) {
   const parts: string[] = [channel, chatId, messageId, intent.kind];
   return sanitizeRequestId(parts.join(":"));
@@ -35,6 +35,17 @@ function buildChartRequestId(
 
 function buildDashboardRequestId(requestIdBase: string, attempt: number) {
   return sanitizeRequestId(`${requestIdBase}:${attempt}`);
+}
+
+function buildResolveRequestId(channel: string, chatId: string, messageId: string, suffix: string) {
+  return sanitizeRequestId([channel, chatId, messageId, suffix].filter(Boolean).join(":"));
+}
+
+function formatUtcDate(d: Date): string {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 function resolveProjectId(config?: LoadedConfig): string | null {
@@ -791,15 +802,6 @@ export async function handleChartIfAny(params: {
     return false;
   }
 
-  const intents = detectChartIntents(chartQuery);
-  if (!intents.length) {
-    if (usedCommand) {
-      await sendTelegramText(chatId, "未识别图表类型。示例：/chart BTC factor timeline 24h");
-      return true;
-    }
-    return false;
-  }
-
   const requestKey = messageId || replyToId;
   if (!requestKey) {
     await sendTelegramText(chatId, rejectText("该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配"));
@@ -831,6 +833,97 @@ export async function handleChartIfAny(params: {
     await sendTelegramText(chatId, rejectText("未配置默认项目，无法生成图表"));
     return true;
   }
+
+  const resolveRequestId = buildResolveRequestId(channel || "telegram", chatId, requestKey, "chart_resolve");
+  let resolveRes: any;
+  try {
+    resolveRes = await requestIntentResolve({
+      projectId,
+      requestId: resolveRequestId,
+      rawQuery: chartQuery,
+      replyText,
+      channel: "telegram",
+      chatId,
+      userId,
+    });
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      cmd: "intent_resolve",
+      raw: chartQuery,
+      intent: resolveRes.intent,
+      params: resolveRes.params,
+      confidence: resolveRes.confidence,
+      reason: resolveRes.reason,
+      unknown_reason: resolveRes.unknownReason,
+      request_id: resolveRequestId,
+      request_id_base: resolveRequestId,
+      adapter_trace_id: resolveRequestId,
+      attempt: 1,
+      schema_version: resolveRes.schemaVersion,
+      intent_version: resolveRes.intentVersion,
+      adapter_entry: true,
+    });
+  } catch (e: any) {
+    await sendTelegramText(chatId, errorText(`图表解析失败：${String(e?.message || e)}`));
+    return true;
+  }
+
+  if (!resolveRes?.ok) {
+    await sendTelegramText(chatId, errorText("图表解析失败，请稍后重试。"));
+    return true;
+  }
+
+  if (resolveRes.intent !== "chart_factor_timeline" && resolveRes.intent !== "chart_daily_activity") {
+    if (resolveRes.needClarify || resolveRes.intent === "unknown") {
+      await sendTelegramText(chatId, "未识别图表类型。示例：/chart BTC factor timeline 24h");
+      return true;
+    }
+    await sendTelegramText(chatId, "当前仅支持图表请求（timeline/activity）。");
+    return true;
+  }
+
+  const resolvedParams = resolveRes.params && typeof resolveRes.params === "object"
+    ? resolveRes.params
+    : {};
+  const symbolRaw = typeof resolvedParams.symbol === "string"
+    ? resolvedParams.symbol.trim()
+    : typeof resolvedParams.ticker === "string"
+      ? resolvedParams.ticker.trim()
+      : "";
+  const windowRaw = resolvedParams.window_hours ?? resolvedParams.hours ?? resolvedParams.window;
+  const parsedHours = Number(windowRaw);
+  const hours = Number.isFinite(parsedHours)
+    ? Math.max(1, Math.min(168, Math.floor(parsedHours)))
+    : 24;
+  let date = typeof resolvedParams.date_utc === "string"
+    ? resolvedParams.date_utc.trim()
+    : typeof resolvedParams.date === "string"
+      ? resolvedParams.date.trim()
+      : "";
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    date = "";
+  }
+  if (!date) {
+    date = formatUtcDate(new Date());
+  }
+
+  const intents = [
+    resolveRes.intent === "chart_factor_timeline"
+      ? {
+          kind: "factor_timeline" as const,
+          symbol: symbolRaw.toUpperCase(),
+          hours,
+          caption: `${symbolRaw.toUpperCase()} factor timeline (${hours}h, UTC)`,
+        }
+      : {
+          kind: "daily_activity" as const,
+          date,
+          caption: `Daily Activity (UTC, ${date})`,
+        },
+  ];
 
   const checkAllowed = (capability: string) => {
     const res = evaluate(config, {
