@@ -19,8 +19,7 @@ import { requestIntentResolve, resolveDefaultWindowSpecId, sanitizeRequestId } f
 import { INTENT_SCHEMA_VERSION, INTENT_VERSION, parseDashboardIntent } from "../runtime/intent_schema.js";
 import { buildErrorResultRef, buildTextResultRef } from "../runtime/on_demand_mapping.js";
 import { clarifyText, errorText, rejectText } from "../runtime/response_templates.js";
-import { buildDashboardIntentFromResolve, dispatchDashboardExport } from "../runtime/handlers.js";
-import { renderChart } from "../channels/charts.js";
+import { buildDashboardIntentFromResolve, dispatchDashboardExport, handleResolvedChartIntent } from "../runtime/handlers.js";
 import { isIntentEnabled } from "../runtime/capabilities.js";
 import { handleStrategyIfAny } from "../runtime/strategy.js";
 import { handleQueryIfAny } from "../runtime/query.js";
@@ -147,18 +146,6 @@ function clipToLen(s: string, n: number) {
   if (t.length <= n) return t;
   if (n <= 1) return t.slice(0, n);
   return t.slice(0, n - 1) + "…";
-}
-
-function buildChartRequestId(channel: string, messageId: string, chatId: string, kind: string): string {
-  const parts: string[] = [channel, chatId, messageId, kind];
-  return sanitizeRequestId(parts.join(":"));
-}
-
-function formatUtcDate(d: Date): string {
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
 }
 
 function escapeRegExp(s: string) {
@@ -1327,118 +1314,25 @@ export async function handleAdapterIntentIfAny(params: {
         if (channel !== "telegram") {
           pendingResolveResponse = rejectText("当前仅支持 Telegram 图表导出。");
         } else {
-          const chartKind = resolveRes.intent === "chart_factor_timeline"
-            ? "factor_timeline"
-            : "daily_activity";
-          const resolvedParams = resolveRes.params && typeof resolveRes.params === "object"
-            ? resolveRes.params
-            : {};
-          const symbolRaw = typeof resolvedParams.symbol === "string"
-            ? resolvedParams.symbol.trim()
-            : typeof resolvedParams.ticker === "string"
-              ? resolvedParams.ticker.trim()
-              : "";
-          const windowRaw = resolvedParams.window_hours ?? resolvedParams.hours ?? resolvedParams.window;
-          const parsedHours = Number(windowRaw);
-          const hours = Number.isFinite(parsedHours)
-            ? Math.max(1, Math.min(168, Math.floor(parsedHours)))
-            : 24;
-          let date = typeof resolvedParams.date_utc === "string"
-            ? resolvedParams.date_utc.trim()
-            : typeof resolvedParams.date === "string"
-              ? resolvedParams.date.trim()
-              : "";
-          if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-            date = "";
-          }
-          if (!date) {
-            date = formatUtcDate(new Date());
-          }
-
-          const requestKey = messageId || replyToId;
-          if (!requestKey) {
-            pendingResolveResponse = rejectText("请求缺少 messageId/parent_id，无法生成图表。");
-          } else {
-            const authState = loadAuth(storageDir, ownerChatId, channel);
-            const isOwnerChat = chatId === ownerChatId;
-            const isOwnerUser = ownerUserId ? userId === ownerUserId : userId === ownerChatId;
-            const allowed =
-              allowlistMode === "owner_only"
-                ? (isGroup ? isOwnerUser : isOwnerChat)
-                : authState.allowed.includes(chatId) || isOwnerUser;
-            const policyOk = config?.meta?.policyOk === true;
-            const capability =
-              chartKind === "factor_timeline" ? "ops.chart.factor_timeline" : "ops.chart.daily_activity";
-            const res = evaluate(config, {
-              channel: "telegram",
-              capability,
-              chat_id: chatId,
-              chat_type: isGroup ? "group" : "private",
-              user_id: userId,
-              mention_bot: mentionsBot,
-              has_reply: Boolean(trimmedReplyText),
-            });
-            let chartAllowed = allowed;
-            let silent = false;
-            if (policyOk) {
-              if (res.allowed) {
-                chartAllowed = true;
-              } else if (res.require?.mention_bot_for_ops && !mentionsBot) {
-                chartAllowed = false;
-                silent = true;
-              } else if ((res.reason === "not_allowed" || !res.reason) && allowed) {
-                chartAllowed = true;
-              } else {
-                chartAllowed = false;
-              }
-            }
-
-            if (!chartAllowed) {
-              if (!silent) {
-                await send(
-                  chatId,
-                  res?.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放。"),
-                );
-              }
-              return true;
-            }
-
-            if (chartKind === "factor_timeline" && !symbolRaw) {
-              await send(chatId, "请指定币种（BTC/ETH/BTCUSDT）。");
-              return true;
-            }
-
-            try {
-              const reqId = buildChartRequestId(channel, String(requestKey), chatId, chartKind);
-              const intent =
-                chartKind === "factor_timeline"
-                  ? {
-                      kind: "factor_timeline" as const,
-                      symbol: symbolRaw.toUpperCase(),
-                      hours,
-                      caption: `${symbolRaw.toUpperCase()} factor timeline (${hours}h, UTC)`,
-                    }
-                  : {
-                      kind: "daily_activity" as const,
-                      date,
-                      caption: `Daily Activity (UTC, ${date})`,
-                    };
-              const rendered = await renderChart(intent, {
-                projectId: projectId || undefined,
-                requestId: reqId,
-                channel,
-                chatId,
-              });
-              if (!rendered.ok) {
-                const trace = rendered.traceId ? ` trace_id=${rendered.traceId}` : "";
-                throw new Error(`${rendered.error || "render_failed"}${trace}`.trim());
-              }
-              await send(chatId, "已请求生成图表，稍后发送。");
-              return true;
-            } catch (e: any) {
-              await send(chatId, errorText(`图表生成失败：${String(e?.message || e)}`));
-              return true;
-            }
+          const handled = await handleResolvedChartIntent({
+            storageDir,
+            config,
+            allowlistMode,
+            ownerChatId,
+            ownerUserId,
+            channel,
+            chatId,
+            messageId,
+            replyToId,
+            userId,
+            isGroup,
+            mentionsBot,
+            replyText: trimmedReplyText,
+            sendText: send,
+            resolved: resolveRes,
+          });
+          if (handled) {
+            return true;
           }
         }
       }

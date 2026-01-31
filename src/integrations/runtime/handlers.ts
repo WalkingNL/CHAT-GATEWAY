@@ -818,15 +818,6 @@ export async function handleChartIfAny(params: {
     return true;
   }
 
-  const authState = loadAuth(storageDir, ownerChatId, "telegram");
-  const isOwnerChat = chatId === ownerChatId;
-  const isOwnerUser = ownerUserId ? userId === ownerUserId : userId === ownerChatId;
-  const allowed =
-    allowlistMode === "owner_only"
-      ? (isGroup ? isOwnerUser : isOwnerChat)
-      : authState.allowed.includes(chatId) || isOwnerUser;
-  const policyOk = config?.meta?.policyOk === true;
-  const chatType = isGroup ? "group" : "private";
   const projectId = resolveProjectId(config);
 
   if (!projectId) {
@@ -885,8 +876,66 @@ export async function handleChartIfAny(params: {
     return true;
   }
 
-  const resolvedParams = resolveRes.params && typeof resolveRes.params === "object"
-    ? resolveRes.params
+  return handleResolvedChartIntent({
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel: "telegram",
+    chatId,
+    messageId,
+    replyToId,
+    userId,
+    isGroup,
+    mentionsBot,
+    replyText,
+    sendText: sendTelegramText,
+    resolved: resolveRes,
+  });
+}
+
+export async function handleResolvedChartIntent(params: {
+  storageDir: string;
+  config: LoadedConfig;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
+  channel: "telegram" | "feishu";
+  chatId: string;
+  messageId: string;
+  replyToId: string;
+  userId: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  replyText: string;
+  sendText: (chatId: string, text: string) => Promise<void>;
+  resolved: any;
+}): Promise<boolean> {
+  const {
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel,
+    chatId,
+    messageId,
+    replyToId,
+    userId,
+    isGroup,
+    mentionsBot,
+    replyText,
+    sendText,
+    resolved,
+  } = params;
+
+  if (!resolved || (resolved.intent !== "chart_factor_timeline" && resolved.intent !== "chart_daily_activity")) {
+    return false;
+  }
+
+  const resolvedParams = resolved.params && typeof resolved.params === "object"
+    ? resolved.params
     : {};
   const symbolRaw = typeof resolvedParams.symbol === "string"
     ? resolvedParams.symbol.trim()
@@ -910,8 +959,8 @@ export async function handleChartIfAny(params: {
     date = formatUtcDate(new Date());
   }
 
-  const intents = [
-    resolveRes.intent === "chart_factor_timeline"
+  const intents: ChartIntent[] = [
+    resolved.intent === "chart_factor_timeline"
       ? {
           kind: "factor_timeline" as const,
           symbol: symbolRaw.toUpperCase(),
@@ -924,6 +973,28 @@ export async function handleChartIfAny(params: {
           caption: `Daily Activity (UTC, ${date})`,
         },
   ];
+
+  const requestKey = messageId || replyToId;
+  if (!requestKey) {
+    await sendText(chatId, rejectText("请求缺少 messageId/parent_id，无法生成图表。"));
+    return true;
+  }
+
+  const authState = loadAuth(storageDir, ownerChatId, channel);
+  const isOwnerChat = chatId === ownerChatId;
+  const isOwnerUser = ownerUserId ? userId === ownerUserId : userId === ownerChatId;
+  const allowed =
+    allowlistMode === "owner_only"
+      ? (isGroup ? isOwnerUser : isOwnerChat)
+      : authState.allowed.includes(chatId) || isOwnerUser;
+  const policyOk = config?.meta?.policyOk === true;
+  const chatType = isGroup ? "group" : "private";
+  const projectId = resolveProjectId(config);
+
+  if (!projectId) {
+    await sendText(chatId, rejectText("未配置默认项目，无法生成图表"));
+    return true;
+  }
 
   const checkAllowed = (capability: string) => {
     const res = evaluate(config, {
@@ -954,7 +1025,7 @@ export async function handleChartIfAny(params: {
     const gate = checkAllowed(capability);
     if (!gate.allowed) {
       if (!gate.silent) {
-        await sendTelegramText(
+        await sendText(
           chatId,
           gate.res?.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放。"),
         );
@@ -963,7 +1034,7 @@ export async function handleChartIfAny(params: {
     }
 
     if (intent.kind === "factor_timeline" && !intent.symbol) {
-      await sendTelegramText(chatId, "请指定币种（BTC/ETH/BTCUSDT）");
+      await sendText(chatId, "请指定币种（BTC/ETH/BTCUSDT）。");
       return true;
     }
 
@@ -972,16 +1043,16 @@ export async function handleChartIfAny(params: {
       const rendered = await renderChart(intent, {
         projectId,
         requestId: reqId,
-        channel: "telegram",
+        channel,
         chatId,
       });
       if (!rendered.ok) {
         const trace = rendered.traceId ? ` trace_id=${rendered.traceId}` : "";
         throw new Error(`${rendered.error || "render_failed"}${trace}`.trim());
       }
-      await sendTelegramText(chatId, "已请求生成图表，稍后发送");
+      await sendText(chatId, "已请求生成图表，稍后发送。");
     } catch (e: any) {
-      await sendTelegramText(chatId, errorText(`图表生成失败：${String(e?.message || e)}`));
+      await sendText(chatId, errorText(`图表生成失败：${String(e?.message || e)}`));
       return true;
     }
   }
