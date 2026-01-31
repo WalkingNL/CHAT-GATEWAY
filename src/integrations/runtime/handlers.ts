@@ -779,8 +779,6 @@ export async function handleChartIfAny(params: {
     const idx = lower.indexOf(commandToken);
     chartQuery = trimmed.slice(idx + commandToken.length).trim();
     usedCommand = true;
-  } else if (!isGroup) {
-    chartQuery = trimmed;
   } else {
     return false;
   }
