@@ -300,7 +300,10 @@ function shouldAttemptResolve(params: {
   if (!raw) return false;
   const isCommand = raw.startsWith("/") && !params.usedFeedbackPrefix;
   if (isCommand) return false;
-  if (params.isGroup && !params.mentionsBot && !params.replyToId && !params.usedFeedbackPrefix) return false;
+  if (params.isGroup) {
+    if (!params.mentionsBot) return false;
+    if (!params.replyToId && !params.usedFeedbackPrefix) return false;
+  }
   return Boolean(params.strippedText);
 }
 
@@ -959,6 +962,150 @@ async function runNewsSummary(params: {
   appendLedger(storageDir, entry);
 }
 
+async function handleAlertExplainIntent(params: {
+  storageDir: string;
+  config: LoadedConfig | undefined;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
+  channel: "telegram" | "feishu";
+  chatId: string;
+  messageId: string;
+  replyToId: string;
+  userId: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  replyText: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  explicitRetry: boolean;
+  rawAlertOverride?: string;
+}): Promise<boolean> {
+  const {
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel,
+    chatId,
+    messageId,
+    replyToId,
+    userId,
+    isGroup,
+    mentionsBot,
+    replyText,
+    send,
+    explicitRetry,
+    rawAlertOverride,
+  } = params;
+
+  let rawAlert = rawAlertOverride || replyText;
+  if (!rawAlert && !isGroup) {
+    rawAlert = lastAlertByChatId.get(chatId)?.rawText || "";
+  }
+  if (!rawAlert) {
+    if (isGroup) {
+      await send(chatId, "请回复一条告警/新闻消息再 @我。");
+    } else {
+      await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下）。");
+    }
+    return true;
+  }
+
+  if (isNewsAlert(rawAlert)) {
+    return false;
+  }
+
+  if (isGroup) {
+    const res = evaluate(config, {
+      channel,
+      capability: "alerts.explain",
+      chat_id: chatId,
+      chat_type: "group",
+      user_id: userId,
+      mention_bot: mentionsBot,
+      has_reply: Boolean(replyText),
+    });
+    if (res.require?.mention_bot_for_explain && !mentionsBot) return false;
+    if (res.require?.reply_required_for_explain && !replyText) {
+      await send(chatId, "请回复一条告警/新闻消息再 @我。");
+      return true;
+    }
+    if (!res.allowed) {
+      await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
+      return true;
+    }
+  } else {
+    const authState = loadAuth(storageDir, ownerChatId, channel);
+    const resolvedOwnerUserId = String(ownerUserId || "");
+    const isOwnerChat = chatId === ownerChatId;
+    const isOwnerUser = resolvedOwnerUserId ? userId === resolvedOwnerUserId : false;
+    const allowed =
+      allowlistMode === "owner_only"
+        ? (isGroup ? isOwnerUser : isOwnerChat)
+        : authState.allowed.includes(chatId) || isOwnerUser;
+    if (!allowed) return true;
+  }
+
+  const adapterIds = resolveAdapterRequestIds({
+    channel,
+    chatId,
+    messageId,
+    replyToId,
+    explicitRetry,
+  });
+  if (adapterIds?.expired) {
+    await send(chatId, rejectText("请求已过期，请重新发起解释。"));
+    appendLedger(storageDir, {
+      ts_utc: nowIso(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      cmd: "alert_explain_reject",
+      request_id: adapterIds.dispatchRequestId,
+      request_id_base: adapterIds.requestIdBase,
+      adapter_trace_id: adapterIds.requestIdBase,
+      attempt: adapterIds.attempt,
+      schema_version: INTENT_SCHEMA_VERSION,
+      intent_version: INTENT_VERSION,
+      error_code: "request_id_expired",
+      raw: rawAlert,
+      adapter_entry: true,
+    });
+    return true;
+  }
+
+  await send(chatId, "🧠 我看一下…");
+  const explainResult = await runExplain({
+    storageDir,
+    chatId,
+    userId,
+    rawAlert,
+    send,
+    config,
+    channel,
+    taskIdPrefix: `${taskPrefix(channel)}_explain`,
+  });
+  appendLedger(storageDir, {
+    ts_utc: nowIso(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    cmd: "alert_explain",
+    request_id: adapterIds?.dispatchRequestId,
+    request_id_base: adapterIds?.requestIdBase,
+    adapter_trace_id: adapterIds?.requestIdBase,
+    attempt: adapterIds?.attempt,
+    schema_version: INTENT_SCHEMA_VERSION,
+    intent_version: INTENT_VERSION,
+    ok: explainResult.ok,
+    err: explainResult.ok ? undefined : explainResult.errCode || "unknown",
+    latency_ms: explainResult.latencyMs,
+    adapter_entry: true,
+  });
+  return true;
+}
+
 export async function handleAdapterIntentIfAny(params: {
   storageDir: string;
   config: LoadedConfig;
@@ -1122,7 +1269,7 @@ export async function handleAdapterIntentIfAny(params: {
     mentionsBot,
     replyToId,
     usedFeedbackPrefix: feedbackStripped.used,
-  }) && (isPrivate || (!summaryRequested && !explainRequested));
+  });
   let pendingResolveResponse: string | null = null;
 
   if (trimmedReplyText && isPrivate) {
@@ -1337,6 +1484,30 @@ export async function handleAdapterIntentIfAny(params: {
         }
       }
 
+      if (resolveRes.ok && resolveRes.intent === "alert_explain") {
+        const handled = await handleAlertExplainIntent({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          messageId,
+          replyToId,
+          userId,
+          isGroup,
+          mentionsBot,
+          replyText: trimmedReplyText,
+          send,
+          explicitRetry,
+          rawAlertOverride: trimmedReplyText,
+        });
+        if (handled) {
+          return true;
+        }
+      }
+
       if (resolveRes.ok && resolveRes.intent === "news_summary") {
         if (!isIntentEnabled("news_summary")) {
           pendingResolveResponse = rejectText("未开放新闻摘要能力。");
@@ -1519,7 +1690,11 @@ export async function handleAdapterIntentIfAny(params: {
     }
   }
 
-  if (isPrivate) {
+  if (isGroup && !allowResolve) {
+    return false;
+  }
+
+  if (isPrivate || allowResolve) {
     if (pendingResolveResponse) {
       await send(chatId, pendingResolveResponse);
       return true;
@@ -1528,107 +1703,25 @@ export async function handleAdapterIntentIfAny(params: {
   }
 
   if (explainRequested && isIntentEnabled("alert_explain")) {
-    let rawAlert = trimmedReplyText;
-    if (!rawAlert && !isGroup) {
-      rawAlert = lastAlertByChatId.get(chatId)?.rawText || "";
-    }
-    if (!rawAlert) {
-      if (isGroup) {
-        await send(chatId, "请回复一条告警/新闻消息再 @我。");
-      } else {
-        await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下）。");
-      }
-      return true;
-    }
-
-    if (!isNewsAlert(rawAlert)) {
-      if (isGroup) {
-        const res = evaluate(config, {
-          channel,
-          capability: "alerts.explain",
-          chat_id: chatId,
-          chat_type: "group",
-          user_id: userId,
-          mention_bot: mentionsBot,
-          has_reply: Boolean(trimmedReplyText),
-        });
-        if (res.require?.mention_bot_for_explain && !mentionsBot) return false;
-        if (res.require?.reply_required_for_explain && !trimmedReplyText) {
-          await send(chatId, "请回复一条告警/新闻消息再 @我。");
-          return true;
-        }
-        if (!res.allowed) {
-          await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
-          return true;
-        }
-      } else {
-        const authState = loadAuth(storageDir, ownerChatId, channel);
-        const resolvedOwnerUserId = String(ownerUserId || "");
-        const isOwnerChat = chatId === ownerChatId;
-        const isOwnerUser = resolvedOwnerUserId ? userId === resolvedOwnerUserId : false;
-        const allowed =
-          allowlistMode === "owner_only"
-            ? (isGroup ? isOwnerUser : isOwnerChat)
-            : authState.allowed.includes(chatId) || isOwnerUser;
-        if (!allowed) return true;
-      }
-
-      const adapterIds = resolveAdapterRequestIds({
-        channel,
-        chatId,
-        messageId,
-        replyToId,
-        explicitRetry,
-      });
-      if (adapterIds?.expired) {
-        await send(chatId, rejectText("请求已过期，请重新发起解释。"));
-        appendLedger(storageDir, {
-          ts_utc: nowIso(),
-          channel,
-          chat_id: chatId,
-          user_id: userId,
-          cmd: "alert_explain_reject",
-          request_id: adapterIds.dispatchRequestId,
-          request_id_base: adapterIds.requestIdBase,
-          adapter_trace_id: adapterIds.requestIdBase,
-          attempt: adapterIds.attempt,
-          schema_version: INTENT_SCHEMA_VERSION,
-          intent_version: INTENT_VERSION,
-          error_code: "request_id_expired",
-          raw: trimmedText,
-          adapter_entry: true,
-        });
-        return true;
-      }
-
-      await send(chatId, "🧠 我看一下…");
-      const explainResult = await runExplain({
-        storageDir,
-        chatId,
-        userId,
-        rawAlert,
-        send,
-        config,
-        channel,
-        taskIdPrefix: `${taskPrefix(channel)}_explain`,
-      });
-      appendLedger(storageDir, {
-        ts_utc: nowIso(),
-        channel,
-        chat_id: chatId,
-        user_id: userId,
-        cmd: "alert_explain",
-        request_id: adapterIds?.dispatchRequestId,
-        request_id_base: adapterIds?.requestIdBase,
-        adapter_trace_id: adapterIds?.requestIdBase,
-        attempt: adapterIds?.attempt,
-        schema_version: INTENT_SCHEMA_VERSION,
-        intent_version: INTENT_VERSION,
-        ok: explainResult.ok,
-        err: explainResult.ok ? undefined : explainResult.errCode || "unknown",
-        latency_ms: explainResult.latencyMs,
-        adapter_entry: true,
-      });
+    const handled = await handleAlertExplainIntent({
+      storageDir,
+      config,
+      allowlistMode,
+      ownerChatId,
+      ownerUserId,
+      channel,
+      chatId,
+      messageId,
+      replyToId,
+      userId,
+      isGroup,
+      mentionsBot,
+      replyText: trimmedReplyText,
+      send,
+      explicitRetry,
+      rawAlertOverride: trimmedReplyText,
+    });
+    if (handled) {
       return true;
     }
   }
@@ -2148,105 +2241,6 @@ async function handleOpsCommand(params: {
   return false;
 }
 
-async function handleGroupExplain(params: {
-  channel: string;
-  taskIdPrefix: string;
-  storageDir: string;
-  chatId: string;
-  userId: string;
-  messageId: string;
-  replyToId: string;
-  trimmedText: string;
-  trimmedReplyText: string;
-  mentionsBot: boolean;
-  send: SendFn;
-  config?: LoadedConfig;
-}) {
-  const { channel, taskIdPrefix, storageDir, chatId, userId, messageId, replyToId, trimmedText, trimmedReplyText, mentionsBot, send, config } = params;
-  const res = evaluate(config, {
-    channel,
-    capability: "alerts.explain",
-    chat_id: chatId,
-    chat_type: "group",
-    user_id: userId,
-    mention_bot: mentionsBot,
-    has_reply: Boolean(trimmedReplyText),
-  });
-
-  if (res.require?.mention_bot_for_explain && !mentionsBot) return;
-
-  if (res.require?.reply_required_for_explain && !trimmedReplyText) {
-    await send(chatId, "请回复一条告警/新闻消息再 @我。");
-    return;
-  }
-
-  if (!res.allowed) {
-    await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
-    return;
-  }
-
-  const isNews = trimmedReplyText ? isNewsAlert(trimmedReplyText) : false;
-  const summaryRequested = wantsNewsSummary(trimmedText);
-  const explainRequested = isExplainRequest(trimmedText);
-  if (isNews && !summaryRequested && !explainRequested) {
-    await send(chatId, "这是新闻告警。请回复“摘要”或“摘要 200”获取摘要。");
-    return;
-  }
-  if (summaryRequested) {
-    if (!trimmedReplyText) {
-      await send(chatId, "请回复一条新闻告警再发送摘要请求。");
-      return;
-    }
-    if (!isNews) {
-      await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
-      return;
-    }
-    await send(chatId, "🧠 正在生成新闻摘要…");
-    await runNewsSummary({
-      storageDir,
-      chatId,
-      userId,
-      messageId,
-      replyToId,
-      rawAlert: trimmedReplyText,
-      send,
-      channel,
-      maxChars: resolveSummaryLength(trimmedText),
-      config,
-    });
-    return;
-  }
-
-  if (isNews && explainRequested) {
-    await send(chatId, "🧠 正在生成新闻摘要…");
-    await runNewsSummary({
-      storageDir,
-      chatId,
-      userId,
-      messageId,
-      replyToId,
-      rawAlert: trimmedReplyText,
-      send,
-      channel,
-      maxChars: resolveSummaryLength(trimmedText),
-      config,
-    });
-    return;
-  }
-
-  await send(chatId, "🧠 我看一下…");
-  await runExplain({
-    storageDir,
-    chatId,
-    userId,
-    rawAlert: trimmedReplyText,
-    send,
-    config,
-    channel,
-    taskIdPrefix: `${taskIdPrefix}_explain`,
-  });
-}
-
 async function handlePrivateMessage(params: {
   channel: string;
   taskIdPrefix: string;
@@ -2623,20 +2617,6 @@ export async function handleMessage(opts: {
       }
       // fall through to command parsing/dispatch below
     } else {
-      await handleGroupExplain({
-        channel,
-        taskIdPrefix,
-        storageDir,
-        chatId,
-        userId,
-        messageId,
-        replyToId,
-        trimmedReplyText,
-        trimmedText,
-        mentionsBot,
-        send,
-        config,
-      });
       return;
     }
   }
