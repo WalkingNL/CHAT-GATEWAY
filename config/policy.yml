@@ -3,6 +3,8 @@ enabled: true
 
 capabilities:
   - alerts.explain
+  - alerts.strategy
+  - alerts.query
   - ops.status
   - ops.logs
   - ops.ps
@@ -16,6 +18,19 @@ default:
     max_chars: 6000
 
 rules:
+  # 0) Owner strategy anywhere (avoid chat_id mismatch blocking)
+  - name: owner_strategy_any
+    match:
+      channel: telegram
+      user_id: "1864053991"
+      capability: "alerts.strategy"
+    allow:
+      - alerts.strategy
+    require:
+      mention_bot_for_explain: false
+      reply_required_for_explain: false
+      mention_bot_for_ops: false
+
   # 1) Owner DM: explain + ops (Phase A)
   - name: owner_dm_all
     match:
@@ -24,6 +39,8 @@ rules:
       user_id: "1864053991"
     allow:
       - alerts.explain
+      - alerts.strategy
+      - alerts.query
       - ops.status
       - ops.logs
       - ops.ps
@@ -46,6 +63,8 @@ rules:
       user_id: "1864053991"
     allow:
       - alerts.explain
+      - alerts.strategy
+      - alerts.query
       - ops.status
       - ops.logs
       - ops.ps

@@ -63,6 +63,7 @@ export function parseCommand(text: string): Cmd {
 
 // ===== LLM gateway commands =====
 import { submitTask } from "../../core/internal_client.js";
+import { errorText } from "../runtime/response_templates.js";
 
 export async function handleAskCommand(ctx: {
   chatId: number | string;
@@ -93,7 +94,7 @@ export async function handleAskCommand(ctx: {
     });
 
     if (!res.ok) {
-      await ctx.reply(`❌ Gateway error: ${res.error || "unknown"}`);
+      await ctx.reply(errorText(`Gateway error: ${res.error || "unknown"}`));
       return;
     }
 
@@ -101,6 +102,6 @@ export async function handleAskCommand(ctx: {
       `🧠 *Analysis (facts-only)*\n\n${res.summary}`,
     );
   } catch (e: any) {
-    await ctx.reply(`❌ Exception: ${String(e.message || e)}`);
+    await ctx.reply(errorText(`Exception: ${String(e.message || e)}`));
   }
 }

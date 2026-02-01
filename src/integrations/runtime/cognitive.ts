@@ -12,6 +12,7 @@ import {
   type CognitiveSource,
 } from "../../core/cognitive_store.js";
 import { submitTask } from "../../core/internal_client.js";
+import { rejectText } from "./response_templates.js";
 
 const EXPLICIT_INTENTS = [
   "记一下",
@@ -33,6 +34,16 @@ const STATUS_MAP: Array<{ status: CognitiveStatus; terms: string[] }> = [
   { status: "BLOCKED", terms: ["blocked", "阻塞", "卡住"] },
   { status: "OPEN", terms: ["open", "打开", "未解决", "待处理"] },
 ];
+
+function normalizeStatusOverride(value: string): CognitiveStatus | null {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const upper = raw.toUpperCase().replace(/\s+/g, "_");
+  if (STATUS_MAP.some(item => item.status === upper)) {
+    return upper as CognitiveStatus;
+  }
+  return null;
+}
 
 const MIN_PROBLEM_LEN = 12;
 const DEFAULT_REMIND_HOURS = 72;
@@ -245,9 +256,10 @@ export async function handleCognitiveStatusUpdate(params: {
   text: string;
   isGroup: boolean;
   mentionsBot: boolean;
+  statusOverride?: { id: string; status: string };
   send: (chatId: string, text: string) => Promise<void>;
 }): Promise<boolean> {
-  const { storageDir, allowlistMode, ownerChatId, ownerUserId, channel, chatId, userId, text, isGroup, mentionsBot, send } =
+  const { storageDir, allowlistMode, ownerChatId, ownerUserId, channel, chatId, userId, text, isGroup, mentionsBot, statusOverride, send } =
     params;
   const normalized = normalizeText(text);
   if (!normalized) return false;
@@ -256,7 +268,10 @@ export async function handleCognitiveStatusUpdate(params: {
   if (!isAllowed({ storageDir, channel, allowlistMode, ownerChatId, ownerUserId, chatId, userId })) return false;
   if (isSummaryRequest(normalized)) return false;
 
-  const statusUpdate = parseStatusUpdate(normalized);
+  const normalizedStatus = statusOverride ? normalizeStatusOverride(statusOverride.status) : null;
+  const statusUpdate = normalizedStatus
+    ? { id: statusOverride!.id, status: normalizedStatus }
+    : parseStatusUpdate(normalized);
   if (!statusUpdate) return false;
 
   const store = new CognitiveStore(storageDir);
@@ -279,6 +294,10 @@ export async function handleCognitiveStatusUpdate(params: {
   return true;
 }
 
+type CognitiveDecision = { action: "record" | "ignore" | "ask_clarify"; confidence: number; reason: string };
+
+type CognitiveConfirmAction = "record" | "ignore";
+
 export async function handleCognitiveIfAny(params: {
   storageDir: string;
   config: LoadedConfig;
@@ -294,6 +313,9 @@ export async function handleCognitiveIfAny(params: {
   text: string;
   isGroup: boolean;
   mentionsBot: boolean;
+  confirmOverride?: CognitiveConfirmAction;
+  decisionOverride?: CognitiveDecision;
+  useReplyOverride?: boolean;
   send: (chatId: string, text: string) => Promise<void>;
 }): Promise<boolean> {
   const {
@@ -310,6 +332,9 @@ export async function handleCognitiveIfAny(params: {
     text,
     isGroup,
     mentionsBot,
+    confirmOverride,
+    decisionOverride,
+    useReplyOverride,
     send,
   } = params;
 
@@ -324,7 +349,7 @@ export async function handleCognitiveIfAny(params: {
 
   const store = new CognitiveStore(storageDir);
   const pendingKey = `${channel}:${chatId}:${userId}`;
-  const confirm = parseConfirm(normalized);
+  const confirm = confirmOverride || parseConfirm(normalized);
   if (confirm) {
     const pending = await store.getPending(pendingKey);
     if (!pending) return false;
@@ -360,7 +385,7 @@ export async function handleCognitiveIfAny(params: {
   }
 
   const ruleDecision = classifyByRules(normalized);
-  let decision: { action: "record" | "ignore" | "ask_clarify"; confidence: number; reason: string } | null = null;
+  let decision: CognitiveDecision | null = null;
 
   const stripIntentPrefix = (textValue: string): { matched: boolean; rest: string } => {
     const t = normalizeText(textValue);
@@ -378,7 +403,9 @@ export async function handleCognitiveIfAny(params: {
 
   const intentStrip = stripIntentPrefix(normalized);
 
-  if (ruleDecision.action === "record") {
+  if (decisionOverride) {
+    decision = decisionOverride;
+  } else if (ruleDecision.action === "record") {
     decision = { ...ruleDecision, action: "record" };
   } else if (normalized.length < MIN_PROBLEM_LEN) {
     decision = { action: "ignore", confidence: 0.3, reason: "too_short" };
@@ -401,7 +428,11 @@ export async function handleCognitiveIfAny(params: {
   let targetNormalized = normalized;
   let useReplyId = false;
 
-  if (intentStrip.matched) {
+  if (useReplyOverride && replyNormalized) {
+    targetRawText = replyRaw;
+    targetNormalized = replyNormalized;
+    useReplyId = Boolean(replyToId);
+  } else if (intentStrip.matched) {
     if (intentStrip.rest) {
       targetRawText = intentStrip.rest;
       targetNormalized = normalizeText(intentStrip.rest);
@@ -422,7 +453,7 @@ export async function handleCognitiveIfAny(params: {
     replyToId,
   );
   if (!issueId) {
-    await send(chatId, "该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配");
+    await send(chatId, rejectText("该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配"));
     appendLedger(storageDir, {
       ts_utc: nowUtc(),
       channel,

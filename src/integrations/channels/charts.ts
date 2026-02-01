@@ -164,12 +164,22 @@ function resolveOnDemandConfig(projectId?: string): OnDemandConfig {
   return { url, token };
 }
 
-function buildRenderPayload(intent: ChartIntent, projectId: string | undefined, requestId: string) {
+function buildRenderPayload(
+  intent: ChartIntent,
+  projectId: string | undefined,
+  requestId: string,
+  targetOverride?: { channel?: "telegram" | "feishu" | "both"; chatId?: string },
+) {
+  const target: Record<string, any> = {};
+  if (projectId) target.project_id = projectId;
+  if (targetOverride?.channel) target.target = targetOverride.channel;
+  if (targetOverride?.chatId) target.chat_id = targetOverride.chatId;
+
   const payload: any = {
     request_id: requestId,
     kind: intent.kind,
     caption: intent.caption,
-    target: projectId ? { project_id: projectId } : undefined,
+    target: Object.keys(target).length ? target : undefined,
   };
 
   if (intent.kind === "factor_timeline") {
@@ -184,19 +194,39 @@ function buildRenderPayload(intent: ChartIntent, projectId: string | undefined, 
 }
 
 async function postJson(url: string, token: string, body: any): Promise<any> {
-  const timeoutMs = Number(process.env.CHAT_GATEWAY_CHART_ACK_TIMEOUT_MS || "2000");
+  const timeoutMs = Number(process.env.CHAT_GATEWAY_CHART_ACK_TIMEOUT_MS || "8000");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (e: any) {
+      const cause = e?.cause;
+      const info = {
+        url,
+        timeoutMs,
+        error: String(e?.message || e),
+        cause: cause
+          ? {
+              message: String(cause?.message || cause),
+              code: String(cause?.code || ""),
+              errno: String(cause?.errno || ""),
+              syscall: String(cause?.syscall || ""),
+            }
+          : undefined,
+      };
+      console.error("[chart][fetch] failed", info);
+      throw e;
+    }
     const text = await res.text();
     let data: any = {};
     try {
@@ -215,12 +245,15 @@ async function postJson(url: string, token: string, body: any): Promise<any> {
 
 export async function renderChart(
   intent: ChartIntent,
-  opts?: { projectId?: string; requestId?: string },
+  opts?: { projectId?: string; requestId?: string; channel?: "telegram" | "feishu" | "both"; chatId?: string },
 ): Promise<ChartRenderResult> {
   const requestId = String(opts?.requestId || "").trim();
   if (!requestId) throw new Error("missing_request_id");
   const cfg = resolveOnDemandConfig(opts?.projectId);
-  const payload = buildRenderPayload(intent, opts?.projectId, requestId);
+  const payload = buildRenderPayload(intent, opts?.projectId, requestId, {
+    channel: opts?.channel,
+    chatId: opts?.chatId,
+  });
   const res = await postJson(`${cfg.url}/v1/render`, cfg.token, payload);
   return {
     kind: intent.kind,

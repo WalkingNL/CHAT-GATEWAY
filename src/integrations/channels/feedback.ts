@@ -71,12 +71,17 @@ export type LevelOverrideHit =
   | { level: PriorityLevel; normalizedText: string }
   | { invalid: true; normalizedText: string };
 
-export function detectFeedback(rawText: string): FeedbackHit | null {
+function stripFeedbackPrefix(rawText: string): string {
   let textNorm = (rawText || "").trim();
-  if (!textNorm) return null;
+  if (!textNorm) return "";
 
   // feedback command channel (works under Telegram privacy mode in groups)
-  textNorm = textNorm.replace(/^(\/feedback|feedback|反馈)[:：]?\s*/i, "").trim();
+  textNorm = textNorm.replace(/^(\/feedback(?:@[A-Za-z0-9_]+)?|feedback|反馈)[:：]?\s*/i, "").trim();
+  return textNorm;
+}
+
+export function detectFeedback(rawText: string): FeedbackHit | null {
+  const textNorm = stripFeedbackPrefix(rawText);
   if (!textNorm) return null;
 
   if (FEEDBACK_TOO_MANY.some((k) => textNorm.includes(k))) {
@@ -89,10 +94,7 @@ export function detectFeedback(rawText: string): FeedbackHit | null {
 }
 
 export function detectLevelOverride(rawText: string): LevelOverrideHit | null {
-  let textNorm = (rawText || "").trim();
-  if (!textNorm) return null;
-
-  textNorm = textNorm.replace(/^(\/feedback|feedback|反馈)[:：]?\s*/i, "").trim();
+  const textNorm = stripFeedbackPrefix(rawText);
   if (!textNorm) return null;
 
   const lower = textNorm.toLowerCase();
@@ -105,14 +107,22 @@ export function detectLevelOverride(rawText: string): LevelOverrideHit | null {
   return { level, normalizedText: textNorm };
 }
 
+function resolveRoot(): string {
+  const root = String(process.env.CRYPTO_AGENT_ROOT || "").trim();
+  if (root) return root;
+  const cwd = process.cwd();
+  if (cwd.includes("chat-gateway")) {
+    return path.resolve(cwd, "..", "crypto_agent");
+  }
+  return cwd;
+}
+
 function resolvePolicyStatePath(): string {
-  const root = String(process.env.CRYPTO_AGENT_ROOT || "").trim() || "/srv/crypto_agent";
-  return path.join(root, "data/metrics/push_policy_state.json");
+  return path.join(resolveRoot(), "data/metrics/push_policy_state.json");
 }
 
 function resolveStatsStatePath(): string {
-  const root = String(process.env.CRYPTO_AGENT_ROOT || "").trim() || "/srv/crypto_agent";
-  return path.join(root, "data/metrics/push_stats_state.json");
+  return path.join(resolveRoot(), "data/metrics/push_stats_state.json");
 }
 
 function safeParseJson(input: string): any | null {
@@ -173,11 +183,27 @@ function roundPushLevel(v: number): number {
   return Math.max(0, Math.min(100, out));
 }
 
+const PRIORITY_ORDER: PriorityLevel[] = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
+
 function pushLevelForMinPriority(level: PriorityLevel): number {
   if (level === "LOW") return 80;
   if (level === "MEDIUM") return 60;
   if (level === "HIGH") return 40;
   return 0;
+}
+
+function normalizePriorityLevel(value: any, fallback: PriorityLevel): PriorityLevel {
+  const v = String(value || "").trim().toUpperCase();
+  return (PRIORITY_ORDER as string[]).includes(v) ? (v as PriorityLevel) : fallback;
+}
+
+function stepPriorityLevel(current: string, kind: FeedbackHit["kind"]): PriorityLevel {
+  const cur = normalizePriorityLevel(current, "HIGH");
+  const idx = PRIORITY_ORDER.indexOf(cur);
+  if (kind === "too_few") {
+    return PRIORITY_ORDER[Math.max(0, idx - 1)];
+  }
+  return PRIORITY_ORDER[Math.min(PRIORITY_ORDER.length - 1, idx + 1)];
 }
 
 function gatesFromPushLevel(pushLevel: number) {
@@ -279,6 +305,9 @@ export function buildFeedbackReply(kind: FeedbackHit["kind"], update: FeedbackUp
     update.nextMaxAlertsPerHour === null || update.nextMaxAlertsPerHour === undefined
       ? "不限频"
       : `上限 ${fmtNumber(update.nextMaxAlertsPerHour)}/小时`;
+  const changed =
+    update.prevMinPriority !== update.nextMinPriority ||
+    update.prevMaxAlertsPerHour !== update.nextMaxAlertsPerHour;
   const lines: string[] = [];
   if (update.cooldownActive) {
     const remain = Math.max(0, Math.round(update.cooldownRemainingSec || 0));
@@ -292,7 +321,11 @@ export function buildFeedbackReply(kind: FeedbackHit["kind"], update: FeedbackUp
     return lines.join("\n");
   }
   lines.push("已收到反馈。");
-  lines.push(`告警等级门槛已${action}至 ${level}（仅推送 ${level}+，${maxText}，以实际配置为准）。`);
+  if (changed) {
+    lines.push(`告警等级门槛已${action}至 ${level}（仅推送 ${level}+，${maxText}，以实际配置为准）。`);
+  } else {
+    lines.push(`门槛保持为 ${level}（未变化，以实际配置为准）。`);
+  }
   lines.push(
     `反馈值：push_level ${fmtNumber(update.prevPushLevel)}→${fmtNumber(update.nextPushLevel)}，` +
       `目标告警频率 ${fmtNumber(update.prevTarget)}/小时→${fmtNumber(update.nextTarget)}/小时。`,
@@ -479,11 +512,24 @@ export function updatePushPolicyTargets(
   nextTarget = roundTarget(nextTarget);
 
   const delta = kind === "too_many" ? -FEEDBACK_PUSH_LEVEL_DELTA : FEEDBACK_PUSH_LEVEL_DELTA;
-  const nextPushLevel = roundPushLevel(prevPushLevel + delta);
-  const nextGates = gatesFromPushLevel(nextPushLevel);
-  const nextMinPriority = normalizePriority(nextGates.min_priority, prevMinPriority);
-  const nextMaxAlertsPerHour =
+  let nextPushLevel = roundPushLevel(prevPushLevel + delta);
+  let nextGates = gatesFromPushLevel(nextPushLevel);
+  let nextMinPriority = normalizePriority(nextGates.min_priority, prevMinPriority);
+  let nextMaxAlertsPerHour =
     nextGates.max_alerts_per_hour === undefined ? null : nextGates.max_alerts_per_hour;
+  if (nextMinPriority === prevMinPriority) {
+    const steppedLevel = stepPriorityLevel(prevMinPriority, kind);
+    if (steppedLevel !== prevMinPriority) {
+      const steppedPushLevel = roundPushLevel(pushLevelForMinPriority(steppedLevel));
+      if (steppedPushLevel !== nextPushLevel) {
+        nextPushLevel = steppedPushLevel;
+        nextGates = gatesFromPushLevel(nextPushLevel);
+        nextMinPriority = normalizePriority(nextGates.min_priority, prevMinPriority);
+        nextMaxAlertsPerHour =
+          nextGates.max_alerts_per_hour === undefined ? null : nextGates.max_alerts_per_hour;
+      }
+    }
+  }
 
   targets.alerts_per_hour_target = nextTarget;
   state.targets = targets;

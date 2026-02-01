@@ -1,22 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
 import { appendLedger } from "../audit/ledger.js";
-import { detectChartIntents, renderChart } from "../channels/charts.js";
+import { type ChartIntent, renderChart } from "../channels/charts.js";
 import {
   buildFeedbackReply,
   buildLevelOverrideReply,
-  detectFeedback,
-  detectLevelOverride,
   FEEDBACK_REPLY,
   updatePushPolicyMinPriority,
   updatePushPolicyTargets,
 } from "../channels/feedback.js";
 import { loadAuth } from "../auth/store.js";
-import { allowedPanelIds, parseDashboardIntent } from "./intent_schema.js";
-import { requestDashboardExport, resolveDefaultWindowSpecId } from "./intent_router.js";
+import { EXPORT_API_VERSION, parseDashboardIntent } from "./intent_schema.js";
+import { requestDashboardExport, requestIntentResolve, resolveDefaultWindowSpecId } from "./intent_router.js";
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
 import { buildErrorResultRef, buildImageResultRef, mapOnDemandStatus } from "./on_demand_mapping.js";
+import { errorText, rejectText } from "./response_templates.js";
 
 function sanitizeRequestId(raw: string): string {
   return raw.replace(/[^A-Za-z0-9._:-]/g, "_").slice(0, 200);
@@ -26,7 +25,7 @@ function buildChartRequestId(
   channel: string,
   messageId: string,
   chatId: string,
-  intent: ReturnType<typeof detectChartIntents>[number],
+  intent: ChartIntent,
 ) {
   const parts: string[] = [channel, chatId, messageId, intent.kind];
   return sanitizeRequestId(parts.join(":"));
@@ -34,6 +33,17 @@ function buildChartRequestId(
 
 function buildDashboardRequestId(requestIdBase: string, attempt: number) {
   return sanitizeRequestId(`${requestIdBase}:${attempt}`);
+}
+
+function buildResolveRequestId(channel: string, chatId: string, messageId: string, suffix: string) {
+  return sanitizeRequestId([channel, chatId, messageId, suffix].filter(Boolean).join(":"));
+}
+
+function formatUtcDate(d: Date): string {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 function resolveProjectId(config?: LoadedConfig): string | null {
@@ -56,6 +66,7 @@ function resolveProjectId(config?: LoadedConfig): string | null {
 
 export async function handleFeedbackIfAny(params: {
   storageDir: string;
+  config: LoadedConfig;
   allowlistMode: "owner_only" | "auth";
   ownerChatId: string;
   ownerUserId: string;
@@ -66,10 +77,18 @@ export async function handleFeedbackIfAny(params: {
   text: string;
   send: (chatId: string, text: string) => Promise<void>;
 }): Promise<boolean> {
-  const { storageDir, channel, chatId, userId, text, send, allowlistMode, ownerChatId, ownerUserId, isGroup } = params;
-  const levelIntent = detectLevelOverride(text);
-  const hit = detectFeedback(text);
-  if (!levelIntent && !hit) return false;
+  const { storageDir, config, channel, chatId, userId, text, send, allowlistMode, ownerChatId, ownerUserId, isGroup } =
+    params;
+  const raw = String(text || "");
+  const feedbackMatch = raw.match(/^\s*(\/feedback(?:@[A-Za-z0-9_]+)?|feedback|反馈)\b/i);
+  if (!feedbackMatch) return false;
+  if (isGroup && !raw.trim().toLowerCase().startsWith("/feedback")) return false;
+
+  const stripped = raw.replace(/^\s*(\/feedback(?:@[A-Za-z0-9_]+)?|feedback|反馈)[:：]?\s*/i, "").trim();
+  if (!stripped) {
+    await send(chatId, "Usage: /feedback <描述>（例如：告警太多了 / 只推高等级）");
+    return true;
+  }
 
   const authState = loadAuth(storageDir, ownerChatId, channel);
   const isOwnerChat = chatId === ownerChatId;
@@ -79,52 +98,169 @@ export async function handleFeedbackIfAny(params: {
       ? (isGroup ? isOwnerUser : isOwnerChat)
       : authState.allowed.includes(chatId) || isOwnerUser;
 
-  if (levelIntent) {
-    if (!allowed) {
-      await send(chatId, "无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。");
-      const rejectPayload: any = {
-        ts_utc: new Date().toISOString(),
-        channel,
-        chat_id: chatId,
-        user_id: userId,
-        kind: "alert_feedback_reject",
-        reason: "not_allowed",
-      };
-      if ("invalid" in levelIntent) {
-        rejectPayload.feedback = "invalid_level";
-      } else {
-        rejectPayload.feedback = levelIntent.level;
-      }
-      rejectPayload.raw = levelIntent.normalizedText;
-      appendLedger(storageDir, rejectPayload);
-      return true;
-    }
-    if ("invalid" in levelIntent) {
-      await send(chatId, "已收到反馈，但等级无效/超出范围（仅支持 LOW/MEDIUM/HIGH/CRITICAL），未做调整。");
+  if (!allowed) {
+    await send(chatId, rejectText("无权限。请联系管理员加入允许列表；群聊请用 /feedback 触发。"));
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "alert_feedback_reject",
+      feedback: "not_allowed",
+      raw: stripped,
+      reason: "not_allowed",
+    });
+    return true;
+  }
+
+  const projectId = resolveProjectId(config);
+  if (!projectId) {
+    await send(chatId, rejectText("未配置默认项目，无法解析反馈。"));
+    return true;
+  }
+
+  const resolveRequestId = sanitizeRequestId(`feedback:${channel}:${chatId}:${Date.now()}`);
+  let resolveRes: any;
+  try {
+    resolveRes = await requestIntentResolve({
+      projectId,
+      requestId: resolveRequestId,
+      rawQuery: stripped,
+      replyText: "",
+      channel,
+      chatId,
+      userId,
+    });
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      cmd: "intent_resolve",
+      raw: stripped,
+      intent: resolveRes.intent,
+      params: resolveRes.params,
+      confidence: resolveRes.confidence,
+      reason: resolveRes.reason,
+      unknown_reason: resolveRes.unknownReason,
+      request_id: resolveRequestId,
+      request_id_base: resolveRequestId,
+      adapter_trace_id: resolveRequestId,
+      attempt: 1,
+      schema_version: resolveRes.schemaVersion,
+      intent_version: resolveRes.intentVersion,
+      adapter_entry: true,
+    });
+  } catch (e: any) {
+    await send(chatId, errorText(`反馈解析失败：${String(e?.message || e)}`));
+    return true;
+  }
+
+  if (!resolveRes?.ok || resolveRes.intent !== "alert_feedback") {
+    await send(chatId, "请明确反馈（例如：告警太多/告警太少/只推高等级）。");
+    return true;
+  }
+
+  const handled = await handleAlertFeedbackIntent({
+    storageDir,
+    channel,
+    chatId,
+    userId,
+    isGroup,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    send,
+    rawText: stripped,
+    feedbackKind: resolveRes.params?.feedback_kind,
+    minPriority: resolveRes.params?.min_priority,
+  });
+  return handled;
+}
+
+export async function handleAlertFeedbackIntent(params: {
+  storageDir: string;
+  channel: string;
+  chatId: string;
+  userId: string;
+  isGroup: boolean;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  rawText: string;
+  feedbackKind?: string;
+  minPriority?: string;
+}): Promise<boolean> {
+  const {
+    storageDir,
+    channel,
+    chatId,
+    userId,
+    isGroup,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    send,
+    rawText,
+    feedbackKind,
+    minPriority,
+  } = params;
+
+  const authState = loadAuth(storageDir, ownerChatId, channel);
+  const isOwnerChat = chatId === ownerChatId;
+  const isOwnerUser = ownerUserId ? userId === ownerUserId : userId === ownerChatId;
+  const allowed =
+    allowlistMode === "owner_only"
+      ? (isGroup ? isOwnerUser : isOwnerChat)
+      : authState.allowed.includes(chatId) || isOwnerUser;
+  if (!allowed) {
+    await send(chatId, rejectText("无权限。请联系管理员加入允许列表；群聊请用 /feedback 触发。"));
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      kind: "alert_feedback_reject",
+      feedback: "not_allowed",
+      raw: rawText,
+      reason: "not_allowed",
+    });
+    return true;
+  }
+
+  const kind = typeof feedbackKind === "string" ? feedbackKind.trim().toLowerCase() : "";
+  const priority = typeof minPriority === "string" ? minPriority.trim().toUpperCase() : "";
+  const validPriority = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
+
+  if (priority) {
+    if (!validPriority.includes(priority)) {
+      await send(chatId, rejectText("等级无效/超出范围（仅支持 LOW/MEDIUM/HIGH/CRITICAL），未做调整。"));
       appendLedger(storageDir, {
         ts_utc: new Date().toISOString(),
         channel,
         chat_id: chatId,
         user_id: userId,
         kind: "alert_feedback_invalid",
-        raw: levelIntent.normalizedText,
+        raw: rawText,
         reason: "invalid_level",
       });
       return true;
     }
+
     let update: ReturnType<typeof updatePushPolicyMinPriority> | null = null;
     let error: string | null = null;
     try {
-      update = updatePushPolicyMinPriority(levelIntent.level, { updatedBy: `${channel}:${userId}` });
+      update = updatePushPolicyMinPriority(priority as any, { updatedBy: `${channel}:${userId}` });
     } catch (e: any) {
       error = String(e?.message || e);
       console.error("[feedback][WARN] level override failed:", error);
     }
 
     let reply = FEEDBACK_REPLY;
-    if (update) reply = buildLevelOverrideReply(levelIntent.level, update);
+    if (update) reply = buildLevelOverrideReply(priority as any, update);
     if (error || !update) {
-      reply = "已收到反馈，但当前未能更新策略，请稍后重试或联系管理员。";
+      reply = errorText("未能更新策略，请稍后重试或联系管理员。");
     }
     await send(chatId, reply);
 
@@ -138,7 +274,7 @@ export async function handleFeedbackIfAny(params: {
           chat_id: chatId,
           user_id: userId,
           kind: "set_level",
-          normalized_text: levelIntent.normalizedText,
+          normalized_text: rawText,
           updated: update.updated ?? false,
           policy_path: update.path,
           policy_version: update.policyVersion,
@@ -165,8 +301,8 @@ export async function handleFeedbackIfAny(params: {
       chat_id: chatId,
       user_id: userId,
       kind: "alert_feedback_level",
-      feedback: levelIntent.level,
-      raw: levelIntent.normalizedText,
+      feedback: priority,
+      raw: rawText,
       policy_path: update?.path,
       target_prev: update?.prevTarget,
       target_next: update?.nextTarget,
@@ -181,35 +317,24 @@ export async function handleFeedbackIfAny(params: {
     return true;
   }
 
-  if (!hit) return false;
-  if (!allowed) {
-    await send(chatId, "无权限。请联系管理员加入允许列表；群聊请用 /feedback 或 @bot 触发。");
-    appendLedger(storageDir, {
-      ts_utc: new Date().toISOString(),
-      channel,
-      chat_id: chatId,
-      user_id: userId,
-      kind: "alert_feedback_reject",
-      feedback: hit.kind,
-      raw: hit.normalizedText,
-      reason: "not_allowed",
-    });
+  if (kind !== "too_many" && kind !== "too_few") {
+    await send(chatId, "请明确反馈（例如：告警太多/告警太少/只推高等级）。");
     return true;
   }
 
   let update: ReturnType<typeof updatePushPolicyTargets> | null = null;
   let error: string | null = null;
   try {
-    update = updatePushPolicyTargets(hit.kind, { updatedBy: `${channel}:${userId}` });
+    update = updatePushPolicyTargets(kind as any, { updatedBy: `${channel}:${userId}` });
   } catch (e: any) {
     error = String(e?.message || e);
     console.error("[feedback][WARN] update failed:", error);
   }
 
   let reply = FEEDBACK_REPLY;
-  if (update) reply = buildFeedbackReply(hit.kind, update);
+  if (update) reply = buildFeedbackReply(kind as any, update);
   if (error || !update) {
-    reply = "已收到反馈，但当前未能更新策略，请稍后重试或联系管理员。";
+    reply = errorText("未能更新策略，请稍后重试或联系管理员。");
   }
   await send(chatId, reply);
 
@@ -221,8 +346,8 @@ export async function handleFeedbackIfAny(params: {
       chat_type: isGroup ? "group" : "private",
       chat_id: chatId,
       user_id: userId,
-      kind: hit.kind,
-      normalized_text: hit.normalizedText,
+      kind,
+      normalized_text: rawText,
       updated: update?.updated ?? false,
       cooldown_remaining_sec: update?.cooldownRemainingSec,
       policy_path: update?.path,
@@ -249,8 +374,8 @@ export async function handleFeedbackIfAny(params: {
     chat_id: chatId,
     user_id: userId,
     kind: "alert_feedback",
-    feedback: hit.kind,
-    raw: hit.normalizedText,
+    feedback: kind,
+    raw: rawText,
     policy_path: update?.path,
     target_prev: update?.prevTarget,
     target_next: update?.nextTarget,
@@ -269,17 +394,77 @@ export async function handleFeedbackIfAny(params: {
 
 function buildDashboardClarifyMessage(intent: ReturnType<typeof parseDashboardIntent>): string {
   if (!intent) return "请补充更具体的请求参数。";
-  if (intent.errors.includes("panel_id_not_allowed")) {
-    return `panel_id 无效。允许的 panel_id：${allowedPanelIds().join(", ")}`;
-  }
   const parts: string[] = [];
-  if (intent.missing.includes("window_spec_id")) parts.push("window_spec_id");
-  if (intent.missing.includes("symbol")) parts.push("symbol（如 BTCUSDT）");
+  if (intent.missing.includes("symbol")) parts.push("symbol");
   if (!parts.length) return "请补充更具体的请求参数。";
   return `请补充 ${parts.join("、")} 后重试。`;
 }
 
 type DashboardIntent = NonNullable<ReturnType<typeof parseDashboardIntent>>;
+type ResolvedIntentPayload = {
+  intent?: string;
+  params?: Record<string, any>;
+  confidence?: number;
+  reason?: string;
+  schemaVersion?: string;
+  intentVersion?: string;
+};
+
+function clampConfidence(value: unknown, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(0.99, n));
+}
+
+export function buildDashboardIntentFromResolve(opts: {
+  resolved: ResolvedIntentPayload;
+  rawQuery: string;
+  defaultWindowSpecId?: string;
+}): DashboardIntent | null {
+  const resolved = opts.resolved || {};
+  if (String(resolved.intent || "") !== "dashboard_export") return null;
+  const params = resolved.params && typeof resolved.params === "object" ? resolved.params : {};
+  const panelIdRaw = params.panel_id ?? params.panel ?? null;
+  const panelId = typeof panelIdRaw === "string" ? panelIdRaw.trim() : null;
+  const explicitWindowSpec = typeof params.window_spec_id === "string" ? params.window_spec_id.trim() : "";
+  const windowSpecId = explicitWindowSpec || String(opts.defaultWindowSpecId || "").trim() || null;
+  const windowSpecIdSource: "explicit" | "default" | "missing" =
+    explicitWindowSpec ? "explicit" : windowSpecId ? "default" : "missing";
+
+  const filters: Record<string, any> = {};
+  if (params.filters && typeof params.filters === "object") {
+    Object.assign(filters, params.filters);
+  }
+  if (typeof params.symbol === "string") filters.symbol = params.symbol.trim();
+  if (params.window_hours != null) filters.window_hours = params.window_hours;
+  if (params.window_minutes != null) filters.window_minutes = params.window_minutes;
+  if (typeof params.date_utc === "string") filters.date_utc = params.date_utc.trim();
+
+  const missing: string[] = [];
+  if (!panelId) missing.push("panel_id");
+
+  const confidence = clampConfidence(resolved.confidence, 0.75);
+  const schemaVersion = String(resolved.schemaVersion || "v1");
+  const intentVersion = String(resolved.intentVersion || "v1");
+
+  return {
+    intent: "dashboard_export",
+    params: {
+      panel_id: panelId,
+      window_spec_id: windowSpecId,
+      filters,
+      export_api_version: EXPORT_API_VERSION,
+    },
+    confidence,
+    schema_version: schemaVersion,
+    intent_version: intentVersion,
+    raw_query: String(opts.rawQuery || "").trim(),
+    missing,
+    errors: [],
+    explicit_panel_id: Boolean(panelId),
+    window_spec_id_source: windowSpecIdSource,
+  };
+}
 
 export async function dispatchDashboardExport(params: {
   storageDir: string;
@@ -368,7 +553,7 @@ export async function dispatchDashboardExport(params: {
     if (!gate.silent) {
       await sendText(
         chatId,
-        gate.res?.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放。",
+        gate.res?.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放。"),
       );
     }
     return true;
@@ -376,7 +561,7 @@ export async function dispatchDashboardExport(params: {
 
   const requestKey = messageId || replyToId;
   if (!requestKey) {
-    await sendText(chatId, "该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配");
+    await sendText(chatId, rejectText("该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),
       channel,
@@ -402,7 +587,7 @@ export async function dispatchDashboardExport(params: {
 
   const projectId = resolveProjectId(config);
   if (!projectId) {
-    await sendText(chatId, "未配置默认项目，无法生成导出。");
+    await sendText(chatId, rejectText("未配置默认项目，无法生成导出。"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),
       channel,
@@ -427,7 +612,7 @@ export async function dispatchDashboardExport(params: {
   }
 
   if (requestExpired) {
-    await sendText(chatId, "请求已过期，请重新发起导出。");
+    await sendText(chatId, rejectText("请求已过期，请重新发起导出。"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),
       channel,
@@ -479,8 +664,8 @@ export async function dispatchDashboardExport(params: {
     return true;
   }
 
-  if (!intent.params.panel_id || !intent.params.window_spec_id) {
-    await sendText(chatId, "参数不完整，无法生成导出。");
+  if (!intent.params.panel_id) {
+    await sendText(chatId, rejectText("参数不完整，无法生成导出。"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),
       channel,
@@ -528,7 +713,7 @@ export async function dispatchDashboardExport(params: {
 
   if (!result.ok) {
     const trace = result.traceId ? ` trace_id=${result.traceId}` : "";
-    await sendText(chatId, `导出失败：${result.error || "unknown"}${trace}`.trim());
+    await sendText(chatId, errorText(`导出失败：${result.error || "unknown"}${trace}`.trim()));
     const entry: any = {
       ts_utc: new Date().toISOString(),
       channel,
@@ -718,8 +903,6 @@ export async function handleChartIfAny(params: {
     const idx = lower.indexOf(commandToken);
     chartQuery = trimmed.slice(idx + commandToken.length).trim();
     usedCommand = true;
-  } else if (!isGroup) {
-    chartQuery = trimmed;
   } else {
     return false;
   }
@@ -732,18 +915,9 @@ export async function handleChartIfAny(params: {
     return false;
   }
 
-  const intents = detectChartIntents(chartQuery);
-  if (!intents.length) {
-    if (usedCommand) {
-      await sendTelegramText(chatId, "未识别图表类型。示例：/chart BTC factor timeline 24h");
-      return true;
-    }
-    return false;
-  }
-
   const requestKey = messageId || replyToId;
   if (!requestKey) {
-    await sendTelegramText(chatId, "该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配");
+    await sendTelegramText(chatId, rejectText("该平台缺 messageId 且无回复 parent_id，请用回复触发/升级适配"));
     appendLedger(storageDir, {
       ts_utc: new Date().toISOString(),
       channel,
@@ -757,7 +931,169 @@ export async function handleChartIfAny(params: {
     return true;
   }
 
-  const authState = loadAuth(storageDir, ownerChatId, "telegram");
+  const projectId = resolveProjectId(config);
+
+  if (!projectId) {
+    await sendTelegramText(chatId, rejectText("未配置默认项目，无法生成图表"));
+    return true;
+  }
+
+  const resolveRequestId = buildResolveRequestId(channel || "telegram", chatId, requestKey, "chart_resolve");
+  let resolveRes: any;
+  try {
+    resolveRes = await requestIntentResolve({
+      projectId,
+      requestId: resolveRequestId,
+      rawQuery: chartQuery,
+      replyText,
+      channel: "telegram",
+      chatId,
+      userId,
+    });
+    appendLedger(storageDir, {
+      ts_utc: new Date().toISOString(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      cmd: "intent_resolve",
+      raw: chartQuery,
+      intent: resolveRes.intent,
+      params: resolveRes.params,
+      confidence: resolveRes.confidence,
+      reason: resolveRes.reason,
+      unknown_reason: resolveRes.unknownReason,
+      request_id: resolveRequestId,
+      request_id_base: resolveRequestId,
+      adapter_trace_id: resolveRequestId,
+      attempt: 1,
+      schema_version: resolveRes.schemaVersion,
+      intent_version: resolveRes.intentVersion,
+      adapter_entry: true,
+    });
+  } catch (e: any) {
+    await sendTelegramText(chatId, errorText(`图表解析失败：${String(e?.message || e)}`));
+    return true;
+  }
+
+  if (!resolveRes?.ok) {
+    await sendTelegramText(chatId, errorText("图表解析失败，请稍后重试。"));
+    return true;
+  }
+
+  if (resolveRes.intent !== "chart_factor_timeline" && resolveRes.intent !== "chart_daily_activity") {
+    if (resolveRes.needClarify || resolveRes.intent === "unknown") {
+      await sendTelegramText(chatId, "未识别图表类型。示例：/chart BTC factor timeline 24h");
+      return true;
+    }
+    await sendTelegramText(chatId, "当前仅支持图表请求（timeline/activity）。");
+    return true;
+  }
+
+  return handleResolvedChartIntent({
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel: "telegram",
+    chatId,
+    messageId,
+    replyToId,
+    userId,
+    isGroup,
+    mentionsBot,
+    replyText,
+    sendText: sendTelegramText,
+    resolved: resolveRes,
+  });
+}
+
+export async function handleResolvedChartIntent(params: {
+  storageDir: string;
+  config: LoadedConfig;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
+  channel: "telegram" | "feishu";
+  chatId: string;
+  messageId: string;
+  replyToId: string;
+  userId: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  replyText: string;
+  sendText: (chatId: string, text: string) => Promise<void>;
+  resolved: any;
+}): Promise<boolean> {
+  const {
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel,
+    chatId,
+    messageId,
+    replyToId,
+    userId,
+    isGroup,
+    mentionsBot,
+    replyText,
+    sendText,
+    resolved,
+  } = params;
+
+  if (!resolved || (resolved.intent !== "chart_factor_timeline" && resolved.intent !== "chart_daily_activity")) {
+    return false;
+  }
+
+  const resolvedParams = resolved.params && typeof resolved.params === "object"
+    ? resolved.params
+    : {};
+  const symbolRaw = typeof resolvedParams.symbol === "string"
+    ? resolvedParams.symbol.trim()
+    : typeof resolvedParams.ticker === "string"
+      ? resolvedParams.ticker.trim()
+      : "";
+  const windowRaw = resolvedParams.window_hours ?? resolvedParams.hours ?? resolvedParams.window;
+  const parsedHours = Number(windowRaw);
+  const hours = Number.isFinite(parsedHours)
+    ? Math.max(1, Math.min(168, Math.floor(parsedHours)))
+    : 24;
+  let date = typeof resolvedParams.date_utc === "string"
+    ? resolvedParams.date_utc.trim()
+    : typeof resolvedParams.date === "string"
+      ? resolvedParams.date.trim()
+      : "";
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    date = "";
+  }
+  if (!date) {
+    date = formatUtcDate(new Date());
+  }
+
+  const intents: ChartIntent[] = [
+    resolved.intent === "chart_factor_timeline"
+      ? {
+          kind: "factor_timeline" as const,
+          symbol: symbolRaw.toUpperCase(),
+          hours,
+          caption: `${symbolRaw.toUpperCase()} factor timeline (${hours}h, UTC)`,
+        }
+      : {
+          kind: "daily_activity" as const,
+          date,
+          caption: `Daily Activity (UTC, ${date})`,
+        },
+  ];
+
+  const requestKey = messageId || replyToId;
+  if (!requestKey) {
+    await sendText(chatId, rejectText("请求缺少 messageId/parent_id，无法生成图表。"));
+    return true;
+  }
+
+  const authState = loadAuth(storageDir, ownerChatId, channel);
   const isOwnerChat = chatId === ownerChatId;
   const isOwnerUser = ownerUserId ? userId === ownerUserId : userId === ownerChatId;
   const allowed =
@@ -769,7 +1105,7 @@ export async function handleChartIfAny(params: {
   const projectId = resolveProjectId(config);
 
   if (!projectId) {
-    await sendTelegramText(chatId, "未配置默认项目，无法生成图表");
+    await sendText(chatId, rejectText("未配置默认项目，无法生成图表"));
     return true;
   }
 
@@ -802,29 +1138,34 @@ export async function handleChartIfAny(params: {
     const gate = checkAllowed(capability);
     if (!gate.allowed) {
       if (!gate.silent) {
-        await sendTelegramText(
+        await sendText(
           chatId,
-          gate.res?.deny_message || "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放。",
+          gate.res?.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放。"),
         );
       }
       return true;
     }
 
     if (intent.kind === "factor_timeline" && !intent.symbol) {
-      await sendTelegramText(chatId, "请指定币种（BTC/ETH/BTCUSDT）");
+      await sendText(chatId, "请指定币种（BTC/ETH/BTCUSDT）。");
       return true;
     }
 
     try {
       const reqId = buildChartRequestId(channel || "telegram", requestKey, chatId, intent);
-      const rendered = await renderChart(intent, { projectId, requestId: reqId });
+      const rendered = await renderChart(intent, {
+        projectId,
+        requestId: reqId,
+        channel,
+        chatId,
+      });
       if (!rendered.ok) {
         const trace = rendered.traceId ? ` trace_id=${rendered.traceId}` : "";
         throw new Error(`${rendered.error || "render_failed"}${trace}`.trim());
       }
-      await sendTelegramText(chatId, "已请求生成图表，稍后发送");
+      await sendText(chatId, "已请求生成图表，稍后发送。");
     } catch (e: any) {
-      await sendTelegramText(chatId, `图表生成失败：${String(e?.message || e)}`);
+      await sendText(chatId, errorText(`图表生成失败：${String(e?.message || e)}`));
       return true;
     }
   }

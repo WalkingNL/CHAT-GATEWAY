@@ -1,0 +1,12 @@
+version: "v1"
+
+templates:
+  error:
+    zh: "处理失败：{reason}"
+    en: "Failed to process: {reason}"
+  reject:
+    zh: "已拒绝：{reason}"
+    en: "Rejected: {reason}"
+  clarify:
+    zh: "需要澄清：{question}"
+    en: "Need clarification: {question}"
