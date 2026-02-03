@@ -179,6 +179,10 @@ export async function handleAlertLevelIntent(params: HandlerParams): Promise<boo
     adapterEntry,
   } = params;
 
+  if (isGroup) {
+    return false;
+  }
+
   const isSet = intent === "alert_level_set";
   const capability = isSet ? "alerts.strategy" : "alerts.query";
 
