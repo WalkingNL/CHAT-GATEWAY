@@ -32,6 +32,13 @@ type HandlerParams = {
 };
 
 const DEFAULT_LEVELS = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
+const PRIORITY_PUSH_BANDS: Record<string, { min: number; max: number; maxInclusive: boolean }> = {
+  LOW: { min: 80, max: 100, maxInclusive: true },
+  MEDIUM: { min: 60, max: 80, maxInclusive: false },
+  HIGH: { min: 40, max: 60, maxInclusive: false },
+  CRITICAL: { min: 0, max: 40, maxInclusive: false },
+};
+const BAND_EPSILON = 0.01;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -158,6 +165,36 @@ function formatPolicyStatus(state: PolicyState, agentCfg: any | null): string {
   return lines.join("\n");
 }
 
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function pickPushLevelForPriority(level: string, prev?: number | null): number {
+  const band = PRIORITY_PUSH_BANDS[level];
+  if (!band) return 50;
+  const min = band.min;
+  const max = band.maxInclusive ? band.max : band.max - BAND_EPSILON;
+  let next: number;
+  if (Number.isFinite(prev as number)) {
+    const v = Number(prev);
+    if (v < min) {
+      next = min;
+    } else if (v > max) {
+      next = max;
+    } else {
+      next = v;
+    }
+  } else {
+    next = (min + max) / 2;
+  }
+  next = round2(next);
+  if (!band.maxInclusive && next >= band.max) {
+    next = round2(band.max - BAND_EPSILON);
+  }
+  if (next < min) next = round2(min);
+  return next;
+}
+
 export async function handleAlertLevelIntent(params: HandlerParams): Promise<boolean> {
   const {
     storageDir,
@@ -272,10 +309,14 @@ export async function handleAlertLevelIntent(params: HandlerParams): Promise<boo
     return true;
   }
 
+  const stateBefore = loadPolicyState(policyPath);
+  const prevPushRaw = Number((stateBefore.control || {}).push_level);
+  const prevPush = Number.isFinite(prevPushRaw) ? prevPushRaw : null;
+  const nextPushLevel = pickPushLevelForPriority(nextLevel, prevPush);
   const res = applyStrategyUpdate({
     action: "set",
-    params: { min_priority: nextLevel },
-    raw: `intent:set_min_priority ${nextLevel}`,
+    params: { min_priority: nextLevel, push_level: nextPushLevel, sync_gates: 1 },
+    raw: `intent:set_min_priority ${nextLevel} push_level=${nextPushLevel} sync_gates=1`,
   });
 
   if (!res.ok) {
