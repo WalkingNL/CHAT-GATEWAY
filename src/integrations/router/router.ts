@@ -23,6 +23,7 @@ import { buildDashboardIntentFromResolve, dispatchDashboardExport, handleAlertFe
 import { isIntentEnabled } from "../runtime/capabilities.js";
 import { handleStrategyIfAny } from "../runtime/strategy.js";
 import { handleQueryIfAny } from "../runtime/query.js";
+import { handleAlertLevelIntent } from "../runtime/alert_level.js";
 import { handleCognitiveIfAny, handleCognitiveStatusUpdate } from "../runtime/cognitive.js";
 
 const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
@@ -1526,6 +1527,32 @@ export async function handleAdapterIntentIfAny(params: {
           rawText: resolveText || cleanedText,
           feedbackKind: resolveRes.params?.feedback_kind,
           minPriority: resolveRes.params?.min_priority,
+        });
+        if (handled) return true;
+      }
+
+      if (
+        resolveRes.ok &&
+        (resolveRes.intent === "alert_level_query" || resolveRes.intent === "alert_level_set")
+      ) {
+        const handled = await handleAlertLevelIntent({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+          mentionsBot,
+          send,
+          intent: resolveRes.intent,
+          minPriority: resolveRes.params?.min_priority,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+          adapterEntry: true,
         });
         if (handled) return true;
       }

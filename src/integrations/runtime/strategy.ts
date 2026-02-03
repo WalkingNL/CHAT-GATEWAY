@@ -27,7 +27,7 @@ type StrategyApplyResult = {
   derived_gates?: { min_priority: string; max_alerts_per_hour: number | null } | null;
 };
 
-type PolicyState = {
+export type PolicyState = {
   version?: number;
   updated_at_utc?: string;
   targets?: Record<string, any>;
@@ -42,7 +42,7 @@ const STRATEGY_PREFIXES = ["/strategy", "策略", "告警策略", "alert_strateg
 const PRIORITY_LEVELS = new Set(["LOW", "MEDIUM", "HIGH", "CRITICAL"]);
 const LOCK_TTL_SEC = Math.max(30, Number(process.env.STRATEGY_LOCK_TTL_SEC || "600"));
 
-function resolveRoot(): string {
+export function resolveRoot(): string {
   const root = String(process.env.CRYPTO_AGENT_ROOT || "").trim();
   if (root) return root;
   const cwd = process.cwd();
@@ -52,7 +52,7 @@ function resolveRoot(): string {
   return cwd;
 }
 
-function resolvePolicyStatePath(): string {
+export function resolvePolicyStatePath(): string {
   const root = resolveRoot();
   return path.join(root, "data/metrics/push_policy_state.json");
 }
@@ -128,7 +128,7 @@ function safeParseJson(input: string): any | null {
   }
 }
 
-function loadPolicyState(filePath: string): PolicyState {
+export function loadPolicyState(filePath: string): PolicyState {
   if (!fs.existsSync(filePath)) {
     return {
       version: 1,
@@ -281,7 +281,7 @@ function withFileLock<T>(lockPath: string, fn: () => T): { ok: true; value: T } 
   }
 }
 
-function applyStrategyUpdate(cmd: StrategyCommand): StrategyApplyResult {
+export function applyStrategyUpdate(cmd: StrategyCommand): StrategyApplyResult {
   const policyPath = resolvePolicyStatePath();
   const historyPath = resolveStrategyHistoryPath();
   const lockPath = resolveStrategyLockPath();
