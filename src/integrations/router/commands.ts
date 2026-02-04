@@ -5,6 +5,13 @@ export type Cmd =
   | { kind: "status" }
   | { kind: "signals"; minutes: number | null }
   | { kind: "help" }
+  | { kind: "news_hot"; limit: number | null }
+  | { kind: "news_refresh"; limit: number | null }
+  | { kind: "feeds_status" }
+  | { kind: "feeds_asset"; symbol: string }
+  | { kind: "feeds_source"; feedId: string }
+  | { kind: "feeds_hotspots"; limit: number | null }
+  | { kind: "feeds_ops"; limit: number | null }
   | { kind: "auth_add"; id: string }
   | { kind: "auth_del"; id: string }
   | { kind: "auth_list" }
@@ -26,6 +33,13 @@ function parseSignalWindow(raw: string): number | null {
   return unit === "h" ? n * 60 : n;
 }
 
+function parsePositiveInt(raw: string): number | null {
+  if (!raw) return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.floor(n);
+}
+
 export function parseCommand(text: string): Cmd {
   const t = (text || "").trim();
 
@@ -35,6 +49,30 @@ export function parseCommand(text: string): Cmd {
     return { kind: "signals", minutes: parseSignalWindow(rest) };
   }
   if (t === "/help") return { kind: "help" };
+
+  if (t.startsWith("/news_refresh")) {
+    const rest = parseAfterCommand(t, "/news_refresh");
+    return { kind: "news_refresh", limit: parsePositiveInt(rest) };
+  }
+  if (t.startsWith("/news")) {
+    const rest = parseAfterCommand(t, "/news");
+    const parts = rest.split(/\s+/).filter(Boolean);
+    if (parts[0] && parts[0].toLowerCase() === "refresh") {
+      return { kind: "news_refresh", limit: parsePositiveInt(parts.slice(1).join(" ")) };
+    }
+    return { kind: "news_hot", limit: parsePositiveInt(parts[0] || "") };
+  }
+
+  if (t.startsWith("/feeds")) {
+    const rest = parseAfterCommand(t, "/feeds");
+    const parts = rest.split(/\s+/).filter(Boolean);
+    const sub = (parts[0] || "status").toLowerCase();
+    if (sub === "status") return { kind: "feeds_status" };
+    if (sub === "asset") return { kind: "feeds_asset", symbol: parts[1] || "" };
+    if (sub === "source") return { kind: "feeds_source", feedId: parts[1] || "" };
+    if (sub === "hotspots") return { kind: "feeds_hotspots", limit: parsePositiveInt(parts[1] || "") };
+    if (sub === "ops") return { kind: "feeds_ops", limit: parsePositiveInt(parts[1] || "") };
+  }
 
   if (t.startsWith("/ask")) {
     const q = parseAfterCommand(t, "/ask");

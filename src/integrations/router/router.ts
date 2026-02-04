@@ -30,6 +30,10 @@ const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
 const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
 const NEWS_SUMMARY_DEFAULT_CHARS = 200;
 const NEWS_SUMMARY_MAX_CHARS = 1200;
+const NEWS_QUERY_DEFAULT_LIMIT = 5;
+const NEWS_QUERY_MAX_LIMIT = 20;
+const FEEDS_QUERY_DEFAULT_LIMIT = 5;
+const FEEDS_QUERY_MAX_LIMIT = 20;
 const NEWS_ALERT_MARKERS = ["📰 重要新闻监控触发", "重要新闻监控触发"];
 const NEWS_SUMMARY_KEYWORDS = ["摘要", "总结", "概括", "简要", "简述"];
 const NEWS_SUMMARY_RESULT_CACHE_TTL_SEC = Number(
@@ -196,6 +200,12 @@ function resolveSummaryLength(text: string): number {
   return safe;
 }
 
+function clampLimit(raw: any, fallback: number, max: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(Math.floor(n), max);
+}
+
 type NewsItem = {
   title: string;
   published?: string;
@@ -280,6 +290,35 @@ function resolveProjectId(config?: LoadedConfig): string | null {
   return ids.length ? ids[0] : null;
 }
 
+function isAllowedChat(params: {
+  storageDir: string;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId?: string;
+  channel: string;
+  chatId: string;
+  userId: string;
+  isGroup: boolean;
+}): boolean {
+  const {
+    storageDir,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel,
+    chatId,
+    userId,
+    isGroup,
+  } = params;
+  const authState = loadAuth(storageDir, ownerChatId, channel);
+  const resolvedOwnerUserId = String(ownerUserId || "");
+  const isOwnerChat = chatId === ownerChatId;
+  const isOwnerUser = resolvedOwnerUserId ? userId === resolvedOwnerUserId : userId === ownerChatId;
+  return allowlistMode === "owner_only"
+    ? (isGroup ? isOwnerUser : isOwnerChat)
+    : authState.allowed.includes(chatId) || isOwnerUser;
+}
+
 function stripFeedbackPrefix(rawText: string): { text: string; used: boolean } {
   const raw = String(rawText || "");
   const trimmed = raw.trim();
@@ -343,6 +382,10 @@ function resolveOnDemandConfigForNews(config?: LoadedConfig): OnDemandConfig {
 
   if (!token) throw new Error("missing on-demand token");
   return { url, token, projectId };
+}
+
+function resolveOnDemandConfigForFeeds(config?: LoadedConfig): OnDemandConfig {
+  return resolveOnDemandConfigForNews(config);
 }
 
 async function postOnDemandJson(url: string, token: string, body: any, timeoutMs: number): Promise<any> {
@@ -963,6 +1006,542 @@ async function runNewsSummary(params: {
   appendLedger(storageDir, entry);
 }
 
+type NewsQueryKind = "news_hot" | "news_refresh";
+
+function formatNewsItems(items: any[]): string[] {
+  const lines: string[] = [];
+  items.forEach((raw, idx) => {
+    const title = String(raw?.title || raw?.name || "").trim() || "（无标题）";
+    const source = String(raw?.source || raw?.publisher || "").trim();
+    const published = String(raw?.published_at || raw?.published || raw?.publishedAt || "").trim();
+    const url = String(raw?.url || raw?.link || "").trim();
+    lines.push(`${idx + 1}. ${title}`);
+    const meta = [source, published].filter(Boolean).join(" | ");
+    if (meta) lines.push(`   ${meta}`);
+    if (url) lines.push(`   ${url}`);
+  });
+  return lines;
+}
+
+function formatNewsQueryResponse(res: any): string {
+  const mode = String(res?.mode || "cached");
+  const items = Array.isArray(res?.items) ? res.items : [];
+  const lines: string[] = [`新闻热点（mode=${mode}）`];
+  if (res?.cooldown_until) lines.push(`冷却至：${res.cooldown_until}`);
+  if (res?.last_ts_utc) lines.push(`最近刷新：${res.last_ts_utc}`);
+  if (res?.source_count != null) lines.push(`来源数：${res.source_count}`);
+  if (!items.length) {
+    lines.push("暂无新闻。");
+    return lines.join("\n");
+  }
+  lines.push(...formatNewsItems(items));
+  return lines.join("\n");
+}
+
+async function runNewsQuery(params: {
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  channel: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  config?: LoadedConfig;
+  kind: NewsQueryKind;
+  limit?: number | null;
+  adapterEntry?: boolean;
+  requestId?: string;
+  requestIdBase?: string;
+  attempt?: number;
+}) {
+  const {
+    storageDir,
+    chatId,
+    userId,
+    channel,
+    send,
+    config,
+    kind,
+    limit,
+    adapterEntry,
+  } = params;
+  const t0 = Date.now();
+  const requestIdBase = params.requestIdBase || sanitizeRequestId([channel, chatId, kind, Date.now()].join(":"));
+  const attempt = params.attempt && params.attempt > 0 ? params.attempt : 1;
+  const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
+  const requestLimit = clampLimit(limit, NEWS_QUERY_DEFAULT_LIMIT, NEWS_QUERY_MAX_LIMIT);
+  let ok = false;
+  let errCode = "";
+  let latencyMs = 0;
+  let output = "";
+  try {
+    const cfg = resolveOnDemandConfigForNews(config);
+    const timeoutMs = Number(process.env.CHAT_GATEWAY_NEWS_QUERY_TIMEOUT_MS || "8000");
+    const payload: any = {
+      request_id: requestId,
+      schema_version: INTENT_SCHEMA_VERSION,
+      intent_version: INTENT_VERSION,
+      limit: requestLimit,
+    };
+    if (cfg.projectId) payload.target = { project_id: cfg.projectId };
+    const endpoint = kind === "news_refresh" ? "/v1/news/refresh" : "/v1/news/hot";
+    const res = await postOnDemandJson(`${cfg.url}${endpoint}`, cfg.token, payload, timeoutMs);
+    if (!res?.ok) {
+      throw new Error(res?.error || "news_query_failed");
+    }
+    output = formatNewsQueryResponse(res);
+    ok = true;
+  } catch (e: any) {
+    errCode = String(e?.message || e);
+    output = errorText(`新闻查询失败：${errCode}`);
+  } finally {
+    latencyMs = Date.now() - t0;
+  }
+
+  await send(chatId, output);
+  const entry: any = {
+    ts_utc: nowIso(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    cmd: kind,
+    request_id: requestId,
+    request_id_base: requestIdBase,
+    adapter_trace_id: requestIdBase,
+    attempt,
+    schema_version: INTENT_SCHEMA_VERSION,
+    intent_version: INTENT_VERSION,
+    ok,
+    err: ok ? undefined : errCode || "unknown",
+    latency_ms: latencyMs,
+    limit: requestLimit,
+  };
+  if (adapterEntry) entry.adapter_entry = true;
+  appendLedger(storageDir, entry);
+}
+
+function formatFeedSummary(summary: any): string {
+  const feeds = summary && typeof summary === "object" ? summary.feeds || {} : {};
+  const feedIds = Object.keys(feeds || {}).sort();
+  const headerParts: string[] = [];
+  if (summary?.health_date) headerParts.push(`health=${summary.health_date}`);
+  if (summary?.budget_date) headerParts.push(`budget=${summary.budget_date}`);
+  const header = headerParts.length ? `数据源状态（${headerParts.join(", ")}）` : "数据源状态";
+  if (!feedIds.length) return `${header}\n暂无数据。`;
+  const maxLines = 20;
+  const lines: string[] = [header];
+  feedIds.slice(0, maxLines).forEach(feedId => {
+    const info = feeds[feedId] || {};
+    const total = info.symbols_total != null ? String(info.symbols_total) : "-";
+    const ok = info.symbols_ok != null ? String(info.symbols_ok) : "-";
+    const partial = info.symbols_partial != null ? String(info.symbols_partial) : "0";
+    const budgetHit = `${info.budget_hit_hour ? "H" : ""}${info.budget_hit_day ? "D" : ""}`;
+    const req = info.requests != null ? String(info.requests) : "";
+    const succ = info.success != null ? String(info.success) : "";
+    const fail = info.fail != null ? String(info.fail) : "";
+    const parts: string[] = [];
+    if (total !== "-") parts.push(`ok ${ok}/${total}`);
+    if (partial !== "0") parts.push(`partial ${partial}`);
+    if (budgetHit) parts.push(`budget=${budgetHit}`);
+    if (req || succ || fail) parts.push(`req ${req || "-"} / ok ${succ || "-"} / fail ${fail || "-"}`);
+    lines.push(`- ${feedId}: ${parts.join(", ") || "no data"}`);
+  });
+  if (feedIds.length > maxLines) lines.push(`… 其余 ${feedIds.length - maxLines} 个数据源已省略`);
+  return lines.join("\n");
+}
+
+function formatAssetStatus(result: any): string {
+  const symbol = String(result?.symbol || "").trim();
+  const feeds = result && typeof result === "object" ? result.feeds || {} : {};
+  const feedIds = Object.keys(feeds || {}).sort();
+  const lines: string[] = [`数据源资产状态：${symbol || "未知"}`];
+  if (!feedIds.length) {
+    lines.push("暂无覆盖记录。");
+    return lines.join("\n");
+  }
+  feedIds.forEach(feedId => {
+    const info = feeds[feedId] || {};
+    const parts: string[] = [];
+    if (info.coverage) parts.push(`coverage=${info.coverage}`);
+    if (info.ok != null) parts.push(`ok=${Boolean(info.ok)}`);
+    if (info.latency_sec != null) parts.push(`latency=${info.latency_sec}s`);
+    if (info.coverage_reason) parts.push(`reason=${info.coverage_reason}`);
+    const budget = info.budget || {};
+    const hit = `${budget.budget_hit_hour ? "H" : ""}${budget.budget_hit_day ? "D" : ""}`;
+    if (hit) parts.push(`budget=${hit}`);
+    if (budget.requests != null || budget.success != null || budget.fail != null) {
+      parts.push(`req ${budget.requests ?? "-"} / ok ${budget.success ?? "-"} / fail ${budget.fail ?? "-"}`);
+    }
+    lines.push(`- ${feedId}: ${parts.join(", ") || "no data"}`);
+  });
+  return lines.join("\n");
+}
+
+function formatSourceStatus(result: any): string {
+  const feedId = String(result?.feed_id || "").trim();
+  const health = result?.health || {};
+  const budget = result?.budget || {};
+  const symbols = health?.symbols && typeof health.symbols === "object" ? health.symbols : {};
+  const symbolIds = Object.keys(symbols || {});
+  let ok = 0;
+  let partial = 0;
+  symbolIds.forEach(sym => {
+    const s = symbols[sym];
+    if (!s || typeof s !== "object") return;
+    if (s.coverage === "partial") partial += 1;
+    if (s.ok) ok += 1;
+  });
+  const lines: string[] = [`数据源状态：${feedId || "未知"}`];
+  if (symbolIds.length) {
+    lines.push(`symbols：ok ${ok}/${symbolIds.length}，partial ${partial}`);
+  }
+  if (budget && typeof budget === "object") {
+    const hit = `${budget.budget_hit_hour ? "H" : ""}${budget.budget_hit_day ? "D" : ""}`;
+    if (hit) lines.push(`budget：${hit} 命中`);
+    if (budget.requests != null || budget.success != null || budget.fail != null) {
+      lines.push(`requests：${budget.requests ?? "-"} / ok ${budget.success ?? "-"} / fail ${budget.fail ?? "-"}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatFeedHotspots(hotspots: any[]): string {
+  if (!hotspots.length) return "数据源异常：暂无异常。";
+  const lines: string[] = [`数据源异常列表（Top ${hotspots.length}）:`];
+  hotspots.forEach(item => {
+    const kind = String(item?.kind || "");
+    const feedId = String(item?.feed_id || "");
+    if (kind === "coverage") {
+      const symbol = String(item?.symbol || "");
+      const coverage = item?.coverage ? String(item.coverage) : "unknown";
+      const reason = item?.reason ? String(item.reason) : "";
+      const latency = item?.latency_sec != null ? `${item.latency_sec}s` : "";
+      const parts = [coverage, reason, latency].filter(Boolean).join(", ");
+      lines.push(`- 覆盖异常：${feedId} ${symbol}${parts ? `（${parts}）` : ""}`);
+    } else if (kind === "budget") {
+      const hit = `${item?.budget_hit_hour ? "H" : ""}${item?.budget_hit_day ? "D" : ""}` || "budget";
+      const req = item?.requests != null ? `requests=${item.requests}` : "";
+      lines.push(`- 预算命中：${feedId}（${hit}）${req ? ` ${req}` : ""}`);
+    } else {
+      lines.push(`- ${kind || "unknown"}: ${feedId}`);
+    }
+  });
+  return lines.join("\n");
+}
+
+async function runDataFeedsStatus(params: {
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  channel: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  config?: LoadedConfig;
+  adapterEntry?: boolean;
+  requestId?: string;
+  requestIdBase?: string;
+  attempt?: number;
+}) {
+  const { storageDir, chatId, userId, channel, send, config, adapterEntry } = params;
+  const t0 = Date.now();
+  const requestIdBase = params.requestIdBase || sanitizeRequestId([channel, chatId, "feeds_status", Date.now()].join(":"));
+  const attempt = params.attempt && params.attempt > 0 ? params.attempt : 1;
+  const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
+  let ok = false;
+  let errCode = "";
+  let latencyMs = 0;
+  let output = "";
+  try {
+    const cfg = resolveOnDemandConfigForFeeds(config);
+    const timeoutMs = Number(process.env.CHAT_GATEWAY_FEEDS_QUERY_TIMEOUT_MS || "8000");
+    const payload: any = { request_id: requestId, schema_version: INTENT_SCHEMA_VERSION, intent_version: INTENT_VERSION };
+    const res = await postOnDemandJson(`${cfg.url}/v1/data_feeds/status`, cfg.token, payload, timeoutMs);
+    if (!res?.ok) throw new Error(res?.error || "feeds_status_failed");
+    output = formatFeedSummary(res.summary || {});
+    ok = true;
+  } catch (e: any) {
+    errCode = String(e?.message || e);
+    output = errorText(`数据源状态获取失败：${errCode}`);
+  } finally {
+    latencyMs = Date.now() - t0;
+  }
+  await send(chatId, output);
+  const entry: any = {
+    ts_utc: nowIso(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    cmd: "data_feeds_status",
+    request_id: requestId,
+    request_id_base: requestIdBase,
+    adapter_trace_id: requestIdBase,
+    attempt,
+    schema_version: INTENT_SCHEMA_VERSION,
+    intent_version: INTENT_VERSION,
+    ok,
+    err: ok ? undefined : errCode || "unknown",
+    latency_ms: latencyMs,
+  };
+  if (adapterEntry) entry.adapter_entry = true;
+  appendLedger(storageDir, entry);
+}
+
+async function runDataFeedsAssetStatus(params: {
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  channel: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  config?: LoadedConfig;
+  symbol: string;
+  adapterEntry?: boolean;
+  requestId?: string;
+  requestIdBase?: string;
+  attempt?: number;
+}) {
+  const { storageDir, chatId, userId, channel, send, config, symbol, adapterEntry } = params;
+  const t0 = Date.now();
+  const requestIdBase = params.requestIdBase || sanitizeRequestId([channel, chatId, "feeds_asset", Date.now()].join(":"));
+  const attempt = params.attempt && params.attempt > 0 ? params.attempt : 1;
+  const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
+  let ok = false;
+  let errCode = "";
+  let latencyMs = 0;
+  let output = "";
+  try {
+    const cfg = resolveOnDemandConfigForFeeds(config);
+    const timeoutMs = Number(process.env.CHAT_GATEWAY_FEEDS_QUERY_TIMEOUT_MS || "8000");
+    const payload: any = {
+      request_id: requestId,
+      schema_version: INTENT_SCHEMA_VERSION,
+      intent_version: INTENT_VERSION,
+      symbol,
+    };
+    const res = await postOnDemandJson(`${cfg.url}/v1/data_feeds/asset_status`, cfg.token, payload, timeoutMs);
+    if (!res?.ok) throw new Error(res?.error || "feeds_asset_status_failed");
+    output = formatAssetStatus(res.result || {});
+    ok = true;
+  } catch (e: any) {
+    errCode = String(e?.message || e);
+    output = errorText(`数据源资产状态获取失败：${errCode}`);
+  } finally {
+    latencyMs = Date.now() - t0;
+  }
+  await send(chatId, output);
+  const entry: any = {
+    ts_utc: nowIso(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    cmd: "data_feeds_asset_status",
+    request_id: requestId,
+    request_id_base: requestIdBase,
+    adapter_trace_id: requestIdBase,
+    attempt,
+    schema_version: INTENT_SCHEMA_VERSION,
+    intent_version: INTENT_VERSION,
+    ok,
+    err: ok ? undefined : errCode || "unknown",
+    latency_ms: latencyMs,
+    symbol,
+  };
+  if (adapterEntry) entry.adapter_entry = true;
+  appendLedger(storageDir, entry);
+}
+
+async function runDataFeedsSourceStatus(params: {
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  channel: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  config?: LoadedConfig;
+  feedId: string;
+  adapterEntry?: boolean;
+  requestId?: string;
+  requestIdBase?: string;
+  attempt?: number;
+}) {
+  const { storageDir, chatId, userId, channel, send, config, feedId, adapterEntry } = params;
+  const t0 = Date.now();
+  const requestIdBase = params.requestIdBase || sanitizeRequestId([channel, chatId, "feeds_source", Date.now()].join(":"));
+  const attempt = params.attempt && params.attempt > 0 ? params.attempt : 1;
+  const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
+  let ok = false;
+  let errCode = "";
+  let latencyMs = 0;
+  let output = "";
+  try {
+    const cfg = resolveOnDemandConfigForFeeds(config);
+    const timeoutMs = Number(process.env.CHAT_GATEWAY_FEEDS_QUERY_TIMEOUT_MS || "8000");
+    const payload: any = {
+      request_id: requestId,
+      schema_version: INTENT_SCHEMA_VERSION,
+      intent_version: INTENT_VERSION,
+      feed_id: feedId,
+    };
+    const res = await postOnDemandJson(`${cfg.url}/v1/data_feeds/source_status`, cfg.token, payload, timeoutMs);
+    if (!res?.ok) throw new Error(res?.error || "feeds_source_status_failed");
+    output = formatSourceStatus(res.result || {});
+    ok = true;
+  } catch (e: any) {
+    errCode = String(e?.message || e);
+    output = errorText(`数据源状态获取失败：${errCode}`);
+  } finally {
+    latencyMs = Date.now() - t0;
+  }
+  await send(chatId, output);
+  const entry: any = {
+    ts_utc: nowIso(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    cmd: "data_feeds_source_status",
+    request_id: requestId,
+    request_id_base: requestIdBase,
+    adapter_trace_id: requestIdBase,
+    attempt,
+    schema_version: INTENT_SCHEMA_VERSION,
+    intent_version: INTENT_VERSION,
+    ok,
+    err: ok ? undefined : errCode || "unknown",
+    latency_ms: latencyMs,
+    feed_id: feedId,
+  };
+  if (adapterEntry) entry.adapter_entry = true;
+  appendLedger(storageDir, entry);
+}
+
+async function runDataFeedsHotspots(params: {
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  channel: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  config?: LoadedConfig;
+  limit?: number | null;
+  adapterEntry?: boolean;
+  requestId?: string;
+  requestIdBase?: string;
+  attempt?: number;
+}) {
+  const { storageDir, chatId, userId, channel, send, config, limit, adapterEntry } = params;
+  const t0 = Date.now();
+  const requestIdBase = params.requestIdBase || sanitizeRequestId([channel, chatId, "feeds_hotspots", Date.now()].join(":"));
+  const attempt = params.attempt && params.attempt > 0 ? params.attempt : 1;
+  const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
+  const requestLimit = clampLimit(limit, FEEDS_QUERY_DEFAULT_LIMIT, FEEDS_QUERY_MAX_LIMIT);
+  let ok = false;
+  let errCode = "";
+  let latencyMs = 0;
+  let output = "";
+  try {
+    const cfg = resolveOnDemandConfigForFeeds(config);
+    const timeoutMs = Number(process.env.CHAT_GATEWAY_FEEDS_QUERY_TIMEOUT_MS || "8000");
+    const payload: any = {
+      request_id: requestId,
+      schema_version: INTENT_SCHEMA_VERSION,
+      intent_version: INTENT_VERSION,
+      limit: requestLimit,
+    };
+    const res = await postOnDemandJson(`${cfg.url}/v1/data_feeds/hotspots`, cfg.token, payload, timeoutMs);
+    if (!res?.ok) throw new Error(res?.error || "feeds_hotspots_failed");
+    output = formatFeedHotspots(Array.isArray(res.hotspots) ? res.hotspots : []);
+    ok = true;
+  } catch (e: any) {
+    errCode = String(e?.message || e);
+    output = errorText(`数据源异常列表获取失败：${errCode}`);
+  } finally {
+    latencyMs = Date.now() - t0;
+  }
+  await send(chatId, output);
+  const entry: any = {
+    ts_utc: nowIso(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    cmd: "data_feeds_hotspots",
+    request_id: requestId,
+    request_id_base: requestIdBase,
+    adapter_trace_id: requestIdBase,
+    attempt,
+    schema_version: INTENT_SCHEMA_VERSION,
+    intent_version: INTENT_VERSION,
+    ok,
+    err: ok ? undefined : errCode || "unknown",
+    latency_ms: latencyMs,
+    limit: requestLimit,
+  };
+  if (adapterEntry) entry.adapter_entry = true;
+  appendLedger(storageDir, entry);
+}
+
+async function runDataFeedsOpsSummary(params: {
+  storageDir: string;
+  chatId: string;
+  userId: string;
+  channel: string;
+  send: (chatId: string, text: string) => Promise<void>;
+  config?: LoadedConfig;
+  limit?: number | null;
+  adapterEntry?: boolean;
+  requestId?: string;
+  requestIdBase?: string;
+  attempt?: number;
+}) {
+  const { storageDir, chatId, userId, channel, send, config, limit, adapterEntry } = params;
+  const t0 = Date.now();
+  const requestIdBase = params.requestIdBase || sanitizeRequestId([channel, chatId, "feeds_ops", Date.now()].join(":"));
+  const attempt = params.attempt && params.attempt > 0 ? params.attempt : 1;
+  const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
+  const requestLimit = clampLimit(limit, FEEDS_QUERY_DEFAULT_LIMIT, FEEDS_QUERY_MAX_LIMIT);
+  let ok = false;
+  let errCode = "";
+  let latencyMs = 0;
+  let output = "";
+  try {
+    const cfg = resolveOnDemandConfigForFeeds(config);
+    const timeoutMs = Number(process.env.CHAT_GATEWAY_FEEDS_QUERY_TIMEOUT_MS || "8000");
+    const payload: any = {
+      request_id: requestId,
+      schema_version: INTENT_SCHEMA_VERSION,
+      intent_version: INTENT_VERSION,
+      limit: requestLimit,
+    };
+    const res = await postOnDemandJson(`${cfg.url}/v1/data_feeds/ops_summary`, cfg.token, payload, timeoutMs);
+    if (!res?.ok) throw new Error(res?.error || "feeds_ops_summary_failed");
+    const summary = String(res?.summary || "").trim();
+    if (summary) {
+      output = summary;
+    } else {
+      output = formatFeedHotspots(Array.isArray(res.hotspots) ? res.hotspots : []);
+    }
+    ok = true;
+  } catch (e: any) {
+    errCode = String(e?.message || e);
+    output = errorText(`数据源运维摘要获取失败：${errCode}`);
+  } finally {
+    latencyMs = Date.now() - t0;
+  }
+  await send(chatId, output);
+  const entry: any = {
+    ts_utc: nowIso(),
+    channel,
+    chat_id: chatId,
+    user_id: userId,
+    cmd: "data_feeds_ops_summary",
+    request_id: requestId,
+    request_id_base: requestIdBase,
+    adapter_trace_id: requestIdBase,
+    attempt,
+    schema_version: INTENT_SCHEMA_VERSION,
+    intent_version: INTENT_VERSION,
+    ok,
+    err: ok ? undefined : errCode || "unknown",
+    latency_ms: latencyMs,
+    limit: requestLimit,
+  };
+  if (adapterEntry) entry.adapter_entry = true;
+  appendLedger(storageDir, entry);
+}
+
 async function handleAlertExplainIntent(params: {
   storageDir: string;
   config: LoadedConfig | undefined;
@@ -1555,6 +2134,262 @@ export async function handleAdapterIntentIfAny(params: {
           adapterEntry: true,
         });
         if (handled) return true;
+      }
+
+      if (resolveRes.ok && resolveRes.intent === "data_feeds_status") {
+        if (isGroup) return false;
+        if (!isIntentEnabled("data_feeds_status")) {
+          await send(chatId, rejectText("未开放数据源查询能力。"));
+          return true;
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return true;
+        }
+        await runDataFeedsStatus({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return true;
+      }
+
+      if (resolveRes.ok && resolveRes.intent === "data_feeds_asset_status") {
+        if (isGroup) return false;
+        if (!isIntentEnabled("data_feeds_asset_status")) {
+          await send(chatId, rejectText("未开放数据源查询能力。"));
+          return true;
+        }
+        const symbol = String(resolveRes.params?.symbol || "").trim();
+        if (!symbol || resolveRes.needClarify) {
+          await send(chatId, "请指定资产（例如：ETHUSDT）。");
+          return true;
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return true;
+        }
+        await runDataFeedsAssetStatus({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          symbol,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return true;
+      }
+
+      if (resolveRes.ok && resolveRes.intent === "data_feeds_source_status") {
+        if (isGroup) return false;
+        if (!isIntentEnabled("data_feeds_source_status")) {
+          await send(chatId, rejectText("未开放数据源查询能力。"));
+          return true;
+        }
+        const feedId = String(resolveRes.params?.feed_id || "").trim();
+        if (!feedId || resolveRes.needClarify) {
+          await send(chatId, "请指定 feed_id（例如：ohlcv_1m）。");
+          return true;
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return true;
+        }
+        await runDataFeedsSourceStatus({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          feedId,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return true;
+      }
+
+      if (resolveRes.ok && resolveRes.intent === "data_feeds_hotspots") {
+        if (isGroup) return false;
+        if (!isIntentEnabled("data_feeds_hotspots")) {
+          await send(chatId, rejectText("未开放数据源查询能力。"));
+          return true;
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return true;
+        }
+        await runDataFeedsHotspots({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          limit: resolveRes.params?.limit,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return true;
+      }
+
+      if (resolveRes.ok && resolveRes.intent === "data_feeds_ops_summary") {
+        if (isGroup) return false;
+        if (!isIntentEnabled("data_feeds_ops_summary")) {
+          await send(chatId, rejectText("未开放数据源查询能力。"));
+          return true;
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return true;
+        }
+        await runDataFeedsOpsSummary({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          limit: resolveRes.params?.limit,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return true;
+      }
+
+      if (resolveRes.ok && resolveRes.intent === "news_hot") {
+        if (isGroup) return false;
+        if (!isIntentEnabled("news_hot")) {
+          await send(chatId, rejectText("未开放新闻查询能力。"));
+          return true;
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return true;
+        }
+        await runNewsQuery({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          kind: "news_hot",
+          limit: resolveRes.params?.limit,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return true;
+      }
+
+      if (resolveRes.ok && resolveRes.intent === "news_refresh") {
+        if (isGroup) return false;
+        if (!isIntentEnabled("news_refresh")) {
+          await send(chatId, rejectText("未开放新闻查询能力。"));
+          return true;
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return true;
+        }
+        await runNewsQuery({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          kind: "news_refresh",
+          limit: resolveRes.params?.limit,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return true;
       }
 
       if (resolveRes.ok && resolveRes.intent === "news_summary") {
@@ -2364,6 +3199,13 @@ async function handleParsedCommand(params: {
       "/help",
       "/status",
       "/signals [N]m|[N]h",
+      "/news [N]",
+      "/news refresh [N]",
+      "/feeds status",
+      "/feeds asset <SYMBOL>",
+      "/feeds source <feed_id>",
+      "/feeds hotspots [N]",
+      "/feeds ops [N]",
       "/ask <q>",
       "/analyze <incident description>",
       "/suggest <incident description>",
@@ -2374,6 +3216,129 @@ async function handleParsedCommand(params: {
     ].join("\n");
     await send(chatId, out);
     appendLedger(storageDir, { ...baseAudit, cmd: "help" });
+    return;
+
+  } else if (cmd.kind === "news_hot") {
+    if (!isIntentEnabled("news_hot")) {
+      await send(chatId, rejectText("未开放新闻查询能力。"));
+      return;
+    }
+    await runNewsQuery({
+      storageDir,
+      chatId,
+      userId,
+      channel,
+      send,
+      config,
+      kind: "news_hot",
+      limit: cmd.limit,
+    });
+    return;
+
+  } else if (cmd.kind === "news_refresh") {
+    if (!isIntentEnabled("news_refresh")) {
+      await send(chatId, rejectText("未开放新闻查询能力。"));
+      return;
+    }
+    await runNewsQuery({
+      storageDir,
+      chatId,
+      userId,
+      channel,
+      send,
+      config,
+      kind: "news_refresh",
+      limit: cmd.limit,
+    });
+    return;
+
+  } else if (cmd.kind === "feeds_status") {
+    if (!isIntentEnabled("data_feeds_status")) {
+      await send(chatId, rejectText("未开放数据源查询能力。"));
+      return;
+    }
+    await runDataFeedsStatus({
+      storageDir,
+      chatId,
+      userId,
+      channel,
+      send,
+      config,
+    });
+    return;
+
+  } else if (cmd.kind === "feeds_asset") {
+    if (!isIntentEnabled("data_feeds_asset_status")) {
+      await send(chatId, rejectText("未开放数据源查询能力。"));
+      return;
+    }
+    const symbol = String(cmd.symbol || "").trim();
+    if (!symbol) {
+      await send(chatId, "Usage: /feeds asset <SYMBOL>");
+      return;
+    }
+    await runDataFeedsAssetStatus({
+      storageDir,
+      chatId,
+      userId,
+      channel,
+      send,
+      config,
+      symbol,
+    });
+    return;
+
+  } else if (cmd.kind === "feeds_source") {
+    if (!isIntentEnabled("data_feeds_source_status")) {
+      await send(chatId, rejectText("未开放数据源查询能力。"));
+      return;
+    }
+    const feedId = String(cmd.feedId || "").trim();
+    if (!feedId) {
+      await send(chatId, "Usage: /feeds source <feed_id>");
+      return;
+    }
+    await runDataFeedsSourceStatus({
+      storageDir,
+      chatId,
+      userId,
+      channel,
+      send,
+      config,
+      feedId,
+    });
+    return;
+
+  } else if (cmd.kind === "feeds_hotspots") {
+    if (!isIntentEnabled("data_feeds_hotspots")) {
+      await send(chatId, rejectText("未开放数据源查询能力。"));
+      return;
+    }
+    await runDataFeedsHotspots({
+      storageDir,
+      chatId,
+      userId,
+      channel,
+      send,
+      config,
+      limit: cmd.limit,
+    });
+    return;
+
+  } else if (cmd.kind === "feeds_ops") {
+    if (!isIntentEnabled("data_feeds_ops_summary")) {
+      await send(chatId, rejectText("未开放数据源查询能力。"));
+      return;
+    }
+    await runDataFeedsOpsSummary({
+      storageDir,
+      chatId,
+      userId,
+      channel,
+      send,
+      config,
+      limit: cmd.limit,
+    });
     return;
 
   } else if (cmd.kind === "signals") {
