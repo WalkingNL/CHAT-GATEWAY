@@ -1737,12 +1737,23 @@ export async function handleAdapterIntentIfAny(params: {
       ? trimmedText.replace(mentionPattern, "").trim()
       : trimmedText;
 
-  const explicitRetry = wantsRetry(cleanedText);
+  const intentCommand = /^\/i\b/i.test(cleanedText);
+  const intentCommandText = intentCommand
+    ? cleanedText.replace(/^\/i\b/i, "").trim()
+    : "";
+  const intentRawText = intentCommand ? intentCommandText : cleanedText;
+  if (intentCommand && !intentRawText) {
+    await send(chatId, "用法：/i <你的问题>");
+    return true;
+  }
+
+  const explicitRetry = wantsRetry(intentRawText);
   const isPrivate = !isGroup;
-  const summaryRequested = wantsNewsSummary(cleanedText);
+  const summaryRequested = wantsNewsSummary(intentRawText);
 
   const strategyRequested = /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i.test(cleanedText);
-  if (strategyRequested && isIntentEnabled("alert_strategy")) {
+  const strategyCommandOk = !isGroup || /^\/strategy\b/i.test(cleanedText);
+  if (strategyRequested && strategyCommandOk && isIntentEnabled("alert_strategy")) {
     const adapterIds = resolveAdapterRequestIds({
       channel,
       chatId,
@@ -1839,17 +1850,22 @@ export async function handleAdapterIntentIfAny(params: {
     });
   }
 
-  const explainRequested = isExplainRequest(cleanedText);
-  const feedbackStripped = stripFeedbackPrefix(cleanedText);
+  const explainRequested = isExplainRequest(intentRawText);
+  const feedbackStripped = stripFeedbackPrefix(intentRawText);
   const resolveText = feedbackStripped.text;
-  const allowResolve = shouldAttemptResolve({
-    rawText: cleanedText,
-    strippedText: resolveText,
-    isGroup,
-    mentionsBot,
-    replyToId,
-    usedFeedbackPrefix: feedbackStripped.used,
-  });
+  let allowResolve = intentCommand
+    ? Boolean(resolveText)
+    : shouldAttemptResolve({
+      rawText: intentRawText,
+      strippedText: resolveText,
+      isGroup,
+      mentionsBot,
+      replyToId,
+      usedFeedbackPrefix: feedbackStripped.used,
+    });
+  if (isGroup && !intentCommand) {
+    allowResolve = false;
+  }
   let pendingResolveResponse: string | null = null;
 
   if (trimmedReplyText && isPrivate) {
@@ -1993,7 +2009,7 @@ export async function handleAdapterIntentIfAny(params: {
             messageId,
             replyToId,
             replyText: trimmedReplyText,
-            text: resolveText || cleanedText,
+            text: resolveText || intentRawText,
             isGroup,
             mentionsBot,
             send,
@@ -2020,7 +2036,7 @@ export async function handleAdapterIntentIfAny(params: {
             channel,
             chatId,
             userId,
-            text: resolveText || cleanedText,
+            text: resolveText || intentRawText,
             isGroup,
             mentionsBot,
             send,
@@ -2103,7 +2119,7 @@ export async function handleAdapterIntentIfAny(params: {
           ownerChatId,
           ownerUserId,
           send,
-          rawText: resolveText || cleanedText,
+          rawText: resolveText || intentRawText,
           feedbackKind: resolveRes.params?.feedback_kind,
           minPriority: resolveRes.params?.min_priority,
         });
@@ -2404,7 +2420,7 @@ export async function handleAdapterIntentIfAny(params: {
           const parsedMax = Number(rawMaxChars);
           const maxChars = Number.isFinite(parsedMax)
             ? Math.max(1, Math.min(NEWS_SUMMARY_MAX_CHARS, Math.floor(parsedMax)))
-            : resolveSummaryLength(cleanedText);
+            : resolveSummaryLength(intentRawText);
           let rawAlert = trimmedReplyText;
           if (!rawAlert && isPrivate) {
             rawAlert = lastAlertByChatId.get(chatId)?.rawText || "";
@@ -2492,7 +2508,7 @@ export async function handleAdapterIntentIfAny(params: {
             rawAlert,
             send,
             channel,
-            maxChars: resolveSummaryLength(cleanedText),
+            maxChars: resolveSummaryLength(intentRawText),
             config,
             adapterEntry: true,
             requestId: adapterIds.dispatchRequestId,
@@ -2572,6 +2588,10 @@ export async function handleAdapterIntentIfAny(params: {
     } else if (isPrivate) {
       pendingResolveResponse = rejectText("请求缺少 messageId/parent_id，无法解析。");
     }
+  }
+
+  if (intentCommand && allowResolve && !pendingResolveResponse) {
+    pendingResolveResponse = clarifyText("我没有理解你的意图，请用一句话明确你要做的事。");
   }
 
   if (isGroup && !allowResolve) {
@@ -3197,6 +3217,7 @@ async function handleParsedCommand(params: {
   if (cmd.kind === "help") {
     const out = [
       "/help",
+      "/i <自然语言>",
       "/status",
       "/signals [N]m|[N]h",
       "/news [N]",
