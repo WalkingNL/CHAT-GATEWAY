@@ -2583,7 +2583,7 @@ export async function handleAdapterIntentIfAny(params: {
     return false;
   }
 
-  if (isPrivate || allowResolve) {
+  if ((isPrivate || allowResolve) && !explainRequested && !summaryRequested) {
     if (pendingResolveResponse) {
       await send(chatId, pendingResolveResponse);
       return true;
