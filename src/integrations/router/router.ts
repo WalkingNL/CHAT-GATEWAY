@@ -1153,6 +1153,15 @@ function appendNewsSummaryReject(params: {
   appendLedger(params.storageDir, entry);
 }
 
+async function sendPendingIfAny(
+  pending: string | null,
+  send: (chatId: string, text: string) => Promise<void>,
+  chatId: string,
+): Promise<boolean> {
+  if (!pending) return false;
+  await send(chatId, pending);
+  return true;
+}
 
 async function runExplainSummaryFlow(
   ctx: AdapterContext,
@@ -1167,14 +1176,14 @@ async function runExplainSummaryFlow(
     isPrivate,
     send,
   } = ctx;
+  const wantsExplainOrSummary = summaryRequested || explainRequested;
 
-  if (isGroup && !allowResolve && !explainRequested && !summaryRequested) {
+  if (isGroup && !allowResolve && !wantsExplainOrSummary) {
     return false;
   }
 
-  if ((isPrivate || allowResolve) && !explainRequested && !summaryRequested) {
-    if (pendingResolveResponse) {
-      await send(chatId, pendingResolveResponse);
+  if ((isPrivate || allowResolve) && !wantsExplainOrSummary) {
+    if (await sendPendingIfAny(pendingResolveResponse, send, chatId)) {
       return true;
     }
     return false;
@@ -1344,15 +1353,7 @@ async function runExplainSummaryFlow(
   }
 
   if (!isIntentEnabled("news_summary")) {
-    if (pendingResolveResponse) {
-      await send(chatId, pendingResolveResponse);
-      return true;
-    }
-    return false;
-  }
-  if (!summaryRequested && !explainRequested) {
-    if (pendingResolveResponse) {
-      await send(chatId, pendingResolveResponse);
+    if (await sendPendingIfAny(pendingResolveResponse, send, chatId)) {
       return true;
     }
     return false;
