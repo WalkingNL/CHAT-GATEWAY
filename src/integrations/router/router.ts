@@ -295,6 +295,732 @@ async function runResolvePipeline(
   return { handled: false, result: false };
 }
 
+type ResolveResult = Awaited<ReturnType<typeof requestIntentResolve>>;
+type AdapterIds = NonNullable<ReturnType<typeof resolveAdapterRequestIds>>;
+type ResolvedDashboardIntent = ReturnType<typeof buildDashboardIntentFromResolve>;
+
+type ResolveStepParams = {
+  ctx: AdapterContext;
+  resolveRes: ResolveResult;
+  adapterIds: AdapterIds;
+  resolvedIntent: ResolvedDashboardIntent;
+  setPending: (text: string) => void;
+};
+
+function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<AdapterContext, any>> {
+  const { ctx, resolveRes, adapterIds, resolvedIntent, setPending } = params;
+  const {
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel,
+    chatId,
+    messageId,
+    replyToId,
+    userId,
+    text,
+    isGroup,
+    mentionsBot,
+    trimmedReplyText,
+    resolveText,
+    intentRawText,
+    isPrivate,
+    explicitRetry,
+    send,
+  } = ctx;
+
+  return [
+    {
+      name: "dashboard_resolve",
+      priority: 100,
+      match: () => ({ matched: Boolean(resolvedIntent) }),
+      run: async () => {
+        if (!resolvedIntent) return { handled: false };
+        const handled = await dispatchDashboardExport({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          messageId,
+          replyToId,
+          userId,
+          text,
+          isGroup,
+          mentionsBot,
+          replyText: trimmedReplyText,
+          sendText: send,
+          intent: resolvedIntent,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+          requestExpired: adapterIds.expired,
+        });
+        return { handled: true, result: handled };
+      },
+    },
+    {
+      name: "cognitive_record",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "cognitive_record" }),
+      run: async () => {
+        const resolvedParams = resolveRes.params && typeof resolveRes.params === "object"
+          ? resolveRes.params
+          : {};
+        const resolvedText = typeof resolvedParams.record_text === "string"
+          ? resolvedParams.record_text.trim()
+          : typeof resolvedParams.text === "string"
+            ? resolvedParams.text.trim()
+            : typeof resolvedParams.content === "string"
+              ? resolvedParams.content.trim()
+              : "";
+        const recordSource = typeof resolvedParams.record_source === "string"
+          ? resolvedParams.record_source.trim().toLowerCase()
+          : typeof resolvedParams.text_source === "string"
+            ? resolvedParams.text_source.trim().toLowerCase()
+            : "";
+        const useReplyOverride = recordSource === "reply";
+        const inputText = resolvedText || (useReplyOverride ? trimmedReplyText : "");
+        if (resolveRes.needClarify || !inputText) {
+          await send(chatId, "请明确要记录的内容（例如：记录一下 XXX）。");
+          return { handled: true };
+        }
+        const handled = await handleCognitiveIfAny({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          messageId,
+          replyToId,
+          replyText: trimmedReplyText,
+          text: inputText,
+          isGroup,
+          mentionsBot,
+          send,
+          useReplyOverride,
+          decisionOverride: {
+            action: "record",
+            confidence: Math.max(0, Number(resolveRes.confidence) || 0),
+            reason: resolveRes.reason || "intent_resolve",
+          },
+        });
+        return { handled };
+      },
+    },
+    {
+      name: "cognitive_confirm",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "cognitive_confirm" }),
+      run: async () => {
+        const action = resolveRes.params?.action;
+        if (action === "record" || action === "ignore") {
+          const handled = await handleCognitiveIfAny({
+            storageDir,
+            config,
+            allowlistMode,
+            ownerChatId,
+            ownerUserId,
+            channel,
+            chatId,
+            userId,
+            messageId,
+            replyToId,
+            replyText: trimmedReplyText,
+            text: resolveText || intentRawText,
+            isGroup,
+            mentionsBot,
+            send,
+            confirmOverride: action,
+          });
+          return { handled };
+        }
+        if (resolveRes.needClarify) {
+          setPending("请回复：记 / 不记");
+        }
+        return { handled: false };
+      },
+    },
+    {
+      name: "cognitive_status_update",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "cognitive_status_update" }),
+      run: async () => {
+        const issueId = typeof resolveRes.params?.id === "string" ? resolveRes.params.id.trim() : "";
+        const status = typeof resolveRes.params?.status === "string" ? resolveRes.params.status.trim() : "";
+        if (issueId && status) {
+          const handled = await handleCognitiveStatusUpdate({
+            storageDir,
+            config,
+            allowlistMode,
+            ownerChatId,
+            ownerUserId,
+            channel,
+            chatId,
+            userId,
+            text: resolveText || intentRawText,
+            isGroup,
+            mentionsBot,
+            send,
+            statusOverride: { id: issueId, status },
+          });
+          return { handled };
+        }
+        if (resolveRes.needClarify) {
+          setPending("请补充记录编号与状态（例如：C-20260130-001 DONE）");
+        }
+        return { handled: false };
+      },
+    },
+    {
+      name: "chart_resolve",
+      match: () => ({
+        matched: resolveRes.ok
+          && (resolveRes.intent === "chart_factor_timeline" || resolveRes.intent === "chart_daily_activity"),
+      }),
+      run: async () => {
+        if (channel !== "telegram") {
+          setPending(rejectText("当前仅支持 Telegram 图表导出。"));
+          return { handled: false };
+        }
+        const handled = await handleResolvedChartIntent({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          messageId,
+          replyToId,
+          userId,
+          isGroup,
+          mentionsBot,
+          replyText: trimmedReplyText,
+          sendText: send,
+          resolved: resolveRes,
+        });
+        return { handled };
+      },
+    },
+    {
+      name: "alert_explain_adapter",
+      priority: 50,
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "alert_explain" }),
+      run: async () => {
+        const handled = await handleAlertExplainIntent({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          messageId,
+          replyToId,
+          userId,
+          isGroup,
+          mentionsBot,
+          replyText: trimmedReplyText,
+          send,
+          explicitRetry,
+          rawAlertOverride: trimmedReplyText,
+        });
+        return { handled };
+      },
+    },
+    {
+      name: "alert_feedback",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "alert_feedback" }),
+      run: async () => {
+        if (isGroup) {
+          await send(chatId, "群聊请用 /feedback <描述>。");
+          return { handled: true };
+        }
+        const handled = await handleAlertFeedbackIntent({
+          storageDir,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          send,
+          rawText: resolveText || intentRawText,
+          feedbackKind: resolveRes.params?.feedback_kind,
+          minPriority: resolveRes.params?.min_priority,
+        });
+        return { handled };
+      },
+    },
+    {
+      name: "alert_level",
+      match: () => ({
+        matched: resolveRes.ok
+          && (resolveRes.intent === "alert_level_query" || resolveRes.intent === "alert_level_set"),
+      }),
+      run: async () => {
+        const intent = resolveRes.intent === "alert_level_query" || resolveRes.intent === "alert_level_set"
+          ? resolveRes.intent
+          : "alert_level_query";
+        const handled = await handleAlertLevelIntent({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+          mentionsBot,
+          send,
+          intent,
+          minPriority: resolveRes.params?.min_priority,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+          adapterEntry: true,
+        });
+        return { handled };
+      },
+    },
+    {
+      name: "data_feeds_status",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_status" }),
+      run: async () => {
+        if (isGroup) return { handled: true, result: false };
+        if (!isIntentEnabled("data_feeds_status")) {
+          await send(chatId, rejectText("未开放数据源查询能力。"));
+          return { handled: true };
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return { handled: true };
+        }
+        await runDataFeedsStatus({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return { handled: true };
+      },
+    },
+    {
+      name: "data_feeds_asset_status",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_asset_status" }),
+      run: async () => {
+        if (isGroup) return { handled: true, result: false };
+        if (!isIntentEnabled("data_feeds_asset_status")) {
+          await send(chatId, rejectText("未开放数据源查询能力。"));
+          return { handled: true };
+        }
+        const symbol = String(resolveRes.params?.symbol || "").trim();
+        if (!symbol || resolveRes.needClarify) {
+          await send(chatId, "请指定资产（例如：ETHUSDT）。");
+          return { handled: true };
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return { handled: true };
+        }
+        await runDataFeedsAssetStatus({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          symbol,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return { handled: true };
+      },
+    },
+    {
+      name: "data_feeds_source_status",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_source_status" }),
+      run: async () => {
+        if (isGroup) return { handled: true, result: false };
+        if (!isIntentEnabled("data_feeds_source_status")) {
+          await send(chatId, rejectText("未开放数据源查询能力。"));
+          return { handled: true };
+        }
+        const feedId = String(resolveRes.params?.feed_id || "").trim();
+        if (!feedId || resolveRes.needClarify) {
+          await send(chatId, "请指定 feed_id（例如：ohlcv_1m）。");
+          return { handled: true };
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return { handled: true };
+        }
+        await runDataFeedsSourceStatus({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          feedId,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return { handled: true };
+      },
+    },
+    {
+      name: "data_feeds_hotspots",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_hotspots" }),
+      run: async () => {
+        if (isGroup) return { handled: true, result: false };
+        if (!isIntentEnabled("data_feeds_hotspots")) {
+          await send(chatId, rejectText("未开放数据源查询能力。"));
+          return { handled: true };
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return { handled: true };
+        }
+        await runDataFeedsHotspots({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          limit: resolveRes.params?.limit,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return { handled: true };
+      },
+    },
+    {
+      name: "data_feeds_ops_summary",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_ops_summary" }),
+      run: async () => {
+        if (isGroup) return { handled: true, result: false };
+        if (!isIntentEnabled("data_feeds_ops_summary")) {
+          await send(chatId, rejectText("未开放数据源查询能力。"));
+          return { handled: true };
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return { handled: true };
+        }
+        await runDataFeedsOpsSummary({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          limit: resolveRes.params?.limit,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return { handled: true };
+      },
+    },
+    {
+      name: "news_hot",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_hot" }),
+      run: async () => {
+        if (isGroup) return { handled: true, result: false };
+        if (!isIntentEnabled("news_hot")) {
+          await send(chatId, rejectText("未开放新闻查询能力。"));
+          return { handled: true };
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return { handled: true };
+        }
+        await runNewsQuery({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          kind: "news_hot",
+          limit: resolveRes.params?.limit,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return { handled: true };
+      },
+    },
+    {
+      name: "news_refresh",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_refresh" }),
+      run: async () => {
+        if (isGroup) return { handled: true, result: false };
+        if (!isIntentEnabled("news_refresh")) {
+          await send(chatId, rejectText("未开放新闻查询能力。"));
+          return { handled: true };
+        }
+        if (!isAllowedChat({
+          storageDir,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+        })) {
+          await send(chatId, rejectText("未授权操作"));
+          return { handled: true };
+        }
+        await runNewsQuery({
+          storageDir,
+          chatId,
+          userId,
+          channel,
+          send,
+          config,
+          kind: "news_refresh",
+          limit: resolveRes.params?.limit,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return { handled: true };
+      },
+    },
+    {
+      name: "news_summary",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_summary" }),
+      run: async () => {
+        if (!isIntentEnabled("news_summary")) {
+          setPending(rejectText("未开放新闻摘要能力。"));
+          return { handled: false };
+        }
+        const resolvedParams = resolveRes.params && typeof resolveRes.params === "object"
+          ? resolveRes.params
+          : {};
+        const rawMaxChars = resolvedParams.max_chars ?? resolvedParams.maxChars
+          ?? resolvedParams.summary_chars ?? resolvedParams.chars;
+        const parsedMax = Number(rawMaxChars);
+        const maxChars = Number.isFinite(parsedMax)
+          ? Math.max(1, Math.min(NEWS_SUMMARY_MAX_CHARS, Math.floor(parsedMax)))
+          : resolveSummaryLength(intentRawText);
+        let rawAlert = trimmedReplyText;
+        if (!rawAlert && isPrivate) {
+          rawAlert = getLastAlert(storageDir, chatId);
+        }
+        if (!rawAlert) {
+          await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：摘要 200）。");
+          return { handled: true };
+        }
+        if (!isNewsAlert(rawAlert)) {
+          await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
+          return { handled: true };
+        }
+        const gate = checkExplainGate({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+          mentionsBot,
+          hasReply: Boolean(trimmedReplyText),
+        });
+        if (!gate.allowed) {
+          if (gate.block === "reply" && gate.message) {
+            await send(chatId, gate.message);
+          }
+          return { handled: gate.block !== "ignore" };
+        }
+        await send(chatId, "🧠 正在生成新闻摘要…");
+        await runNewsSummary({
+          storageDir,
+          chatId,
+          userId,
+          messageId,
+          replyToId,
+          rawAlert,
+          send,
+          channel,
+          maxChars,
+          config,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return { handled: true };
+      },
+    },
+    {
+      name: "alert_explain_news",
+      match: () => ({ matched: resolveRes.ok && resolveRes.intent === "alert_explain" }),
+      run: async () => {
+        let rawAlert = trimmedReplyText;
+        if (!rawAlert && isPrivate) {
+          rawAlert = getLastAlert(storageDir, chatId);
+        }
+        if (!rawAlert) {
+          await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下）。");
+          return { handled: true };
+        }
+        if (isNewsAlert(rawAlert)) {
+          if (!isIntentEnabled("news_summary")) {
+            await send(chatId, rejectText("未开放新闻摘要能力。"));
+            return { handled: true };
+          }
+          await send(chatId, "🧠 正在生成新闻摘要…");
+          await runNewsSummary({
+            storageDir,
+            chatId,
+            userId,
+            messageId,
+            replyToId,
+            rawAlert,
+            send,
+            channel,
+            maxChars: resolveSummaryLength(intentRawText),
+            config,
+            adapterEntry: true,
+            requestId: adapterIds.dispatchRequestId,
+            requestIdBase: adapterIds.requestIdBase,
+            attempt: adapterIds.attempt,
+          });
+          return { handled: true };
+        }
+        const gate = checkExplainGate({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+          mentionsBot,
+          hasReply: Boolean(trimmedReplyText),
+        });
+        if (!gate.allowed) {
+          if (gate.block === "reply" && gate.message) {
+            await send(chatId, gate.message);
+          }
+          return { handled: gate.block !== "ignore" };
+        }
+        await send(chatId, "🧠 我看一下…");
+        const explainResult = await runExplain({
+          storageDir,
+          chatId,
+          userId,
+          rawAlert,
+          send,
+          config,
+          channel,
+          taskIdPrefix: `${taskPrefix(channel)}_explain`,
+        });
+        appendAlertExplainLedger({
+          storageDir,
+          channel,
+          chatId,
+          userId,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+          ok: explainResult.ok,
+          errCode: explainResult.ok ? undefined : explainResult.errCode || "unknown",
+          latencyMs: explainResult.latencyMs,
+          adapterEntry: true,
+        });
+        return { handled: true };
+      },
+    },
+  ];
+}
+
 async function runResolveFlow(ctx: AdapterContext): Promise<ResolveFlowResult> {
   if (!ctx.allowResolve) return { done: false, result: false, pending: null };
 
@@ -323,6 +1049,9 @@ async function runResolveFlow(ctx: AdapterContext): Promise<ResolveFlowResult> {
   } = ctx;
 
   let pendingResolveResponse: string | null = null;
+  const setPending = (text: string) => {
+    pendingResolveResponse = text;
+  };
   const adapterIds = resolveAdapterRequestIds({
     channel,
     chatId,
@@ -381,694 +1110,7 @@ async function runResolveFlow(ctx: AdapterContext): Promise<ResolveFlowResult> {
       return { done: true, result: false, pending: null };
     }
 
-    const steps: Array<PipelineStep<AdapterContext, any>> = [
-      {
-        name: "dashboard_resolve",
-        priority: 100,
-        match: () => ({ matched: Boolean(resolvedIntent) }),
-        run: async () => {
-          if (!resolvedIntent) return { handled: false };
-          const handled = await dispatchDashboardExport({
-            storageDir,
-            config,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            messageId,
-            replyToId,
-            userId,
-            text,
-            isGroup,
-            mentionsBot,
-            replyText: trimmedReplyText,
-            sendText: send,
-            intent: resolvedIntent,
-            adapterEntry: true,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-            requestExpired: adapterIds.expired,
-          });
-          return { handled: true, result: handled };
-        },
-      },
-      {
-        name: "cognitive_record",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "cognitive_record" }),
-        run: async () => {
-          const resolvedParams = resolveRes.params && typeof resolveRes.params === "object"
-            ? resolveRes.params
-            : {};
-          const resolvedText = typeof resolvedParams.record_text === "string"
-            ? resolvedParams.record_text.trim()
-            : typeof resolvedParams.text === "string"
-              ? resolvedParams.text.trim()
-              : typeof resolvedParams.content === "string"
-                ? resolvedParams.content.trim()
-                : "";
-          const recordSource = typeof resolvedParams.record_source === "string"
-            ? resolvedParams.record_source.trim().toLowerCase()
-            : typeof resolvedParams.text_source === "string"
-              ? resolvedParams.text_source.trim().toLowerCase()
-              : "";
-          const useReplyOverride = recordSource === "reply";
-          const inputText = resolvedText || (useReplyOverride ? trimmedReplyText : "");
-          if (resolveRes.needClarify || !inputText) {
-            await send(chatId, "请明确要记录的内容（例如：记录一下 XXX）。");
-            return { handled: true };
-          }
-          const handled = await handleCognitiveIfAny({
-            storageDir,
-            config,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            messageId,
-            replyToId,
-            replyText: trimmedReplyText,
-            text: inputText,
-            isGroup,
-            mentionsBot,
-            send,
-            useReplyOverride,
-            decisionOverride: {
-              action: "record",
-              confidence: Math.max(0, Number(resolveRes.confidence) || 0),
-              reason: resolveRes.reason || "intent_resolve",
-            },
-          });
-          return { handled };
-        },
-      },
-      {
-        name: "cognitive_confirm",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "cognitive_confirm" }),
-        run: async () => {
-          const action = resolveRes.params?.action;
-          if (action === "record" || action === "ignore") {
-            const handled = await handleCognitiveIfAny({
-              storageDir,
-              config,
-              allowlistMode,
-              ownerChatId,
-              ownerUserId,
-              channel,
-              chatId,
-              userId,
-              messageId,
-              replyToId,
-              replyText: trimmedReplyText,
-              text: resolveText || intentRawText,
-              isGroup,
-              mentionsBot,
-              send,
-              confirmOverride: action,
-            });
-            return { handled };
-          }
-          if (resolveRes.needClarify) {
-            pendingResolveResponse = "请回复：记 / 不记";
-          }
-          return { handled: false };
-        },
-      },
-      {
-        name: "cognitive_status_update",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "cognitive_status_update" }),
-        run: async () => {
-          const issueId = typeof resolveRes.params?.id === "string" ? resolveRes.params.id.trim() : "";
-          const status = typeof resolveRes.params?.status === "string" ? resolveRes.params.status.trim() : "";
-          if (issueId && status) {
-            const handled = await handleCognitiveStatusUpdate({
-              storageDir,
-              config,
-              allowlistMode,
-              ownerChatId,
-              ownerUserId,
-              channel,
-              chatId,
-              userId,
-              text: resolveText || intentRawText,
-              isGroup,
-              mentionsBot,
-              send,
-              statusOverride: { id: issueId, status },
-            });
-            return { handled };
-          }
-          if (resolveRes.needClarify) {
-            pendingResolveResponse = "请补充记录编号与状态（例如：C-20260130-001 DONE）";
-          }
-          return { handled: false };
-        },
-      },
-      {
-        name: "chart_resolve",
-        match: () => ({
-          matched: resolveRes.ok
-            && (resolveRes.intent === "chart_factor_timeline" || resolveRes.intent === "chart_daily_activity"),
-        }),
-        run: async () => {
-          if (channel !== "telegram") {
-            pendingResolveResponse = rejectText("当前仅支持 Telegram 图表导出。");
-            return { handled: false };
-          }
-          const handled = await handleResolvedChartIntent({
-            storageDir,
-            config,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            messageId,
-            replyToId,
-            userId,
-            isGroup,
-            mentionsBot,
-            replyText: trimmedReplyText,
-            sendText: send,
-            resolved: resolveRes,
-          });
-          return { handled };
-        },
-      },
-      {
-        name: "alert_explain_adapter",
-        priority: 50,
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "alert_explain" }),
-        run: async () => {
-          const handled = await handleAlertExplainIntent({
-            storageDir,
-            config,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            messageId,
-            replyToId,
-            userId,
-            isGroup,
-            mentionsBot,
-            replyText: trimmedReplyText,
-            send,
-            explicitRetry,
-            rawAlertOverride: trimmedReplyText,
-          });
-          return { handled };
-        },
-      },
-      {
-        name: "alert_feedback",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "alert_feedback" }),
-        run: async () => {
-          if (isGroup) {
-            await send(chatId, "群聊请用 /feedback <描述>。");
-            return { handled: true };
-          }
-          const handled = await handleAlertFeedbackIntent({
-            storageDir,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            send,
-            rawText: resolveText || intentRawText,
-            feedbackKind: resolveRes.params?.feedback_kind,
-            minPriority: resolveRes.params?.min_priority,
-          });
-          return { handled };
-        },
-      },
-      {
-        name: "alert_level",
-        match: () => ({
-          matched: resolveRes.ok
-            && (resolveRes.intent === "alert_level_query" || resolveRes.intent === "alert_level_set"),
-        }),
-        run: async () => {
-          const intent = resolveRes.intent === "alert_level_query" || resolveRes.intent === "alert_level_set"
-            ? resolveRes.intent
-            : "alert_level_query";
-          const handled = await handleAlertLevelIntent({
-            storageDir,
-            config,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-            mentionsBot,
-            send,
-            intent,
-            minPriority: resolveRes.params?.min_priority,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-            adapterEntry: true,
-          });
-          return { handled };
-        },
-      },
-      {
-        name: "data_feeds_status",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_status" }),
-        run: async () => {
-          if (isGroup) return { handled: true, result: false };
-          if (!isIntentEnabled("data_feeds_status")) {
-            await send(chatId, rejectText("未开放数据源查询能力。"));
-            return { handled: true };
-          }
-          if (!isAllowedChat({
-            storageDir,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-          })) {
-            await send(chatId, rejectText("未授权操作"));
-            return { handled: true };
-          }
-          await runDataFeedsStatus({
-            storageDir,
-            chatId,
-            userId,
-            channel,
-            send,
-            config,
-            adapterEntry: true,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-          });
-          return { handled: true };
-        },
-      },
-      {
-        name: "data_feeds_asset_status",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_asset_status" }),
-        run: async () => {
-          if (isGroup) return { handled: true, result: false };
-          if (!isIntentEnabled("data_feeds_asset_status")) {
-            await send(chatId, rejectText("未开放数据源查询能力。"));
-            return { handled: true };
-          }
-          const symbol = String(resolveRes.params?.symbol || "").trim();
-          if (!symbol || resolveRes.needClarify) {
-            await send(chatId, "请指定资产（例如：ETHUSDT）。");
-            return { handled: true };
-          }
-          if (!isAllowedChat({
-            storageDir,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-          })) {
-            await send(chatId, rejectText("未授权操作"));
-            return { handled: true };
-          }
-          await runDataFeedsAssetStatus({
-            storageDir,
-            chatId,
-            userId,
-            channel,
-            send,
-            config,
-            symbol,
-            adapterEntry: true,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-          });
-          return { handled: true };
-        },
-      },
-      {
-        name: "data_feeds_source_status",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_source_status" }),
-        run: async () => {
-          if (isGroup) return { handled: true, result: false };
-          if (!isIntentEnabled("data_feeds_source_status")) {
-            await send(chatId, rejectText("未开放数据源查询能力。"));
-            return { handled: true };
-          }
-          const feedId = String(resolveRes.params?.feed_id || "").trim();
-          if (!feedId || resolveRes.needClarify) {
-            await send(chatId, "请指定 feed_id（例如：ohlcv_1m）。");
-            return { handled: true };
-          }
-          if (!isAllowedChat({
-            storageDir,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-          })) {
-            await send(chatId, rejectText("未授权操作"));
-            return { handled: true };
-          }
-          await runDataFeedsSourceStatus({
-            storageDir,
-            chatId,
-            userId,
-            channel,
-            send,
-            config,
-            feedId,
-            adapterEntry: true,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-          });
-          return { handled: true };
-        },
-      },
-      {
-        name: "data_feeds_hotspots",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_hotspots" }),
-        run: async () => {
-          if (isGroup) return { handled: true, result: false };
-          if (!isIntentEnabled("data_feeds_hotspots")) {
-            await send(chatId, rejectText("未开放数据源查询能力。"));
-            return { handled: true };
-          }
-          if (!isAllowedChat({
-            storageDir,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-          })) {
-            await send(chatId, rejectText("未授权操作"));
-            return { handled: true };
-          }
-          await runDataFeedsHotspots({
-            storageDir,
-            chatId,
-            userId,
-            channel,
-            send,
-            config,
-            limit: resolveRes.params?.limit,
-            adapterEntry: true,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-          });
-          return { handled: true };
-        },
-      },
-      {
-        name: "data_feeds_ops_summary",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_ops_summary" }),
-        run: async () => {
-          if (isGroup) return { handled: true, result: false };
-          if (!isIntentEnabled("data_feeds_ops_summary")) {
-            await send(chatId, rejectText("未开放数据源查询能力。"));
-            return { handled: true };
-          }
-          if (!isAllowedChat({
-            storageDir,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-          })) {
-            await send(chatId, rejectText("未授权操作"));
-            return { handled: true };
-          }
-          await runDataFeedsOpsSummary({
-            storageDir,
-            chatId,
-            userId,
-            channel,
-            send,
-            config,
-            limit: resolveRes.params?.limit,
-            adapterEntry: true,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-          });
-          return { handled: true };
-        },
-      },
-      {
-        name: "news_hot",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_hot" }),
-        run: async () => {
-          if (isGroup) return { handled: true, result: false };
-          if (!isIntentEnabled("news_hot")) {
-            await send(chatId, rejectText("未开放新闻查询能力。"));
-            return { handled: true };
-          }
-          if (!isAllowedChat({
-            storageDir,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-          })) {
-            await send(chatId, rejectText("未授权操作"));
-            return { handled: true };
-          }
-          await runNewsQuery({
-            storageDir,
-            chatId,
-            userId,
-            channel,
-            send,
-            config,
-            kind: "news_hot",
-            limit: resolveRes.params?.limit,
-            adapterEntry: true,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-          });
-          return { handled: true };
-        },
-      },
-      {
-        name: "news_refresh",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_refresh" }),
-        run: async () => {
-          if (isGroup) return { handled: true, result: false };
-          if (!isIntentEnabled("news_refresh")) {
-            await send(chatId, rejectText("未开放新闻查询能力。"));
-            return { handled: true };
-          }
-          if (!isAllowedChat({
-            storageDir,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-          })) {
-            await send(chatId, rejectText("未授权操作"));
-            return { handled: true };
-          }
-          await runNewsQuery({
-            storageDir,
-            chatId,
-            userId,
-            channel,
-            send,
-            config,
-            kind: "news_refresh",
-            limit: resolveRes.params?.limit,
-            adapterEntry: true,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-          });
-          return { handled: true };
-        },
-      },
-      {
-        name: "news_summary",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_summary" }),
-        run: async () => {
-          if (!isIntentEnabled("news_summary")) {
-            pendingResolveResponse = rejectText("未开放新闻摘要能力。");
-            return { handled: false };
-          }
-          const resolvedParams = resolveRes.params && typeof resolveRes.params === "object"
-            ? resolveRes.params
-            : {};
-          const rawMaxChars = resolvedParams.max_chars ?? resolvedParams.maxChars
-            ?? resolvedParams.summary_chars ?? resolvedParams.chars;
-          const parsedMax = Number(rawMaxChars);
-          const maxChars = Number.isFinite(parsedMax)
-            ? Math.max(1, Math.min(NEWS_SUMMARY_MAX_CHARS, Math.floor(parsedMax)))
-            : resolveSummaryLength(intentRawText);
-          let rawAlert = trimmedReplyText;
-          if (!rawAlert && isPrivate) {
-            rawAlert = getLastAlert(storageDir, chatId);
-          }
-          if (!rawAlert) {
-            await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：摘要 200）。");
-            return { handled: true };
-          }
-          if (!isNewsAlert(rawAlert)) {
-            await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
-            return { handled: true };
-          }
-          const gate = checkExplainGate({
-            storageDir,
-            config,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-            mentionsBot,
-            hasReply: Boolean(trimmedReplyText),
-          });
-          if (!gate.allowed) {
-            if (gate.block === "reply" && gate.message) {
-              await send(chatId, gate.message);
-            }
-            return { handled: gate.block !== "ignore" };
-          }
-          await send(chatId, "🧠 正在生成新闻摘要…");
-          await runNewsSummary({
-            storageDir,
-            chatId,
-            userId,
-            messageId,
-            replyToId,
-            rawAlert,
-            send,
-            channel,
-            maxChars,
-            config,
-            adapterEntry: true,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-          });
-          return { handled: true };
-        },
-      },
-      {
-        name: "alert_explain_news",
-        match: () => ({ matched: resolveRes.ok && resolveRes.intent === "alert_explain" }),
-        run: async () => {
-          let rawAlert = trimmedReplyText;
-          if (!rawAlert && isPrivate) {
-            rawAlert = getLastAlert(storageDir, chatId);
-          }
-          if (!rawAlert) {
-            await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下）。");
-            return { handled: true };
-          }
-          if (isNewsAlert(rawAlert)) {
-            if (!isIntentEnabled("news_summary")) {
-              await send(chatId, rejectText("未开放新闻摘要能力。"));
-              return { handled: true };
-            }
-            await send(chatId, "🧠 正在生成新闻摘要…");
-            await runNewsSummary({
-              storageDir,
-              chatId,
-              userId,
-              messageId,
-              replyToId,
-              rawAlert,
-              send,
-              channel,
-              maxChars: resolveSummaryLength(intentRawText),
-              config,
-              adapterEntry: true,
-              requestId: adapterIds.dispatchRequestId,
-              requestIdBase: adapterIds.requestIdBase,
-              attempt: adapterIds.attempt,
-            });
-            return { handled: true };
-          }
-          const gate = checkExplainGate({
-            storageDir,
-            config,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-            mentionsBot,
-            hasReply: Boolean(trimmedReplyText),
-          });
-          if (!gate.allowed) {
-            if (gate.block === "reply" && gate.message) {
-              await send(chatId, gate.message);
-            }
-            return { handled: gate.block !== "ignore" };
-          }
-          await send(chatId, "🧠 我看一下…");
-          const explainResult = await runExplain({
-            storageDir,
-            chatId,
-            userId,
-            rawAlert,
-            send,
-            config,
-            channel,
-            taskIdPrefix: `${taskPrefix(channel)}_explain`,
-          });
-          appendAlertExplainLedger({
-            storageDir,
-            channel,
-            chatId,
-            userId,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-            ok: explainResult.ok,
-            errCode: explainResult.ok ? undefined : explainResult.errCode || "unknown",
-            latencyMs: explainResult.latencyMs,
-            adapterEntry: true,
-          });
-          return { handled: true };
-        },
-      },
-    ];
+    const steps = buildResolveSteps({ ctx, resolveRes, adapterIds, resolvedIntent, setPending });
 
     const pipelineResult = await runResolvePipeline(ctx, steps);
     if (pipelineResult.handled) {
@@ -1163,6 +1205,165 @@ async function sendPendingIfAny(
   return true;
 }
 
+const EXPLAIN_SUMMARY_STEPS: Array<PipelineStep<AdapterContext, any>> = [
+  {
+    name: "alert_explain",
+    priority: 10,
+    match: (c) => ({
+      matched: c.explainRequested && isIntentEnabled("alert_explain"),
+    }),
+    run: async (c) => {
+      const handled = await handleAlertExplainIntent({
+        storageDir: c.storageDir,
+        config: c.config,
+        allowlistMode: c.allowlistMode,
+        ownerChatId: c.ownerChatId,
+        ownerUserId: c.ownerUserId,
+        channel: c.channel,
+        chatId: c.chatId,
+        messageId: c.messageId,
+        replyToId: c.replyToId,
+        userId: c.userId,
+        isGroup: c.isGroup,
+        mentionsBot: c.mentionsBot,
+        replyText: c.trimmedReplyText,
+        send: c.send,
+        explicitRetry: c.explicitRetry,
+        rawAlertOverride: c.trimmedReplyText,
+      });
+      return { handled };
+    },
+  },
+  {
+    name: "news_summary",
+    match: (c) => ({
+      matched: c.summaryRequested || c.explainRequested,
+    }),
+    run: async (c) => {
+      if (!isIntentEnabled("news_summary")) return { handled: false };
+
+      let rawAlert = c.trimmedReplyText;
+      if (!rawAlert && !c.isGroup) {
+        rawAlert = getLastAlert(c.storageDir, c.chatId);
+      }
+      if (!rawAlert) {
+        if (c.isGroup) {
+          await c.send(c.chatId, "请回复一条新闻告警再发送摘要请求。");
+        } else {
+          await c.send(c.chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下 / 摘要 200）。");
+        }
+        return { handled: true };
+      }
+
+      const isNews = isNewsAlert(rawAlert);
+      const summaryIntent = c.summaryRequested || (isNews && c.explainRequested);
+      if (!summaryIntent) return { handled: false };
+
+      if (!isNews) {
+        await c.send(c.chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
+        return { handled: true };
+      }
+
+      const gate = checkExplainGate({
+        storageDir: c.storageDir,
+        config: c.config,
+        allowlistMode: c.allowlistMode,
+        ownerChatId: c.ownerChatId,
+        ownerUserId: c.ownerUserId,
+        channel: c.channel,
+        chatId: c.chatId,
+        userId: c.userId,
+        isGroup: c.isGroup,
+        mentionsBot: c.mentionsBot,
+        hasReply: Boolean(c.trimmedReplyText),
+      });
+      if (!gate.allowed) {
+        if (gate.block === "reply" && gate.message) {
+          await c.send(c.chatId, gate.message);
+        }
+        return { handled: gate.block !== "ignore" };
+      }
+
+      const adapterIds = resolveAdapterRequestIds({
+        channel: c.channel,
+        chatId: c.chatId,
+        messageId: c.messageId,
+        replyToId: c.replyToId,
+        explicitRetry: c.explicitRetry,
+      });
+      if (!adapterIds) {
+        await runNewsSummary({
+          storageDir: c.storageDir,
+          chatId: c.chatId,
+          userId: c.userId,
+          messageId: c.messageId,
+          replyToId: c.replyToId,
+          rawAlert,
+          send: c.send,
+          channel: c.channel,
+          maxChars: resolveSummaryLength(c.trimmedText),
+          config: c.config,
+          adapterEntry: true,
+        });
+        return { handled: true };
+      }
+
+      if (!c.projectId) {
+        await c.send(c.chatId, rejectText("未配置默认项目，无法生成摘要。"));
+        appendNewsSummaryReject({
+          storageDir: c.storageDir,
+          channel: c.channel,
+          chatId: c.chatId,
+          userId: c.userId,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+          errorCode: "missing_project_id",
+          raw: c.trimmedText,
+          adapterEntry: true,
+        });
+        return { handled: true };
+      }
+
+      if (adapterIds.expired) {
+        await c.send(c.chatId, rejectText("请求已过期，请重新发起摘要。"));
+        appendNewsSummaryReject({
+          storageDir: c.storageDir,
+          channel: c.channel,
+          chatId: c.chatId,
+          userId: c.userId,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+          errorCode: "request_id_expired",
+          raw: c.trimmedText,
+          adapterEntry: true,
+        });
+        return { handled: true };
+      }
+
+      await c.send(c.chatId, "🧠 正在生成新闻摘要…");
+      await runNewsSummary({
+        storageDir: c.storageDir,
+        chatId: c.chatId,
+        userId: c.userId,
+        messageId: c.messageId,
+        replyToId: c.replyToId,
+        rawAlert,
+        send: c.send,
+        channel: c.channel,
+        maxChars: resolveSummaryLength(c.trimmedText),
+        config: c.config,
+        adapterEntry: true,
+        requestId: adapterIds.dispatchRequestId,
+        requestIdBase: adapterIds.requestIdBase,
+        attempt: adapterIds.attempt,
+      });
+      return { handled: true };
+    },
+  },
+];
+
 async function runExplainSummaryFlow(
   ctx: AdapterContext,
   pendingResolveResponse: string | null,
@@ -1189,166 +1390,7 @@ async function runExplainSummaryFlow(
     return false;
   }
 
-  const steps: Array<PipelineStep<AdapterContext, any>> = [
-    {
-      name: "alert_explain",
-      priority: 10,
-      match: (c) => ({
-        matched: c.explainRequested && isIntentEnabled("alert_explain"),
-      }),
-      run: async (c) => {
-        const handled = await handleAlertExplainIntent({
-          storageDir: c.storageDir,
-          config: c.config,
-          allowlistMode: c.allowlistMode,
-          ownerChatId: c.ownerChatId,
-          ownerUserId: c.ownerUserId,
-          channel: c.channel,
-          chatId: c.chatId,
-          messageId: c.messageId,
-          replyToId: c.replyToId,
-          userId: c.userId,
-          isGroup: c.isGroup,
-          mentionsBot: c.mentionsBot,
-          replyText: c.trimmedReplyText,
-          send: c.send,
-          explicitRetry: c.explicitRetry,
-          rawAlertOverride: c.trimmedReplyText,
-        });
-        return { handled };
-      },
-    },
-    {
-      name: "news_summary",
-      match: (c) => ({
-        matched: c.summaryRequested || c.explainRequested,
-      }),
-      run: async (c) => {
-        if (!isIntentEnabled("news_summary")) return { handled: false };
-
-        let rawAlert = c.trimmedReplyText;
-        if (!rawAlert && !c.isGroup) {
-          rawAlert = getLastAlert(c.storageDir, c.chatId);
-        }
-        if (!rawAlert) {
-          if (c.isGroup) {
-            await c.send(c.chatId, "请回复一条新闻告警再发送摘要请求。");
-          } else {
-            await c.send(c.chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下 / 摘要 200）。");
-          }
-          return { handled: true };
-        }
-
-        const isNews = isNewsAlert(rawAlert);
-        const summaryIntent = c.summaryRequested || (isNews && c.explainRequested);
-        if (!summaryIntent) return { handled: false };
-
-        if (!isNews) {
-          await c.send(c.chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
-          return { handled: true };
-        }
-
-        const gate = checkExplainGate({
-          storageDir: c.storageDir,
-          config: c.config,
-          allowlistMode: c.allowlistMode,
-          ownerChatId: c.ownerChatId,
-          ownerUserId: c.ownerUserId,
-          channel: c.channel,
-          chatId: c.chatId,
-          userId: c.userId,
-          isGroup: c.isGroup,
-          mentionsBot: c.mentionsBot,
-          hasReply: Boolean(c.trimmedReplyText),
-        });
-        if (!gate.allowed) {
-          if (gate.block === "reply" && gate.message) {
-            await c.send(c.chatId, gate.message);
-          }
-          return { handled: gate.block !== "ignore" };
-        }
-
-        const adapterIds = resolveAdapterRequestIds({
-          channel: c.channel,
-          chatId: c.chatId,
-          messageId: c.messageId,
-          replyToId: c.replyToId,
-          explicitRetry: c.explicitRetry,
-        });
-        if (!adapterIds) {
-          await runNewsSummary({
-            storageDir: c.storageDir,
-            chatId: c.chatId,
-            userId: c.userId,
-            messageId: c.messageId,
-            replyToId: c.replyToId,
-            rawAlert,
-            send: c.send,
-            channel: c.channel,
-            maxChars: resolveSummaryLength(c.trimmedText),
-            config: c.config,
-            adapterEntry: true,
-          });
-          return { handled: true };
-        }
-
-        if (!c.projectId) {
-          await c.send(c.chatId, rejectText("未配置默认项目，无法生成摘要。"));
-          appendNewsSummaryReject({
-            storageDir: c.storageDir,
-            channel: c.channel,
-            chatId: c.chatId,
-            userId: c.userId,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-            errorCode: "missing_project_id",
-            raw: c.trimmedText,
-            adapterEntry: true,
-          });
-          return { handled: true };
-        }
-
-        if (adapterIds.expired) {
-          await c.send(c.chatId, rejectText("请求已过期，请重新发起摘要。"));
-          appendNewsSummaryReject({
-            storageDir: c.storageDir,
-            channel: c.channel,
-            chatId: c.chatId,
-            userId: c.userId,
-            requestId: adapterIds.dispatchRequestId,
-            requestIdBase: adapterIds.requestIdBase,
-            attempt: adapterIds.attempt,
-            errorCode: "request_id_expired",
-            raw: c.trimmedText,
-            adapterEntry: true,
-          });
-          return { handled: true };
-        }
-
-        await c.send(c.chatId, "🧠 正在生成新闻摘要…");
-        await runNewsSummary({
-          storageDir: c.storageDir,
-          chatId: c.chatId,
-          userId: c.userId,
-          messageId: c.messageId,
-          replyToId: c.replyToId,
-          rawAlert,
-          send: c.send,
-          channel: c.channel,
-          maxChars: resolveSummaryLength(c.trimmedText),
-          config: c.config,
-          adapterEntry: true,
-          requestId: adapterIds.dispatchRequestId,
-          requestIdBase: adapterIds.requestIdBase,
-          attempt: adapterIds.attempt,
-        });
-        return { handled: true };
-      },
-    },
-  ];
-
-  if (await runPipeline(ctx, steps)) {
+  if (await runPipeline(ctx, EXPLAIN_SUMMARY_STEPS)) {
     return true;
   }
 
