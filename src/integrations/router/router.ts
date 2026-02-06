@@ -74,6 +74,7 @@ type IntentMeta = {
   disabledMessage?: string;
   allowGroup?: boolean;
   requiresAuth?: boolean;
+  groupDenyAction?: "ignore" | "reject";
 };
 
 const INTENT_REGISTRY: Record<string, IntentMeta> = {
@@ -100,6 +101,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     disabledMessage: "未开放数据源查询能力。",
     allowGroup: false,
     requiresAuth: true,
+    groupDenyAction: "ignore",
   },
   data_feeds_asset_status: {
     name: "data_feeds_asset_status",
@@ -107,6 +109,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     disabledMessage: "未开放数据源查询能力。",
     allowGroup: false,
     requiresAuth: true,
+    groupDenyAction: "ignore",
   },
   data_feeds_source_status: {
     name: "data_feeds_source_status",
@@ -114,6 +117,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     disabledMessage: "未开放数据源查询能力。",
     allowGroup: false,
     requiresAuth: true,
+    groupDenyAction: "ignore",
   },
   data_feeds_hotspots: {
     name: "data_feeds_hotspots",
@@ -121,6 +125,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     disabledMessage: "未开放数据源查询能力。",
     allowGroup: false,
     requiresAuth: true,
+    groupDenyAction: "ignore",
   },
   data_feeds_ops_summary: {
     name: "data_feeds_ops_summary",
@@ -128,6 +133,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     disabledMessage: "未开放数据源查询能力。",
     allowGroup: false,
     requiresAuth: true,
+    groupDenyAction: "ignore",
   },
   news_hot: {
     name: "news_hot",
@@ -135,6 +141,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     disabledMessage: "未开放新闻查询能力。",
     allowGroup: false,
     requiresAuth: true,
+    groupDenyAction: "ignore",
   },
   news_refresh: {
     name: "news_refresh",
@@ -142,26 +149,11 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     disabledMessage: "未开放新闻查询能力。",
     allowGroup: false,
     requiresAuth: true,
+    groupDenyAction: "ignore",
   },
 };
 
 type ResolveIntentMeta = IntentMeta;
-
-const RESOLVE_INTENT_META: Record<string, ResolveIntentMeta> = {
-  data_feeds_status: INTENT_REGISTRY.data_feeds_status,
-  data_feeds_asset_status: INTENT_REGISTRY.data_feeds_asset_status,
-  data_feeds_source_status: INTENT_REGISTRY.data_feeds_source_status,
-  data_feeds_hotspots: INTENT_REGISTRY.data_feeds_hotspots,
-  data_feeds_ops_summary: INTENT_REGISTRY.data_feeds_ops_summary,
-  news_hot: INTENT_REGISTRY.news_hot,
-  news_refresh: INTENT_REGISTRY.news_refresh,
-};
-
-const RESOLVE_GROUP_SKIP_INTENTS = new Set(
-  Object.values(RESOLVE_INTENT_META)
-    .filter(meta => meta.allowGroup === false)
-    .map(meta => meta.name),
-);
 
 type PrimaryCommandMeta = IntentMeta & {
   name: "alert_strategy" | "alert_query";
@@ -216,6 +208,12 @@ type AdapterContext = {
 function getIntentMeta(name?: string | null): IntentMeta | null {
   if (!name) return null;
   return INTENT_REGISTRY[name] || null;
+}
+
+function resolveGroupDenyAction(intent?: string | null): "allow" | "ignore" | "reject" {
+  const meta = getIntentMeta(intent);
+  if (!meta || meta.allowGroup !== false) return "allow";
+  return meta.groupDenyAction || "ignore";
 }
 
 function isIntentEnabledByName(name: string): boolean {
@@ -1137,8 +1135,16 @@ async function runResolveFlow(ctx: AdapterContext): Promise<ResolveFlowResult> {
       defaultWindowSpecId,
     });
 
-    if (resolveRes.ok && resolveRes.intent && isGroup && RESOLVE_GROUP_SKIP_INTENTS.has(resolveRes.intent)) {
-      return { done: true, result: false, pending: null };
+    if (resolveRes.ok && resolveRes.intent && isGroup) {
+      const groupAction = resolveGroupDenyAction(resolveRes.intent);
+      if (groupAction === "ignore") {
+        return { done: true, result: false, pending: null };
+      }
+      if (groupAction === "reject") {
+        const meta = getIntentMeta(resolveRes.intent);
+        await send(chatId, rejectText(meta?.disabledMessage || "未开放相关能力。"));
+        return { done: true, result: true, pending: null };
+      }
     }
 
     const steps = buildResolveSteps({ ctx, resolveRes, adapterIds, resolvedIntent, setPending });
@@ -1707,8 +1713,7 @@ function isAllowedChat(params: {
 }
 
 function resolveIntentMeta(intent?: string | null): ResolveIntentMeta | null {
-  if (!intent) return null;
-  return RESOLVE_INTENT_META[intent] || null;
+  return getIntentMeta(intent);
 }
 
 async function ensureIntentEnabled(
