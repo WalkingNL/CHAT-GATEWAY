@@ -4,6 +4,7 @@ import path from "node:path";
 import { execSync } from "node:child_process";
 import { handleAskCommand, parseCommand } from "./commands.js";
 import { buildIntentHints, escapeRegExp } from "./intent_hints.js";
+import { runPipeline, type MatchResult, type PipelineStep } from "./intent_pipeline.js";
 import { appendLedger } from "../audit/ledger.js";
 import { getStatusFacts } from "./context.js";
 import type { RateLimiter } from "../../core/rateLimit/limiter.js";
@@ -65,6 +66,209 @@ function parseIntEnv(name: string, fallback: number): number {
   const val = Number(raw);
   if (!Number.isFinite(val)) return fallback;
   return Math.max(0, Math.floor(val));
+}
+
+type AdapterContext = {
+  storageDir: string;
+  config: LoadedConfig;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
+  channel: "telegram" | "feishu";
+  chatId: string;
+  messageId: string;
+  replyToId: string;
+  userId: string;
+  text: string;
+  replyText: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  send: (chatId: string, text: string) => Promise<void>;
+  trimmedText: string;
+  trimmedReplyText: string;
+  cleanedText: string;
+  intentRawText: string;
+  summaryRequested: boolean;
+  explainRequested: boolean;
+  resolveText: string;
+  allowResolve: boolean;
+  explicitRetry: boolean;
+  isPrivate: boolean;
+  projectId: string | null;
+  defaultWindowSpecId?: string;
+};
+
+function buildAdapterContext(params: {
+  storageDir: string;
+  config: LoadedConfig;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
+  channel: "telegram" | "feishu";
+  chatId: string;
+  messageId: string;
+  replyToId: string;
+  userId: string;
+  text: string;
+  replyText: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  send: (chatId: string, text: string) => Promise<void>;
+}): AdapterContext {
+  const trimmedText = String(params.text || "").trim();
+  const trimmedReplyText = String(params.replyText || "").trim();
+  const hints = buildIntentHints({
+    channel: params.channel,
+    text: trimmedText,
+    isGroup: params.isGroup,
+    mentionsBot: params.mentionsBot,
+    replyToId: params.replyToId,
+  });
+  const explicitRetry = wantsRetry(hints.intentRawText);
+  const isPrivate = !params.isGroup;
+  const projectId = resolveProjectId(params.config);
+  const defaultWindowSpecId = resolveDefaultWindowSpecId(projectId || undefined) || undefined;
+  return {
+    ...params,
+    trimmedText,
+    trimmedReplyText,
+    cleanedText: hints.cleanedText,
+    intentRawText: hints.intentRawText,
+    summaryRequested: hints.summaryRequested,
+    explainRequested: hints.explainRequested,
+    resolveText: hints.resolveText,
+    allowResolve: hints.allowResolve,
+    explicitRetry,
+    isPrivate,
+    projectId,
+    defaultWindowSpecId,
+  };
+}
+
+async function runPrimaryIntentPipeline(ctx: AdapterContext): Promise<boolean> {
+  const steps: Array<PipelineStep<AdapterContext, any>> = [
+    {
+      name: "alert_strategy",
+      priority: 30,
+      match: (c) => {
+        const requested = /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i.test(c.cleanedText);
+        const commandOk = !c.isGroup || /^\/strategy\b/i.test(c.cleanedText);
+        return { matched: requested && commandOk && isIntentEnabled("alert_strategy") };
+      },
+      run: async (c) => {
+        const adapterIds = resolveAdapterRequestIds({
+          channel: c.channel,
+          chatId: c.chatId,
+          messageId: c.messageId,
+          replyToId: c.replyToId,
+          explicitRetry: c.explicitRetry,
+        });
+        const handled = await handleStrategyIfAny({
+          storageDir: c.storageDir,
+          config: c.config,
+          allowlistMode: c.allowlistMode,
+          ownerChatId: c.ownerChatId,
+          ownerUserId: c.ownerUserId,
+          channel: c.channel,
+          chatId: c.chatId,
+          userId: c.userId,
+          isGroup: c.isGroup,
+          mentionsBot: c.mentionsBot,
+          text: c.cleanedText,
+          send: c.send,
+          adapterEntry: true,
+          requestId: adapterIds?.dispatchRequestId,
+          requestIdBase: adapterIds?.requestIdBase,
+          attempt: adapterIds?.attempt,
+        });
+        return { handled };
+      },
+    },
+    {
+      name: "alert_query",
+      priority: 20,
+      match: (c) => {
+        const requested = /^\/(event|evidence|gate|eval|evaluation|reliability|config|health)\b/i.test(c.cleanedText);
+        return { matched: requested && isIntentEnabled("alert_query") };
+      },
+      run: async (c) => {
+        const adapterIds = resolveAdapterRequestIds({
+          channel: c.channel,
+          chatId: c.chatId,
+          messageId: c.messageId,
+          replyToId: c.replyToId,
+          explicitRetry: c.explicitRetry,
+        });
+        const handled = await handleQueryIfAny({
+          storageDir: c.storageDir,
+          config: c.config,
+          allowlistMode: c.allowlistMode,
+          ownerChatId: c.ownerChatId,
+          ownerUserId: c.ownerUserId,
+          channel: c.channel,
+          chatId: c.chatId,
+          userId: c.userId,
+          isGroup: c.isGroup,
+          mentionsBot: c.mentionsBot,
+          text: c.cleanedText,
+          send: c.send,
+          adapterEntry: true,
+          requestId: adapterIds?.dispatchRequestId,
+          requestIdBase: adapterIds?.requestIdBase,
+          attempt: adapterIds?.attempt,
+        });
+        return { handled };
+      },
+    },
+    {
+      name: "dashboard_export",
+      priority: 10,
+      match: (c) => {
+        if (c.isPrivate) return { matched: false };
+        if (!isIntentEnabled("dashboard_export")) return { matched: false };
+        if (!c.trimmedText) return { matched: false };
+        const intent = parseDashboardIntent(c.trimmedText, { defaultWindowSpecId: c.defaultWindowSpecId });
+        if (!intent) return { matched: false };
+        return { matched: true, data: intent };
+      },
+      run: async (c, match: MatchResult<ReturnType<typeof parseDashboardIntent>>) => {
+        const dashIntent = match.data;
+        if (!dashIntent) return { handled: false };
+        const adapterIds = resolveAdapterRequestIds({
+          channel: c.channel,
+          chatId: c.chatId,
+          messageId: c.messageId,
+          replyToId: c.replyToId,
+          explicitRetry: c.explicitRetry,
+        });
+        const handled = await dispatchDashboardExport({
+          storageDir: c.storageDir,
+          config: c.config,
+          allowlistMode: c.allowlistMode,
+          ownerChatId: c.ownerChatId,
+          ownerUserId: c.ownerUserId,
+          channel: c.channel,
+          chatId: c.chatId,
+          messageId: c.messageId,
+          replyToId: c.replyToId,
+          userId: c.userId,
+          text: c.text,
+          isGroup: c.isGroup,
+          mentionsBot: c.mentionsBot,
+          replyText: c.trimmedReplyText,
+          sendText: c.send,
+          intent: dashIntent,
+          adapterEntry: true,
+          requestId: adapterIds?.dispatchRequestId,
+          requestIdBase: adapterIds?.requestIdBase,
+          attempt: adapterIds?.attempt,
+          requestExpired: adapterIds?.expired,
+        });
+        return { handled };
+      },
+    },
+  ];
+  return runPipeline(ctx, steps);
 }
 
 const ADAPTER_DEDUPE_WINDOW_SEC = parseIntEnv(
@@ -1674,18 +1878,40 @@ export async function handleAdapterIntentIfAny(params: {
     send,
   } = params;
 
-  const trimmedText = String(text || "").trim();
-  const trimmedReplyText = String(replyText || "").trim();
-  if (!trimmedText && !trimmedReplyText) return false;
-
-  const hints = buildIntentHints({
+  const ctx = buildAdapterContext({
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
     channel,
-    text: trimmedText,
+    chatId,
+    messageId,
+    replyToId,
+    userId,
+    text,
+    replyText,
     isGroup,
     mentionsBot,
-    replyToId,
+    send,
   });
-  const { cleanedText, intentRawText, summaryRequested, explainRequested, resolveText, allowResolve } = hints;
+
+  const {
+    trimmedText,
+    trimmedReplyText,
+    cleanedText,
+    intentRawText,
+    summaryRequested,
+    explainRequested,
+    resolveText,
+    allowResolve,
+    explicitRetry,
+    isPrivate,
+    projectId,
+    defaultWindowSpecId,
+  } = ctx;
+
+  if (!trimmedText && !trimmedReplyText) return false;
 
   if (process.env.CHAT_GATEWAY_ROUTE_TRACE === "1") {
     appendLedger(storageDir, {
@@ -1706,106 +1932,8 @@ export async function handleAdapterIntentIfAny(params: {
     });
   }
 
-  const explicitRetry = wantsRetry(intentRawText);
-  const isPrivate = !isGroup;
-
-  const strategyRequested = /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i.test(cleanedText);
-  const strategyCommandOk = !isGroup || /^\/strategy\b/i.test(cleanedText);
-  if (strategyRequested && strategyCommandOk && isIntentEnabled("alert_strategy")) {
-    const adapterIds = resolveAdapterRequestIds({
-      channel,
-      chatId,
-      messageId,
-      replyToId,
-      explicitRetry,
-    });
-    return handleStrategyIfAny({
-      storageDir,
-      config,
-      allowlistMode,
-      ownerChatId,
-      ownerUserId,
-      channel,
-      chatId,
-      userId,
-      isGroup,
-      mentionsBot,
-      text: cleanedText,
-      send,
-      adapterEntry: true,
-      requestId: adapterIds?.dispatchRequestId,
-      requestIdBase: adapterIds?.requestIdBase,
-      attempt: adapterIds?.attempt,
-    });
-  }
-
-  const queryRequested = /^\/(event|evidence|gate|eval|evaluation|reliability|config|health)\b/i.test(cleanedText);
-  if (queryRequested && isIntentEnabled("alert_query")) {
-    const adapterIds = resolveAdapterRequestIds({
-      channel,
-      chatId,
-      messageId,
-      replyToId,
-      explicitRetry,
-    });
-    return handleQueryIfAny({
-      storageDir,
-      config,
-      allowlistMode,
-      ownerChatId,
-      ownerUserId,
-      channel,
-      chatId,
-      userId,
-      isGroup,
-      mentionsBot,
-      text: cleanedText,
-      send,
-      adapterEntry: true,
-      requestId: adapterIds?.dispatchRequestId,
-      requestIdBase: adapterIds?.requestIdBase,
-      attempt: adapterIds?.attempt,
-    });
-  }
-
-  // v1: dashboard_export（优先于新闻摘要）
-  const projectId = resolveProjectId(config);
-  const defaultWindowSpecId = resolveDefaultWindowSpecId(projectId || undefined) || undefined;
-  const dashboardEnabled = isIntentEnabled("dashboard_export");
-  const dashIntent = !isPrivate && dashboardEnabled && trimmedText
-    ? parseDashboardIntent(trimmedText, { defaultWindowSpecId })
-    : null;
-  if (dashIntent) {
-    const adapterIds = resolveAdapterRequestIds({
-      channel,
-      chatId,
-      messageId,
-      replyToId,
-      explicitRetry,
-    });
-    return dispatchDashboardExport({
-      storageDir,
-      config,
-      allowlistMode,
-      ownerChatId,
-      ownerUserId,
-      channel,
-      chatId,
-      messageId,
-      replyToId,
-      userId,
-      text,
-      isGroup,
-      mentionsBot,
-      replyText: trimmedReplyText,
-      sendText: send,
-      intent: dashIntent,
-      adapterEntry: true,
-      requestId: adapterIds?.dispatchRequestId,
-      requestIdBase: adapterIds?.requestIdBase,
-      attempt: adapterIds?.attempt,
-      requestExpired: adapterIds?.expired,
-    });
+  if (await runPrimaryIntentPipeline(ctx)) {
+    return true;
   }
 
   let pendingResolveResponse: string | null = null;
