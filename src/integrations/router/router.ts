@@ -1008,26 +1008,12 @@ async function runExplainSummaryFlow(
   pendingResolveResponse: string | null,
 ): Promise<boolean> {
   const {
-    storageDir,
-    config,
-    allowlistMode,
-    ownerChatId,
-    ownerUserId,
-    channel,
     chatId,
-    messageId,
-    replyToId,
-    userId,
     isGroup,
-    mentionsBot,
-    explicitRetry,
-    trimmedReplyText,
-    trimmedText,
     summaryRequested,
     explainRequested,
     allowResolve,
     isPrivate,
-    projectId,
     send,
   } = ctx;
 
@@ -1043,31 +1029,177 @@ async function runExplainSummaryFlow(
     return false;
   }
 
-  if (explainRequested && isIntentEnabled("alert_explain")) {
-    const handled = await handleAlertExplainIntent({
-      storageDir,
-      config,
-      allowlistMode,
-      ownerChatId,
-      ownerUserId,
-      channel,
-      chatId,
-      messageId,
-      replyToId,
-      userId,
-      isGroup,
-      mentionsBot,
-      replyText: trimmedReplyText,
-      send,
-      explicitRetry,
-      rawAlertOverride: trimmedReplyText,
-    });
-    if (handled) {
-      return true;
-    }
+  const steps: Array<PipelineStep<AdapterContext, any>> = [
+    {
+      name: "alert_explain",
+      priority: 10,
+      match: (c) => ({
+        matched: c.explainRequested && isIntentEnabled("alert_explain"),
+      }),
+      run: async (c) => {
+        const handled = await handleAlertExplainIntent({
+          storageDir: c.storageDir,
+          config: c.config,
+          allowlistMode: c.allowlistMode,
+          ownerChatId: c.ownerChatId,
+          ownerUserId: c.ownerUserId,
+          channel: c.channel,
+          chatId: c.chatId,
+          messageId: c.messageId,
+          replyToId: c.replyToId,
+          userId: c.userId,
+          isGroup: c.isGroup,
+          mentionsBot: c.mentionsBot,
+          replyText: c.trimmedReplyText,
+          send: c.send,
+          explicitRetry: c.explicitRetry,
+          rawAlertOverride: c.trimmedReplyText,
+        });
+        return { handled };
+      },
+    },
+    {
+      name: "news_summary",
+      match: (c) => ({
+        matched: c.summaryRequested || c.explainRequested,
+      }),
+      run: async (c) => {
+        if (!isIntentEnabled("news_summary")) return { handled: false };
+
+        let rawAlert = c.trimmedReplyText;
+        if (!rawAlert && !c.isGroup) {
+          rawAlert = getLastAlert(c.storageDir, c.chatId);
+        }
+        if (!rawAlert) {
+          if (c.isGroup) {
+            await c.send(c.chatId, "请回复一条新闻告警再发送摘要请求。");
+          } else {
+            await c.send(c.chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下 / 摘要 200）。");
+          }
+          return { handled: true };
+        }
+
+        const isNews = isNewsAlert(rawAlert);
+        const summaryIntent = c.summaryRequested || (isNews && c.explainRequested);
+        if (!summaryIntent) return { handled: false };
+
+        if (!isNews) {
+          await c.send(c.chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
+          return { handled: true };
+        }
+
+        const gate = checkExplainGate({
+          storageDir: c.storageDir,
+          config: c.config,
+          allowlistMode: c.allowlistMode,
+          ownerChatId: c.ownerChatId,
+          ownerUserId: c.ownerUserId,
+          channel: c.channel,
+          chatId: c.chatId,
+          userId: c.userId,
+          isGroup: c.isGroup,
+          mentionsBot: c.mentionsBot,
+          hasReply: Boolean(c.trimmedReplyText),
+        });
+        if (!gate.allowed) {
+          if (gate.block === "reply" && gate.message) {
+            await c.send(c.chatId, gate.message);
+          }
+          return { handled: gate.block !== "ignore" };
+        }
+
+        const adapterIds = resolveAdapterRequestIds({
+          channel: c.channel,
+          chatId: c.chatId,
+          messageId: c.messageId,
+          replyToId: c.replyToId,
+          explicitRetry: c.explicitRetry,
+        });
+        if (!adapterIds) {
+          await runNewsSummary({
+            storageDir: c.storageDir,
+            chatId: c.chatId,
+            userId: c.userId,
+            messageId: c.messageId,
+            replyToId: c.replyToId,
+            rawAlert,
+            send: c.send,
+            channel: c.channel,
+            maxChars: resolveSummaryLength(c.trimmedText),
+            config: c.config,
+            adapterEntry: true,
+          });
+          return { handled: true };
+        }
+
+        if (!c.projectId) {
+          await c.send(c.chatId, rejectText("未配置默认项目，无法生成摘要。"));
+          appendLedger(c.storageDir, {
+            ts_utc: nowIso(),
+            channel: c.channel,
+            chat_id: c.chatId,
+            user_id: c.userId,
+            cmd: "news_summary_reject",
+            request_id: adapterIds.dispatchRequestId,
+            request_id_base: adapterIds.requestIdBase,
+            adapter_trace_id: adapterIds.requestIdBase,
+            attempt: adapterIds.attempt,
+            schema_version: INTENT_SCHEMA_VERSION,
+            intent_version: INTENT_VERSION,
+            error_code: "missing_project_id",
+            raw: c.trimmedText,
+            adapter_entry: true,
+          });
+          return { handled: true };
+        }
+
+        if (adapterIds.expired) {
+          await c.send(c.chatId, rejectText("请求已过期，请重新发起摘要。"));
+          appendLedger(c.storageDir, {
+            ts_utc: nowIso(),
+            channel: c.channel,
+            chat_id: c.chatId,
+            user_id: c.userId,
+            cmd: "news_summary_reject",
+            request_id: adapterIds.dispatchRequestId,
+            request_id_base: adapterIds.requestIdBase,
+            adapter_trace_id: adapterIds.requestIdBase,
+            attempt: adapterIds.attempt,
+            schema_version: INTENT_SCHEMA_VERSION,
+            intent_version: INTENT_VERSION,
+            error_code: "request_id_expired",
+            raw: c.trimmedText,
+            adapter_entry: true,
+          });
+          return { handled: true };
+        }
+
+        await c.send(c.chatId, "🧠 正在生成新闻摘要…");
+        await runNewsSummary({
+          storageDir: c.storageDir,
+          chatId: c.chatId,
+          userId: c.userId,
+          messageId: c.messageId,
+          replyToId: c.replyToId,
+          rawAlert,
+          send: c.send,
+          channel: c.channel,
+          maxChars: resolveSummaryLength(c.trimmedText),
+          config: c.config,
+          adapterEntry: true,
+          requestId: adapterIds.dispatchRequestId,
+          requestIdBase: adapterIds.requestIdBase,
+          attempt: adapterIds.attempt,
+        });
+        return { handled: true };
+      },
+    },
+  ];
+
+  if (await runPipeline(ctx, steps)) {
+    return true;
   }
 
-  // v1: news_summary（仅在明确请求摘要时进入 adapter）
   if (!isIntentEnabled("news_summary")) {
     if (pendingResolveResponse) {
       await send(chatId, pendingResolveResponse);
@@ -1083,132 +1215,7 @@ async function runExplainSummaryFlow(
     return false;
   }
 
-  let rawAlert = trimmedReplyText;
-  if (!rawAlert && !isGroup) {
-    rawAlert = getLastAlert(storageDir, chatId);
-  }
-  if (!rawAlert) {
-    if (isGroup) {
-      await send(chatId, "请回复一条新闻告警再发送摘要请求。");
-    } else {
-      await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下 / 摘要 200）。");
-    }
-    return true;
-  }
-
-  const isNews = isNewsAlert(rawAlert);
-  const summaryIntent = summaryRequested || (isNews && explainRequested);
-  if (!summaryIntent) return false;
-
-  if (!isNews) {
-    await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
-    return true;
-  }
-
-  const gate = checkExplainGate({
-    storageDir,
-    config,
-    allowlistMode,
-    ownerChatId,
-    ownerUserId,
-    channel,
-    chatId,
-    userId,
-    isGroup,
-    mentionsBot,
-    hasReply: Boolean(trimmedReplyText),
-  });
-  if (!gate.allowed) {
-    if (gate.block === "reply" && gate.message) {
-      await send(chatId, gate.message);
-    }
-    return gate.block !== "ignore";
-  }
-
-  const adapterIds = resolveAdapterRequestIds({
-    channel,
-    chatId,
-    messageId,
-    replyToId,
-    explicitRetry,
-  });
-  if (!adapterIds) {
-    await runNewsSummary({
-      storageDir,
-      chatId,
-      userId,
-      messageId,
-      replyToId,
-      rawAlert,
-      send,
-      channel,
-      maxChars: resolveSummaryLength(trimmedText),
-      config,
-      adapterEntry: true,
-    });
-    return true;
-  }
-
-  if (!projectId) {
-    await send(chatId, rejectText("未配置默认项目，无法生成摘要。"));
-    appendLedger(storageDir, {
-      ts_utc: nowIso(),
-      channel,
-      chat_id: chatId,
-      user_id: userId,
-      cmd: "news_summary_reject",
-      request_id: adapterIds.dispatchRequestId,
-      request_id_base: adapterIds.requestIdBase,
-      adapter_trace_id: adapterIds.requestIdBase,
-      attempt: adapterIds.attempt,
-      schema_version: INTENT_SCHEMA_VERSION,
-      intent_version: INTENT_VERSION,
-      error_code: "missing_project_id",
-      raw: trimmedText,
-      adapter_entry: true,
-    });
-    return true;
-  }
-
-  if (adapterIds.expired) {
-    await send(chatId, rejectText("请求已过期，请重新发起摘要。"));
-    appendLedger(storageDir, {
-      ts_utc: nowIso(),
-      channel,
-      chat_id: chatId,
-      user_id: userId,
-      cmd: "news_summary_reject",
-      request_id: adapterIds.dispatchRequestId,
-      request_id_base: adapterIds.requestIdBase,
-      adapter_trace_id: adapterIds.requestIdBase,
-      attempt: adapterIds.attempt,
-      schema_version: INTENT_SCHEMA_VERSION,
-      intent_version: INTENT_VERSION,
-      error_code: "request_id_expired",
-      raw: trimmedText,
-      adapter_entry: true,
-    });
-    return true;
-  }
-
-  await send(chatId, "🧠 正在生成新闻摘要…");
-  await runNewsSummary({
-    storageDir,
-    chatId,
-    userId,
-    messageId,
-    replyToId,
-    rawAlert,
-    send,
-    channel,
-    maxChars: resolveSummaryLength(trimmedText),
-    config,
-    adapterEntry: true,
-    requestId: adapterIds.dispatchRequestId,
-    requestIdBase: adapterIds.requestIdBase,
-    attempt: adapterIds.attempt,
-  });
-  return true;
+  return false;
 }
 
 const ADAPTER_DEDUPE_WINDOW_SEC = parseIntEnv(
