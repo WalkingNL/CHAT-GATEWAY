@@ -197,9 +197,17 @@ function resolveOnDemandConfigForNews(config?: LoadedConfig): OnDemandConfig {
   const tokenEnv = String(
     onDemand.token_env
       || (anyProj as any)?.on_demand_token_env
-      || "CRYPTO_AGENT_ON_DEMAND_TOKEN",
-  );
-  const token = String(process.env[tokenEnv] || onDemand.token || envToken || "").trim();
+      || "",
+  ).trim();
+  const token = String(
+    (tokenEnv ? process.env[tokenEnv] : "")
+      || onDemand.token
+      || (anyProj as any)?.on_demand_token
+      || envToken
+      || "",
+  ).trim();
+
+  if (!token) throw new Error("missing on-demand token");
 
   return { url, token, projectId };
 }
