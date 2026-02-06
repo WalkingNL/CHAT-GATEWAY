@@ -786,10 +786,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "data_feeds_status",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_status" }),
       run: async () => {
-        if (!await ensureResolveIntentEnabled(ctx, "data_feeds_status")) {
-          return { handled: true };
-        }
-        if (!await ensureResolveIntentAuthorized(ctx, "data_feeds_status")) {
+        if (!await ensureResolveIntentReady(ctx, "data_feeds_status")) {
           return { handled: true };
         }
         await runDataFeedsStatus({
@@ -873,10 +870,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "data_feeds_hotspots",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_hotspots" }),
       run: async () => {
-        if (!await ensureResolveIntentEnabled(ctx, "data_feeds_hotspots")) {
-          return { handled: true };
-        }
-        if (!await ensureResolveIntentAuthorized(ctx, "data_feeds_hotspots")) {
+        if (!await ensureResolveIntentReady(ctx, "data_feeds_hotspots")) {
           return { handled: true };
         }
         await runDataFeedsHotspots({
@@ -899,10 +893,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "data_feeds_ops_summary",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_ops_summary" }),
       run: async () => {
-        if (!await ensureResolveIntentEnabled(ctx, "data_feeds_ops_summary")) {
-          return { handled: true };
-        }
-        if (!await ensureResolveIntentAuthorized(ctx, "data_feeds_ops_summary")) {
+        if (!await ensureResolveIntentReady(ctx, "data_feeds_ops_summary")) {
           return { handled: true };
         }
         await runDataFeedsOpsSummary({
@@ -925,10 +916,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "news_hot",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_hot" }),
       run: async () => {
-        if (!await ensureResolveIntentEnabled(ctx, "news_hot")) {
-          return { handled: true };
-        }
-        if (!await ensureResolveIntentAuthorized(ctx, "news_hot")) {
+        if (!await ensureResolveIntentReady(ctx, "news_hot")) {
           return { handled: true };
         }
         await runNewsQuery({
@@ -952,10 +940,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "news_refresh",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_refresh" }),
       run: async () => {
-        if (!await ensureResolveIntentEnabled(ctx, "news_refresh")) {
-          return { handled: true };
-        }
-        if (!await ensureResolveIntentAuthorized(ctx, "news_refresh")) {
+        if (!await ensureResolveIntentReady(ctx, "news_refresh")) {
           return { handled: true };
         }
         await runNewsQuery({
@@ -1914,6 +1899,14 @@ async function ensureResolveIntentAuthorized(
   intent: string,
 ): Promise<boolean> {
   return ensureIntentAuthorized(ctx, intent, resolveIntentMeta(intent));
+}
+
+async function ensureResolveIntentReady(
+  ctx: AdapterContext,
+  intent: string,
+): Promise<boolean> {
+  if (!await ensureResolveIntentEnabled(ctx, intent)) return false;
+  return ensureResolveIntentAuthorized(ctx, intent);
 }
 
 type OnDemandConfig = { url: string; token: string; projectId?: string | null };
