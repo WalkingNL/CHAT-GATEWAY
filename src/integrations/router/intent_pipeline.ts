@@ -6,6 +6,7 @@ export type MatchResult<T = unknown> = {
 export type StepResult = {
   handled: boolean;
   stop?: boolean;
+  result?: boolean;
 };
 
 export type PipelineStep<C, M = unknown> = {
