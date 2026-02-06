@@ -1052,22 +1052,18 @@ async function runResolveFlow(ctx: AdapterContext): Promise<ResolveFlowResult> {
             channel,
             taskIdPrefix: `${taskPrefix(channel)}_explain`,
           });
-          appendLedger(storageDir, {
-            ts_utc: nowIso(),
+          appendAlertExplainLedger({
+            storageDir,
             channel,
-            chat_id: chatId,
-            user_id: userId,
-            cmd: "alert_explain",
-            request_id: adapterIds.dispatchRequestId,
-            request_id_base: adapterIds.requestIdBase,
-            adapter_trace_id: adapterIds.requestIdBase,
+            chatId,
+            userId,
+            requestId: adapterIds.dispatchRequestId,
+            requestIdBase: adapterIds.requestIdBase,
             attempt: adapterIds.attempt,
-            schema_version: INTENT_SCHEMA_VERSION,
-            intent_version: INTENT_VERSION,
             ok: explainResult.ok,
-            err: explainResult.ok ? undefined : explainResult.errCode || "unknown",
-            latency_ms: explainResult.latencyMs,
-            adapter_entry: true,
+            errCode: explainResult.ok ? undefined : explainResult.errCode || "unknown",
+            latencyMs: explainResult.latencyMs,
+            adapterEntry: true,
           });
           return { handled: true };
         },
@@ -1091,6 +1087,70 @@ async function runResolveFlow(ctx: AdapterContext): Promise<ResolveFlowResult> {
   }
 
   return { done: false, result: false, pending: pendingResolveResponse };
+}
+
+function appendAlertExplainLedger(params: {
+  storageDir: string;
+  channel: string;
+  chatId: string;
+  userId: string;
+  requestId?: string;
+  requestIdBase?: string;
+  attempt?: number;
+  ok: boolean;
+  errCode?: string;
+  latencyMs?: number;
+  adapterEntry?: boolean;
+}) {
+  const entry: any = {
+    ts_utc: nowIso(),
+    channel: params.channel,
+    chat_id: params.chatId,
+    user_id: params.userId,
+    cmd: "alert_explain",
+    request_id: params.requestId,
+    request_id_base: params.requestIdBase,
+    adapter_trace_id: params.requestIdBase,
+    attempt: params.attempt,
+    schema_version: INTENT_SCHEMA_VERSION,
+    intent_version: INTENT_VERSION,
+    ok: params.ok,
+    err: params.ok ? undefined : params.errCode || "unknown",
+    latency_ms: params.latencyMs,
+  };
+  if (params.adapterEntry) entry.adapter_entry = true;
+  appendLedger(params.storageDir, entry);
+}
+
+function appendNewsSummaryReject(params: {
+  storageDir: string;
+  channel: string;
+  chatId: string;
+  userId: string;
+  requestId?: string;
+  requestIdBase?: string;
+  attempt?: number;
+  errorCode: string;
+  raw: string;
+  adapterEntry?: boolean;
+}) {
+  const entry: any = {
+    ts_utc: nowIso(),
+    channel: params.channel,
+    chat_id: params.chatId,
+    user_id: params.userId,
+    cmd: "news_summary_reject",
+    request_id: params.requestId,
+    request_id_base: params.requestIdBase,
+    adapter_trace_id: params.requestIdBase,
+    attempt: params.attempt,
+    schema_version: INTENT_SCHEMA_VERSION,
+    intent_version: INTENT_VERSION,
+    error_code: params.errorCode,
+    raw: params.raw,
+  };
+  if (params.adapterEntry) entry.adapter_entry = true;
+  appendLedger(params.storageDir, entry);
 }
 
 
@@ -1225,42 +1285,34 @@ async function runExplainSummaryFlow(
 
         if (!c.projectId) {
           await c.send(c.chatId, rejectText("未配置默认项目，无法生成摘要。"));
-          appendLedger(c.storageDir, {
-            ts_utc: nowIso(),
+          appendNewsSummaryReject({
+            storageDir: c.storageDir,
             channel: c.channel,
-            chat_id: c.chatId,
-            user_id: c.userId,
-            cmd: "news_summary_reject",
-            request_id: adapterIds.dispatchRequestId,
-            request_id_base: adapterIds.requestIdBase,
-            adapter_trace_id: adapterIds.requestIdBase,
+            chatId: c.chatId,
+            userId: c.userId,
+            requestId: adapterIds.dispatchRequestId,
+            requestIdBase: adapterIds.requestIdBase,
             attempt: adapterIds.attempt,
-            schema_version: INTENT_SCHEMA_VERSION,
-            intent_version: INTENT_VERSION,
-            error_code: "missing_project_id",
+            errorCode: "missing_project_id",
             raw: c.trimmedText,
-            adapter_entry: true,
+            adapterEntry: true,
           });
           return { handled: true };
         }
 
         if (adapterIds.expired) {
           await c.send(c.chatId, rejectText("请求已过期，请重新发起摘要。"));
-          appendLedger(c.storageDir, {
-            ts_utc: nowIso(),
+          appendNewsSummaryReject({
+            storageDir: c.storageDir,
             channel: c.channel,
-            chat_id: c.chatId,
-            user_id: c.userId,
-            cmd: "news_summary_reject",
-            request_id: adapterIds.dispatchRequestId,
-            request_id_base: adapterIds.requestIdBase,
-            adapter_trace_id: adapterIds.requestIdBase,
+            chatId: c.chatId,
+            userId: c.userId,
+            requestId: adapterIds.dispatchRequestId,
+            requestIdBase: adapterIds.requestIdBase,
             attempt: adapterIds.attempt,
-            schema_version: INTENT_SCHEMA_VERSION,
-            intent_version: INTENT_VERSION,
-            error_code: "request_id_expired",
+            errorCode: "request_id_expired",
             raw: c.trimmedText,
-            adapter_entry: true,
+            adapterEntry: true,
           });
           return { handled: true };
         }
@@ -2861,22 +2913,18 @@ async function handleAlertExplainIntent(params: {
     channel,
     taskIdPrefix: `${taskPrefix(channel)}_explain`,
   });
-  appendLedger(storageDir, {
-    ts_utc: nowIso(),
+  appendAlertExplainLedger({
+    storageDir,
     channel,
-    chat_id: chatId,
-    user_id: userId,
-    cmd: "alert_explain",
-    request_id: adapterIds?.dispatchRequestId,
-    request_id_base: adapterIds?.requestIdBase,
-    adapter_trace_id: adapterIds?.requestIdBase,
+    chatId,
+    userId,
+    requestId: adapterIds?.dispatchRequestId,
+    requestIdBase: adapterIds?.requestIdBase,
     attempt: adapterIds?.attempt,
-    schema_version: INTENT_SCHEMA_VERSION,
-    intent_version: INTENT_VERSION,
     ok: explainResult.ok,
-    err: explainResult.ok ? undefined : explainResult.errCode || "unknown",
-    latency_ms: explainResult.latencyMs,
-    adapter_entry: true,
+    errCode: explainResult.ok ? undefined : explainResult.errCode || "unknown",
+    latencyMs: explainResult.latencyMs,
+    adapterEntry: true,
   });
   return true;
 }
