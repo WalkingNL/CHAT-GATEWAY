@@ -75,6 +75,7 @@ type IntentMeta = {
   allowGroup?: boolean;
   requiresAuth?: boolean;
   groupDenyAction?: "ignore" | "reject";
+  gateKind?: "explain";
 };
 
 const INTENT_REGISTRY: Record<string, IntentMeta> = {
@@ -89,11 +90,13 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
   alert_explain: {
     name: "alert_explain",
     enabledKey: "alert_explain",
+    gateKind: "explain",
   },
   news_summary: {
     name: "news_summary",
     enabledKey: "news_summary",
     disabledMessage: "未开放新闻摘要能力。",
+    gateKind: "explain",
   },
   data_feeds_status: {
     name: "data_feeds_status",
@@ -936,20 +939,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
           return { handled: true };
         }
-          const gateResult = await applyExplainGate({
-            storageDir,
-            config,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-            mentionsBot,
-            hasReply: Boolean(trimmedReplyText),
-            send,
-          });
+          const gateResult = await applyIntentGate(ctx, "news_summary", Boolean(trimmedReplyText));
           if (!gateResult.allowed) {
             return { handled: gateResult.handled };
           }
@@ -1009,20 +999,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           });
           return { handled: true };
         }
-          const gateResult = await applyExplainGate({
-            storageDir,
-            config,
-            allowlistMode,
-            ownerChatId,
-            ownerUserId,
-            channel,
-            chatId,
-            userId,
-            isGroup,
-            mentionsBot,
-            hasReply: Boolean(trimmedReplyText),
-            send,
-          });
+          const gateResult = await applyIntentGate(ctx, "alert_explain", Boolean(trimmedReplyText));
           if (!gateResult.allowed) {
             return { handled: gateResult.handled };
           }
@@ -1298,20 +1275,7 @@ const EXPLAIN_SUMMARY_STEPS: Array<PipelineStep<AdapterContext, any>> = [
         return { handled: true };
       }
 
-      const gateResult = await applyExplainGate({
-        storageDir: c.storageDir,
-        config: c.config,
-        allowlistMode: c.allowlistMode,
-        ownerChatId: c.ownerChatId,
-        ownerUserId: c.ownerUserId,
-        channel: c.channel,
-        chatId: c.chatId,
-        userId: c.userId,
-        isGroup: c.isGroup,
-        mentionsBot: c.mentionsBot,
-        hasReply: Boolean(c.trimmedReplyText),
-        send: c.send,
-      });
+      const gateResult = await applyIntentGate(c, "news_summary", Boolean(c.trimmedReplyText));
       if (!gateResult.allowed) {
         return { handled: gateResult.handled };
       }
@@ -1781,6 +1745,45 @@ async function applyExplainGate(params: {
       await params.send(params.chatId, gate.message);
     }
     return { allowed: false, handled: gate.block !== "ignore" };
+  }
+  return { allowed: true, handled: false };
+}
+
+type IntentGateContext = Pick<
+  AdapterContext,
+  | "storageDir"
+  | "allowlistMode"
+  | "ownerChatId"
+  | "ownerUserId"
+  | "channel"
+  | "chatId"
+  | "userId"
+  | "isGroup"
+  | "mentionsBot"
+  | "send"
+> & { config?: LoadedConfig };
+
+async function applyIntentGate(
+  ctx: IntentGateContext,
+  intent: string,
+  hasReply: boolean,
+): Promise<{ allowed: boolean; handled: boolean }> {
+  const meta = getIntentMeta(intent);
+  if (meta?.gateKind === "explain") {
+    return applyExplainGate({
+      storageDir: ctx.storageDir,
+      config: ctx.config,
+      allowlistMode: ctx.allowlistMode,
+      ownerChatId: ctx.ownerChatId,
+      ownerUserId: ctx.ownerUserId,
+      channel: ctx.channel,
+      chatId: ctx.chatId,
+      userId: ctx.userId,
+      isGroup: ctx.isGroup,
+      mentionsBot: ctx.mentionsBot,
+      hasReply,
+      send: ctx.send,
+    });
   }
   return { allowed: true, handled: false };
 }
@@ -3021,7 +3024,7 @@ async function handleAlertExplainIntent(params: {
     return false;
   }
 
-  const gateResult = await applyExplainGate({
+  const gateResult = await applyIntentGate({
     storageDir,
     config,
     allowlistMode,
@@ -3032,9 +3035,8 @@ async function handleAlertExplainIntent(params: {
     userId,
     isGroup,
     mentionsBot,
-    hasReply: Boolean(replyText),
     send,
-  });
+  }, "alert_explain", Boolean(replyText));
   if (!gateResult.allowed) {
     return gateResult.handled;
   }
