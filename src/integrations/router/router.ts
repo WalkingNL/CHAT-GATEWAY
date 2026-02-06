@@ -68,6 +68,72 @@ function parseIntEnv(name: string, fallback: number): number {
   return Math.max(0, Math.floor(val));
 }
 
+type ResolveIntentMeta = {
+  intent: string;
+  enabledKey?: string;
+  disabledMessage?: string;
+  allowGroup?: boolean;
+  requiresAuth?: boolean;
+};
+
+const RESOLVE_INTENT_META: Record<string, ResolveIntentMeta> = {
+  data_feeds_status: {
+    intent: "data_feeds_status",
+    enabledKey: "data_feeds_status",
+    disabledMessage: "未开放数据源查询能力。",
+    allowGroup: false,
+    requiresAuth: true,
+  },
+  data_feeds_asset_status: {
+    intent: "data_feeds_asset_status",
+    enabledKey: "data_feeds_asset_status",
+    disabledMessage: "未开放数据源查询能力。",
+    allowGroup: false,
+    requiresAuth: true,
+  },
+  data_feeds_source_status: {
+    intent: "data_feeds_source_status",
+    enabledKey: "data_feeds_source_status",
+    disabledMessage: "未开放数据源查询能力。",
+    allowGroup: false,
+    requiresAuth: true,
+  },
+  data_feeds_hotspots: {
+    intent: "data_feeds_hotspots",
+    enabledKey: "data_feeds_hotspots",
+    disabledMessage: "未开放数据源查询能力。",
+    allowGroup: false,
+    requiresAuth: true,
+  },
+  data_feeds_ops_summary: {
+    intent: "data_feeds_ops_summary",
+    enabledKey: "data_feeds_ops_summary",
+    disabledMessage: "未开放数据源查询能力。",
+    allowGroup: false,
+    requiresAuth: true,
+  },
+  news_hot: {
+    intent: "news_hot",
+    enabledKey: "news_hot",
+    disabledMessage: "未开放新闻查询能力。",
+    allowGroup: false,
+    requiresAuth: true,
+  },
+  news_refresh: {
+    intent: "news_refresh",
+    enabledKey: "news_refresh",
+    disabledMessage: "未开放新闻查询能力。",
+    allowGroup: false,
+    requiresAuth: true,
+  },
+};
+
+const RESOLVE_GROUP_SKIP_INTENTS = new Set(
+  Object.values(RESOLVE_INTENT_META)
+    .filter(meta => meta.allowGroup === false)
+    .map(meta => meta.intent),
+);
+
 type AdapterContext = {
   storageDir: string;
   config: LoadedConfig;
@@ -595,22 +661,10 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "data_feeds_status",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_status" }),
       run: async () => {
-        if (isGroup) return { handled: true, result: false };
-        if (!isIntentEnabled("data_feeds_status")) {
-          await send(chatId, rejectText("未开放数据源查询能力。"));
+        if (!await ensureResolveIntentEnabled(ctx, "data_feeds_status")) {
           return { handled: true };
         }
-        if (!isAllowedChat({
-          storageDir,
-          allowlistMode,
-          ownerChatId,
-          ownerUserId,
-          channel,
-          chatId,
-          userId,
-          isGroup,
-        })) {
-          await send(chatId, rejectText("未授权操作"));
+        if (!await ensureResolveIntentAuthorized(ctx, "data_feeds_status")) {
           return { handled: true };
         }
         await runDataFeedsStatus({
@@ -632,9 +686,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "data_feeds_asset_status",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_asset_status" }),
       run: async () => {
-        if (isGroup) return { handled: true, result: false };
-        if (!isIntentEnabled("data_feeds_asset_status")) {
-          await send(chatId, rejectText("未开放数据源查询能力。"));
+        if (!await ensureResolveIntentEnabled(ctx, "data_feeds_asset_status")) {
           return { handled: true };
         }
         const symbol = String(resolveRes.params?.symbol || "").trim();
@@ -642,17 +694,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           await send(chatId, "请指定资产（例如：ETHUSDT）。");
           return { handled: true };
         }
-        if (!isAllowedChat({
-          storageDir,
-          allowlistMode,
-          ownerChatId,
-          ownerUserId,
-          channel,
-          chatId,
-          userId,
-          isGroup,
-        })) {
-          await send(chatId, rejectText("未授权操作"));
+        if (!await ensureResolveIntentAuthorized(ctx, "data_feeds_asset_status")) {
           return { handled: true };
         }
         await runDataFeedsAssetStatus({
@@ -675,9 +717,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "data_feeds_source_status",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_source_status" }),
       run: async () => {
-        if (isGroup) return { handled: true, result: false };
-        if (!isIntentEnabled("data_feeds_source_status")) {
-          await send(chatId, rejectText("未开放数据源查询能力。"));
+        if (!await ensureResolveIntentEnabled(ctx, "data_feeds_source_status")) {
           return { handled: true };
         }
         const feedId = String(resolveRes.params?.feed_id || "").trim();
@@ -685,17 +725,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           await send(chatId, "请指定 feed_id（例如：ohlcv_1m）。");
           return { handled: true };
         }
-        if (!isAllowedChat({
-          storageDir,
-          allowlistMode,
-          ownerChatId,
-          ownerUserId,
-          channel,
-          chatId,
-          userId,
-          isGroup,
-        })) {
-          await send(chatId, rejectText("未授权操作"));
+        if (!await ensureResolveIntentAuthorized(ctx, "data_feeds_source_status")) {
           return { handled: true };
         }
         await runDataFeedsSourceStatus({
@@ -718,22 +748,10 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "data_feeds_hotspots",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_hotspots" }),
       run: async () => {
-        if (isGroup) return { handled: true, result: false };
-        if (!isIntentEnabled("data_feeds_hotspots")) {
-          await send(chatId, rejectText("未开放数据源查询能力。"));
+        if (!await ensureResolveIntentEnabled(ctx, "data_feeds_hotspots")) {
           return { handled: true };
         }
-        if (!isAllowedChat({
-          storageDir,
-          allowlistMode,
-          ownerChatId,
-          ownerUserId,
-          channel,
-          chatId,
-          userId,
-          isGroup,
-        })) {
-          await send(chatId, rejectText("未授权操作"));
+        if (!await ensureResolveIntentAuthorized(ctx, "data_feeds_hotspots")) {
           return { handled: true };
         }
         await runDataFeedsHotspots({
@@ -756,22 +774,10 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "data_feeds_ops_summary",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "data_feeds_ops_summary" }),
       run: async () => {
-        if (isGroup) return { handled: true, result: false };
-        if (!isIntentEnabled("data_feeds_ops_summary")) {
-          await send(chatId, rejectText("未开放数据源查询能力。"));
+        if (!await ensureResolveIntentEnabled(ctx, "data_feeds_ops_summary")) {
           return { handled: true };
         }
-        if (!isAllowedChat({
-          storageDir,
-          allowlistMode,
-          ownerChatId,
-          ownerUserId,
-          channel,
-          chatId,
-          userId,
-          isGroup,
-        })) {
-          await send(chatId, rejectText("未授权操作"));
+        if (!await ensureResolveIntentAuthorized(ctx, "data_feeds_ops_summary")) {
           return { handled: true };
         }
         await runDataFeedsOpsSummary({
@@ -794,22 +800,10 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "news_hot",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_hot" }),
       run: async () => {
-        if (isGroup) return { handled: true, result: false };
-        if (!isIntentEnabled("news_hot")) {
-          await send(chatId, rejectText("未开放新闻查询能力。"));
+        if (!await ensureResolveIntentEnabled(ctx, "news_hot")) {
           return { handled: true };
         }
-        if (!isAllowedChat({
-          storageDir,
-          allowlistMode,
-          ownerChatId,
-          ownerUserId,
-          channel,
-          chatId,
-          userId,
-          isGroup,
-        })) {
-          await send(chatId, rejectText("未授权操作"));
+        if (!await ensureResolveIntentAuthorized(ctx, "news_hot")) {
           return { handled: true };
         }
         await runNewsQuery({
@@ -833,22 +827,10 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "news_refresh",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_refresh" }),
       run: async () => {
-        if (isGroup) return { handled: true, result: false };
-        if (!isIntentEnabled("news_refresh")) {
-          await send(chatId, rejectText("未开放新闻查询能力。"));
+        if (!await ensureResolveIntentEnabled(ctx, "news_refresh")) {
           return { handled: true };
         }
-        if (!isAllowedChat({
-          storageDir,
-          allowlistMode,
-          ownerChatId,
-          ownerUserId,
-          channel,
-          chatId,
-          userId,
-          isGroup,
-        })) {
-          await send(chatId, rejectText("未授权操作"));
+        if (!await ensureResolveIntentAuthorized(ctx, "news_refresh")) {
           return { handled: true };
         }
         await runNewsQuery({
@@ -1097,16 +1079,7 @@ async function runResolveFlow(ctx: AdapterContext): Promise<ResolveFlowResult> {
       defaultWindowSpecId,
     });
 
-    const groupSkipIntents = new Set([
-      "data_feeds_status",
-      "data_feeds_asset_status",
-      "data_feeds_source_status",
-      "data_feeds_hotspots",
-      "data_feeds_ops_summary",
-      "news_hot",
-      "news_refresh",
-    ]);
-    if (resolveRes.ok && resolveRes.intent && isGroup && groupSkipIntents.has(resolveRes.intent)) {
+    if (resolveRes.ok && resolveRes.intent && isGroup && RESOLVE_GROUP_SKIP_INTENTS.has(resolveRes.intent)) {
       return { done: true, result: false, pending: null };
     }
 
@@ -1673,6 +1646,47 @@ function isAllowedChat(params: {
   return allowlistMode === "owner_only"
     ? (isGroup ? isOwnerUser : isOwnerChat)
     : authState.allowed.includes(chatId) || isOwnerUser;
+}
+
+function resolveIntentMeta(intent?: string | null): ResolveIntentMeta | null {
+  if (!intent) return null;
+  return RESOLVE_INTENT_META[intent] || null;
+}
+
+async function ensureResolveIntentEnabled(
+  ctx: AdapterContext,
+  intent: string,
+): Promise<boolean> {
+  const meta = resolveIntentMeta(intent);
+  if (!meta?.enabledKey) return true;
+  if (!isIntentEnabled(meta.enabledKey)) {
+    const message = meta.disabledMessage || "未开放相关能力。";
+    await ctx.send(ctx.chatId, rejectText(message));
+    return false;
+  }
+  return true;
+}
+
+async function ensureResolveIntentAuthorized(
+  ctx: AdapterContext,
+  intent: string,
+): Promise<boolean> {
+  const meta = resolveIntentMeta(intent);
+  if (!meta?.requiresAuth) return true;
+  if (!isAllowedChat({
+    storageDir: ctx.storageDir,
+    allowlistMode: ctx.allowlistMode,
+    ownerChatId: ctx.ownerChatId,
+    ownerUserId: ctx.ownerUserId,
+    channel: ctx.channel,
+    chatId: ctx.chatId,
+    userId: ctx.userId,
+    isGroup: ctx.isGroup,
+  })) {
+    await ctx.send(ctx.chatId, rejectText("未授权操作"));
+    return false;
+  }
+  return true;
 }
 
 type OnDemandConfig = { url: string; token: string; projectId?: string | null };
