@@ -78,6 +78,16 @@ type IntentMeta = {
   denyMessage?: string;
   groupDenyMessage?: string;
   gateKind?: "explain";
+  messages?: IntentMessages;
+};
+
+type IntentMessages = {
+  missingReplyGroup?: string;
+  missingReplyPrivate?: string;
+  missingReplyResolve?: string;
+  unsupported?: string;
+  missingProject?: string;
+  expired?: string;
 };
 
 const INTENT_REGISTRY: Record<string, IntentMeta> = {
@@ -95,12 +105,25 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     name: "alert_explain",
     enabledKey: "alert_explain",
     gateKind: "explain",
+    messages: {
+      missingReplyGroup: "请回复一条告警/新闻消息再 @我。",
+      missingReplyPrivate: "请先回复一条告警/新闻消息，然后发一句话（如：解释一下）。",
+      expired: "请求已过期，请重新发起解释。",
+    },
   },
   news_summary: {
     name: "news_summary",
     enabledKey: "news_summary",
     disabledMessage: "未开放新闻摘要能力。",
     gateKind: "explain",
+    messages: {
+      missingReplyGroup: "请回复一条新闻告警再发送摘要请求。",
+      missingReplyPrivate: "请先回复一条告警/新闻消息，然后发一句话（如：解释一下 / 摘要 200）。",
+      missingReplyResolve: "请先回复一条告警/新闻消息，然后发一句话（如：摘要 200）。",
+      unsupported: "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。",
+      missingProject: "未配置默认项目，无法生成摘要。",
+      expired: "请求已过期，请重新发起摘要。",
+    },
   },
   data_feeds_status: {
     name: "data_feeds_status",
@@ -222,6 +245,15 @@ type AdapterContext = {
 function getIntentMeta(name?: string | null): IntentMeta | null {
   if (!name) return null;
   return INTENT_REGISTRY[name] || null;
+}
+
+function getIntentMessage(intent: string, key: keyof IntentMessages): string | undefined {
+  const meta = getIntentMeta(intent);
+  return meta?.messages?.[key];
+}
+
+function resolveIntentMessage(intent: string, key: keyof IntentMessages, fallback: string): string {
+  return getIntentMessage(intent, key) || fallback;
 }
 
 function resolveGroupDenyAction(intent?: string | null): "allow" | "ignore" | "reject" {
@@ -943,11 +975,25 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           rawAlert = getLastAlert(storageDir, chatId);
         }
         if (!rawAlert) {
-          await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：摘要 200）。");
+          await send(
+            chatId,
+            resolveIntentMessage(
+              "news_summary",
+              "missingReplyResolve",
+              "请先回复一条告警/新闻消息，然后发一句话（如：摘要 200）。",
+            ),
+          );
           return { handled: true };
         }
         if (!isNewsAlert(rawAlert)) {
-          await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
+          await send(
+            chatId,
+            resolveIntentMessage(
+              "news_summary",
+              "unsupported",
+              "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。",
+            ),
+          );
           return { handled: true };
         }
           const gateResult = await applyIntentGate(ctx, "news_summary", Boolean(trimmedReplyText));
@@ -983,7 +1029,14 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           rawAlert = getLastAlert(storageDir, chatId);
         }
         if (!rawAlert) {
-          await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下）。");
+          await send(
+            chatId,
+            resolveIntentMessage(
+              "alert_explain",
+              "missingReplyPrivate",
+              "请先回复一条告警/新闻消息，然后发一句话（如：解释一下）。",
+            ),
+          );
           return { handled: true };
         }
         if (isNewsAlert(rawAlert)) {
@@ -1270,9 +1323,19 @@ const EXPLAIN_SUMMARY_STEPS: Array<PipelineStep<AdapterContext, any>> = [
       }
       if (!rawAlert) {
         if (c.isGroup) {
-          await c.send(c.chatId, "请回复一条新闻告警再发送摘要请求。");
+          await c.send(
+            c.chatId,
+            resolveIntentMessage("news_summary", "missingReplyGroup", "请回复一条新闻告警再发送摘要请求。"),
+          );
         } else {
-          await c.send(c.chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下 / 摘要 200）。");
+          await c.send(
+            c.chatId,
+            resolveIntentMessage(
+              "news_summary",
+              "missingReplyPrivate",
+              "请先回复一条告警/新闻消息，然后发一句话（如：解释一下 / 摘要 200）。",
+            ),
+          );
         }
         return { handled: true };
       }
@@ -1282,7 +1345,14 @@ const EXPLAIN_SUMMARY_STEPS: Array<PipelineStep<AdapterContext, any>> = [
       if (!summaryIntent) return { handled: false };
 
       if (!isNews) {
-        await c.send(c.chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
+        await c.send(
+          c.chatId,
+          resolveIntentMessage(
+            "news_summary",
+            "unsupported",
+            "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。",
+          ),
+        );
         return { handled: true };
       }
 
@@ -1316,7 +1386,10 @@ const EXPLAIN_SUMMARY_STEPS: Array<PipelineStep<AdapterContext, any>> = [
       }
 
       if (!c.projectId) {
-        await c.send(c.chatId, rejectText("未配置默认项目，无法生成摘要。"));
+        await c.send(
+          c.chatId,
+          rejectText(resolveIntentMessage("news_summary", "missingProject", "未配置默认项目，无法生成摘要。")),
+        );
         appendNewsSummaryReject({
           storageDir: c.storageDir,
           channel: c.channel,
@@ -1333,7 +1406,10 @@ const EXPLAIN_SUMMARY_STEPS: Array<PipelineStep<AdapterContext, any>> = [
       }
 
       if (adapterIds.expired) {
-        await c.send(c.chatId, rejectText("请求已过期，请重新发起摘要。"));
+        await c.send(
+          c.chatId,
+          rejectText(resolveIntentMessage("news_summary", "expired", "请求已过期，请重新发起摘要。")),
+        );
         appendNewsSummaryReject({
           storageDir: c.storageDir,
           channel: c.channel,
@@ -3025,9 +3101,19 @@ async function handleAlertExplainIntent(params: {
   }
   if (!rawAlert) {
     if (isGroup) {
-      await send(chatId, "请回复一条告警/新闻消息再 @我。");
+      await send(
+        chatId,
+        resolveIntentMessage("alert_explain", "missingReplyGroup", "请回复一条告警/新闻消息再 @我。"),
+      );
     } else {
-      await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下）。");
+      await send(
+        chatId,
+        resolveIntentMessage(
+          "alert_explain",
+          "missingReplyPrivate",
+          "请先回复一条告警/新闻消息，然后发一句话（如：解释一下）。",
+        ),
+      );
     }
     return true;
   }
@@ -3061,7 +3147,10 @@ async function handleAlertExplainIntent(params: {
     explicitRetry,
   });
   if (adapterIds?.expired) {
-    await send(chatId, rejectText("请求已过期，请重新发起解释。"));
+    await send(
+      chatId,
+      rejectText(resolveIntentMessage("alert_explain", "expired", "请求已过期，请重新发起解释。")),
+    );
     appendLedger(storageDir, {
       ts_utc: nowIso(),
       channel,
