@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { handleAskCommand, parseCommand } from "./commands.js";
+import { buildIntentHints, escapeRegExp } from "./intent_hints.js";
 import { appendLedger } from "../audit/ledger.js";
 import { getStatusFacts } from "./context.js";
 import type { RateLimiter } from "../../core/rateLimit/limiter.js";
@@ -21,13 +22,13 @@ import { buildErrorResultRef, buildTextResultRef } from "../runtime/on_demand_ma
 import { clarifyText, errorText, rejectText } from "../runtime/response_templates.js";
 import { buildDashboardIntentFromResolve, dispatchDashboardExport, handleAlertFeedbackIntent, handleResolvedChartIntent } from "../runtime/handlers.js";
 import { isIntentEnabled } from "../runtime/capabilities.js";
+import { checkExplainGate } from "./intent_gate.js";
+import { getLastAlert, getLastExplainTrace, setLastAlert, setLastExplainTrace } from "./state_cache.js";
 import { handleStrategyIfAny } from "../runtime/strategy.js";
 import { handleQueryIfAny } from "../runtime/query.js";
 import { handleAlertLevelIntent } from "../runtime/alert_level.js";
 import { handleCognitiveIfAny, handleCognitiveStatusUpdate } from "../runtime/cognitive.js";
 
-const lastAlertByChatId = new Map<string, { ts: number; rawText: string }>();
-const lastExplainByChatId = new Map<string, { ts: number; trace_id: string }>();
 const NEWS_SUMMARY_DEFAULT_CHARS = 200;
 const NEWS_SUMMARY_MAX_CHARS = 1200;
 const NEWS_QUERY_DEFAULT_LIMIT = 5;
@@ -35,11 +36,16 @@ const NEWS_QUERY_MAX_LIMIT = 20;
 const FEEDS_QUERY_DEFAULT_LIMIT = 5;
 const FEEDS_QUERY_MAX_LIMIT = 20;
 const NEWS_ALERT_MARKERS = ["📰 重要新闻监控触发", "重要新闻监控触发"];
-const NEWS_SUMMARY_KEYWORDS = ["摘要", "总结", "概括", "简要", "简述"];
 const NEWS_SUMMARY_RESULT_CACHE_TTL_SEC = Number(
   process.env.CHAT_GATEWAY_NEWS_SUMMARY_CACHE_TTL_SEC || "600",
 );
+const NEWS_SUMMARY_CACHE_MAX_ITEMS = parseIntEnv("CHAT_GATEWAY_NEWS_SUMMARY_CACHE_MAX_ITEMS", 500);
+const NEWS_SUMMARY_CACHE_CLEANUP_INTERVAL_MS = parseIntEnv(
+  "CHAT_GATEWAY_NEWS_SUMMARY_CACHE_CLEANUP_MS",
+  60_000,
+);
 const newsSummaryCache = new Map<string, { summary: string; source: string; items: number | null; ts: number }>();
+let newsSummaryCacheLastCleanup = 0;
 
 type AdapterDedupeState = {
   firstTs: number;
@@ -49,6 +55,8 @@ type AdapterDedupeState = {
 
 const adapterDedupe = new Map<string, AdapterDedupeState>();
 const ADAPTER_DEDUPE_CLEANUP_THRESHOLD = 5000;
+const ADAPTER_DEDUPE_CLEANUP_INTERVAL_MS = parseIntEnv("CHAT_GATEWAY_DEDUPE_CLEANUP_MS", 60_000);
+let adapterDedupeLastCleanup = 0;
 
 function parseIntEnv(name: string, fallback: number): number {
   const raw = String(process.env[name] || "").trim();
@@ -64,11 +72,36 @@ const ADAPTER_DEDUPE_WINDOW_SEC = parseIntEnv(
 );
 
 function cleanupAdapterDedupe(now: number) {
-  if (adapterDedupe.size < ADAPTER_DEDUPE_CLEANUP_THRESHOLD) return;
+  if (now - adapterDedupeLastCleanup < ADAPTER_DEDUPE_CLEANUP_INTERVAL_MS
+    && adapterDedupe.size < ADAPTER_DEDUPE_CLEANUP_THRESHOLD) {
+    return;
+  }
+  adapterDedupeLastCleanup = now;
   const maxAgeSec = Math.max(ADAPTER_DEDUPE_WINDOW_SEC * 2, 600);
   for (const [key, state] of adapterDedupe) {
     const ageSec = (now - state.lastTs) / 1000;
     if (ageSec > maxAgeSec) adapterDedupe.delete(key);
+  }
+}
+
+function cleanupNewsSummaryCache(now: number) {
+  if (now - newsSummaryCacheLastCleanup < NEWS_SUMMARY_CACHE_CLEANUP_INTERVAL_MS
+    && newsSummaryCache.size <= NEWS_SUMMARY_CACHE_MAX_ITEMS) {
+    return;
+  }
+  newsSummaryCacheLastCleanup = now;
+  const maxAgeMs = Math.max(0, NEWS_SUMMARY_RESULT_CACHE_TTL_SEC) * 1000;
+  for (const [key, entry] of newsSummaryCache) {
+    if (maxAgeMs > 0 && now - entry.ts > maxAgeMs) {
+      newsSummaryCache.delete(key);
+    }
+  }
+  if (newsSummaryCache.size <= NEWS_SUMMARY_CACHE_MAX_ITEMS) return;
+  const entries = Array.from(newsSummaryCache.entries());
+  entries.sort((a, b) => a[1].ts - b[1].ts);
+  const removeCount = Math.max(0, entries.length - NEWS_SUMMARY_CACHE_MAX_ITEMS);
+  for (let i = 0; i < removeCount; i += 1) {
+    newsSummaryCache.delete(entries[i][0]);
   }
 }
 
@@ -153,10 +186,6 @@ function clipToLen(s: string, n: number) {
   return t.slice(0, n - 1) + "…";
 }
 
-function escapeRegExp(s: string) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function isNewsAlert(raw: string): boolean {
   const s = String(raw || "");
   if (!s.trim()) return false;
@@ -166,17 +195,6 @@ function isNewsAlert(raw: string): boolean {
   if (hasBullet && hasLink && s.includes("新闻")) return true;
   const parsed = parseNewsAlert(s);
   return parsed.items.length > 0;
-}
-
-function wantsNewsSummary(text: string): boolean {
-  const t = String(text || "").trim();
-  if (!t) return false;
-  return NEWS_SUMMARY_KEYWORDS.some(k => t.includes(k));
-}
-
-function isExplainRequest(text: string): boolean {
-  const t = String(text || "").trim();
-  return t === "解释一下" || t === "解释" || t === "解释下";
 }
 
 function wantsRetry(text: string): boolean {
@@ -317,34 +335,6 @@ function isAllowedChat(params: {
   return allowlistMode === "owner_only"
     ? (isGroup ? isOwnerUser : isOwnerChat)
     : authState.allowed.includes(chatId) || isOwnerUser;
-}
-
-function stripFeedbackPrefix(rawText: string): { text: string; used: boolean } {
-  const raw = String(rawText || "");
-  const trimmed = raw.trim();
-  if (!trimmed) return { text: "", used: false };
-  const replaced = trimmed.replace(/^(\/feedback(?:@[A-Za-z0-9_]+)?|feedback|反馈)[:：]?\s*/i, "");
-  if (replaced === trimmed) return { text: trimmed, used: false };
-  return { text: replaced.trim(), used: true };
-}
-
-function shouldAttemptResolve(params: {
-  rawText: string;
-  strippedText: string;
-  isGroup: boolean;
-  mentionsBot: boolean;
-  replyToId: string;
-  usedFeedbackPrefix: boolean;
-}): boolean {
-  const raw = String(params.rawText || "").trim();
-  if (!raw) return false;
-  const isCommand = raw.startsWith("/") && !params.usedFeedbackPrefix;
-  if (isCommand) return false;
-  if (params.isGroup) {
-    if (!params.mentionsBot) return false;
-    if (!params.replyToId && !params.usedFeedbackPrefix) return false;
-  }
-  return Boolean(params.strippedText);
 }
 
 type OnDemandConfig = { url: string; token: string; projectId?: string | null };
@@ -786,7 +776,7 @@ async function runExplain(params: {
   };
 
   writeExplainTrace(storageDir, trace);
-  lastExplainByChatId.set(chatId, { ts: Date.now(), trace_id: taskId });
+  setLastExplainTrace(chatId, taskId);
 
   return { ok, summary, errCode, latencyMs };
 }
@@ -844,6 +834,7 @@ async function runNewsSummary(params: {
     params.requestIdBase || sanitizeRequestId([channel, chatId, requestKey].filter(Boolean).join(":"));
   const attempt = params.attempt && params.attempt > 0 ? params.attempt : 1;
   const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
+  cleanupNewsSummaryCache(Date.now());
   const cached = newsSummaryCache.get(requestId);
   if (cached) {
     const ageMs = Date.now() - cached.ts;
@@ -968,6 +959,7 @@ async function runNewsSummary(params: {
     items: agentItems ?? parsed.items.length,
     ts: Date.now(),
   });
+  cleanupNewsSummaryCache(Date.now());
 
   const entry: any = {
     ts_utc: nowIso(),
@@ -1581,7 +1573,7 @@ async function handleAlertExplainIntent(params: {
 
   let rawAlert = rawAlertOverride || replyText;
   if (!rawAlert && !isGroup) {
-    rawAlert = lastAlertByChatId.get(chatId)?.rawText || "";
+    rawAlert = getLastAlert(storageDir, chatId);
   }
   if (!rawAlert) {
     if (isGroup) {
@@ -1596,35 +1588,24 @@ async function handleAlertExplainIntent(params: {
     return false;
   }
 
-  if (isGroup) {
-    const res = evaluate(config, {
-      channel,
-      capability: "alerts.explain",
-      chat_id: chatId,
-      chat_type: "group",
-      user_id: userId,
-      mention_bot: mentionsBot,
-      has_reply: Boolean(replyText),
-    });
-    if (res.require?.mention_bot_for_explain && !mentionsBot) return false;
-    if (res.require?.reply_required_for_explain && !replyText) {
-      await send(chatId, "请回复一条告警/新闻消息再 @我。");
-      return true;
+  const gate = checkExplainGate({
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel,
+    chatId,
+    userId,
+    isGroup,
+    mentionsBot,
+    hasReply: Boolean(replyText),
+  });
+  if (!gate.allowed) {
+    if (gate.block === "reply" && gate.message) {
+      await send(chatId, gate.message);
     }
-    if (!res.allowed) {
-      await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
-      return true;
-    }
-  } else {
-    const authState = loadAuth(storageDir, ownerChatId, channel);
-    const resolvedOwnerUserId = String(ownerUserId || "");
-    const isOwnerChat = chatId === ownerChatId;
-    const isOwnerUser = resolvedOwnerUserId ? userId === resolvedOwnerUserId : false;
-    const allowed =
-      allowlistMode === "owner_only"
-        ? (isGroup ? isOwnerUser : isOwnerChat)
-        : authState.allowed.includes(chatId) || isOwnerUser;
-    if (!allowed) return true;
+    return gate.block !== "ignore";
   }
 
   const adapterIds = resolveAdapterRequestIds({
@@ -1725,23 +1706,36 @@ export async function handleAdapterIntentIfAny(params: {
   const trimmedReplyText = String(replyText || "").trim();
   if (!trimmedText && !trimmedReplyText) return false;
 
-  const botUsername = channel === "telegram"
-    ? String(process.env.TELEGRAM_BOT_USERNAME || "SoliaNLBot")
-    : "";
-  const mentionToken = botUsername
-    ? (botUsername.startsWith("@") ? botUsername : `@${botUsername}`)
-    : "";
-  const mentionPattern = mentionToken ? new RegExp(escapeRegExp(mentionToken), "gi") : null;
-  const cleanedText =
-    channel === "telegram" && isGroup && mentionsBot && mentionPattern
-      ? trimmedText.replace(mentionPattern, "").trim()
-      : trimmedText;
+  const hints = buildIntentHints({
+    channel,
+    text: trimmedText,
+    isGroup,
+    mentionsBot,
+    replyToId,
+  });
+  const { cleanedText, intentRawText, summaryRequested, explainRequested, resolveText, allowResolve } = hints;
 
-  const intentRawText = cleanedText;
+  if (process.env.CHAT_GATEWAY_ROUTE_TRACE === "1") {
+    appendLedger(storageDir, {
+      ts_utc: nowIso(),
+      channel,
+      chat_id: chatId,
+      user_id: userId,
+      cmd: "route_hint",
+      is_group: isGroup,
+      mentions_bot: mentionsBot,
+      has_reply: Boolean(trimmedReplyText),
+      reply_to_id: replyToId,
+      allow_resolve: allowResolve,
+      explain_requested: explainRequested,
+      summary_requested: summaryRequested,
+      cleaned_text: clip(cleanedText, 200),
+      raw_text: clip(intentRawText, 200),
+    });
+  }
 
   const explicitRetry = wantsRetry(intentRawText);
   const isPrivate = !isGroup;
-  const summaryRequested = wantsNewsSummary(intentRawText);
 
   const strategyRequested = /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i.test(cleanedText);
   const strategyCommandOk = !isGroup || /^\/strategy\b/i.test(cleanedText);
@@ -1842,23 +1836,10 @@ export async function handleAdapterIntentIfAny(params: {
     });
   }
 
-  const explainRequested = isExplainRequest(intentRawText);
-  const feedbackStripped = stripFeedbackPrefix(intentRawText);
-  const resolveText = feedbackStripped.text;
-  const allowResolve = !explainRequested
-    && !summaryRequested
-    && shouldAttemptResolve({
-      rawText: intentRawText,
-      strippedText: resolveText,
-      isGroup,
-      mentionsBot,
-      replyToId,
-      usedFeedbackPrefix: feedbackStripped.used,
-    });
   let pendingResolveResponse: string | null = null;
 
   if (trimmedReplyText && isPrivate) {
-    lastAlertByChatId.set(chatId, { ts: Date.now(), rawText: trimmedReplyText });
+    setLastAlert(storageDir, chatId, trimmedReplyText);
   }
 
   if (allowResolve) {
@@ -2412,7 +2393,7 @@ export async function handleAdapterIntentIfAny(params: {
             : resolveSummaryLength(intentRawText);
           let rawAlert = trimmedReplyText;
           if (!rawAlert && isPrivate) {
-            rawAlert = lastAlertByChatId.get(chatId)?.rawText || "";
+            rawAlert = getLastAlert(storageDir, chatId);
           }
           if (!rawAlert) {
             await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：摘要 200）。");
@@ -2422,35 +2403,24 @@ export async function handleAdapterIntentIfAny(params: {
             await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
             return true;
           }
-          if (isGroup) {
-            const res = evaluate(config, {
-              channel,
-              capability: "alerts.explain",
-              chat_id: chatId,
-              chat_type: "group",
-              user_id: userId,
-              mention_bot: mentionsBot,
-              has_reply: Boolean(trimmedReplyText),
-            });
-            if (res.require?.mention_bot_for_explain && !mentionsBot) return false;
-            if (res.require?.reply_required_for_explain && !trimmedReplyText) {
-              await send(chatId, "请回复一条告警/新闻消息再 @我。");
-              return true;
+          const gate = checkExplainGate({
+            storageDir,
+            config,
+            allowlistMode,
+            ownerChatId,
+            ownerUserId,
+            channel,
+            chatId,
+            userId,
+            isGroup,
+            mentionsBot,
+            hasReply: Boolean(trimmedReplyText),
+          });
+          if (!gate.allowed) {
+            if (gate.block === "reply" && gate.message) {
+              await send(chatId, gate.message);
             }
-            if (!res.allowed) {
-              await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
-              return true;
-            }
-          } else {
-            const authState = loadAuth(storageDir, ownerChatId, channel);
-            const resolvedOwnerUserId = String(ownerUserId || "");
-            const isOwnerChat = chatId === ownerChatId;
-            const isOwnerUser = resolvedOwnerUserId ? userId === resolvedOwnerUserId : false;
-            const allowed =
-              allowlistMode === "owner_only"
-                ? (isGroup ? isOwnerUser : isOwnerChat)
-                : authState.allowed.includes(chatId) || isOwnerUser;
-            if (!allowed) return true;
+            return gate.block !== "ignore";
           }
           await send(chatId, "🧠 正在生成新闻摘要…");
           await runNewsSummary({
@@ -2476,7 +2446,7 @@ export async function handleAdapterIntentIfAny(params: {
       if (resolveRes.ok && resolveRes.intent === "alert_explain") {
         let rawAlert = trimmedReplyText;
         if (!rawAlert && isPrivate) {
-          rawAlert = lastAlertByChatId.get(chatId)?.rawText || "";
+          rawAlert = getLastAlert(storageDir, chatId);
         }
         if (!rawAlert) {
           await send(chatId, "请先回复一条告警/新闻消息，然后发一句话（如：解释一下）。");
@@ -2506,35 +2476,24 @@ export async function handleAdapterIntentIfAny(params: {
           });
           return true;
         }
-        if (isGroup) {
-          const res = evaluate(config, {
-            channel,
-            capability: "alerts.explain",
-            chat_id: chatId,
-            chat_type: "group",
-            user_id: userId,
-            mention_bot: mentionsBot,
-            has_reply: Boolean(trimmedReplyText),
-          });
-          if (res.require?.mention_bot_for_explain && !mentionsBot) return false;
-          if (res.require?.reply_required_for_explain && !trimmedReplyText) {
-            await send(chatId, "请回复一条告警/新闻消息再 @我。");
-            return true;
+        const gate = checkExplainGate({
+          storageDir,
+          config,
+          allowlistMode,
+          ownerChatId,
+          ownerUserId,
+          channel,
+          chatId,
+          userId,
+          isGroup,
+          mentionsBot,
+          hasReply: Boolean(trimmedReplyText),
+        });
+        if (!gate.allowed) {
+          if (gate.block === "reply" && gate.message) {
+            await send(chatId, gate.message);
           }
-          if (!res.allowed) {
-            await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
-            return true;
-          }
-        } else {
-          const authState = loadAuth(storageDir, ownerChatId, channel);
-          const resolvedOwnerUserId = String(ownerUserId || "");
-          const isOwnerChat = chatId === ownerChatId;
-          const isOwnerUser = resolvedOwnerUserId ? userId === resolvedOwnerUserId : false;
-          const allowed =
-            allowlistMode === "owner_only"
-              ? (isGroup ? isOwnerUser : isOwnerChat)
-              : authState.allowed.includes(chatId) || isOwnerUser;
-          if (!allowed) return true;
+          return gate.block !== "ignore";
         }
         await send(chatId, "🧠 我看一下…");
         const explainResult = await runExplain({
@@ -2633,7 +2592,7 @@ export async function handleAdapterIntentIfAny(params: {
 
   let rawAlert = trimmedReplyText;
   if (!rawAlert && !isGroup) {
-    rawAlert = lastAlertByChatId.get(chatId)?.rawText || "";
+    rawAlert = getLastAlert(storageDir, chatId);
   }
   if (!rawAlert) {
     if (isGroup) {
@@ -2653,35 +2612,24 @@ export async function handleAdapterIntentIfAny(params: {
     return true;
   }
 
-  if (isGroup) {
-    const res = evaluate(config, {
-      channel,
-      capability: "alerts.explain",
-      chat_id: chatId,
-      chat_type: "group",
-      user_id: userId,
-      mention_bot: mentionsBot,
-      has_reply: Boolean(trimmedReplyText),
-    });
-    if (res.require?.mention_bot_for_explain && !mentionsBot) return false;
-    if (res.require?.reply_required_for_explain && !trimmedReplyText) {
-      await send(chatId, "请回复一条告警/新闻消息再 @我。");
-      return true;
+  const gate = checkExplainGate({
+    storageDir,
+    config,
+    allowlistMode,
+    ownerChatId,
+    ownerUserId,
+    channel,
+    chatId,
+    userId,
+    isGroup,
+    mentionsBot,
+    hasReply: Boolean(trimmedReplyText),
+  });
+  if (!gate.allowed) {
+    if (gate.block === "reply" && gate.message) {
+      await send(chatId, gate.message);
     }
-    if (!res.allowed) {
-      await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
-      return true;
-    }
-  } else {
-    const authState = loadAuth(storageDir, ownerChatId, channel);
-    const resolvedOwnerUserId = String(ownerUserId || "");
-    const isOwnerChat = chatId === ownerChatId;
-    const isOwnerUser = resolvedOwnerUserId ? userId === resolvedOwnerUserId : false;
-    const allowed =
-      allowlistMode === "owner_only"
-        ? (isGroup ? isOwnerUser : isOwnerChat)
-        : authState.allowed.includes(chatId) || isOwnerUser;
-    if (!allowed) return true;
+    return gate.block !== "ignore";
   }
 
   const adapterIds = resolveAdapterRequestIds({
@@ -3160,7 +3108,7 @@ async function handlePrivateMessage(params: {
   } = params;
 
   if (trimmedReplyText) {
-    lastAlertByChatId.set(chatId, { ts: Date.now(), rawText: trimmedReplyText });
+    setLastAlert(storageDir, chatId, trimmedReplyText);
   }
 
   if (trimmedText === "/help" || trimmedText === "help") {
@@ -3596,7 +3544,7 @@ export async function handleMessage(opts: {
   }
 
   if (trimmedText === "👍" || trimmedText === "👎") {
-    const last = lastExplainByChatId.get(chatId);
+    const last = getLastExplainTrace(chatId);
     if (!last) {
       await send(chatId, "没有可反馈的解释。");
       return;
@@ -3659,6 +3607,8 @@ export async function handleMessage(opts: {
     });
     if (handledPrivate) return;
   }
+
+  if (!isCommand) return;
 
   const cmd = parseCommand(cleanedText);
   await handleParsedCommand({
