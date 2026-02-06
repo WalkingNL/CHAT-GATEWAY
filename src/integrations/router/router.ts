@@ -206,6 +206,22 @@ const COMMAND_MESSAGES = {
   analyzeUsage: "Usage: /analyze <incident description>",
   suggestUsage: "Usage: /suggest <incident description>",
   signalsUsage: (maxWindow: number) => `Usage: /signals [N]m|[N]h (default 60m, max ${maxWindow}m)`,
+  signalsTooLarge: (maxWindow: number) => `Window too large. Max ${maxWindow}m.`,
+};
+
+const ACCESS_MESSAGES = {
+  ownerOnlyExplain: "未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。",
+  ownerOnlyExplainWithEmoji: "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。",
+};
+
+const INTERACTION_MESSAGES = {
+  quickHelp: "用法：回复一条告警发“解释一下”；回复新闻发“摘要 200”。",
+  explainFeedbackMissing: "没有可反馈的解释。",
+  explainFeedbackRecorded: "已记录反馈。",
+  unknownCommand: "unknown command. /help",
+  cognitiveConfirmPrompt: "请回复：记 / 不记",
+  cognitiveStatusPrompt: "请补充记录编号与状态（例如：C-20260130-001 DONE）",
+  chartTelegramOnly: "当前仅支持 Telegram 图表导出。",
 };
 
 type ResolveIntentMeta = IntentMeta;
@@ -644,7 +660,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           return { handled };
         }
         if (resolveRes.needClarify) {
-          setPending("请回复：记 / 不记");
+          setPending(INTERACTION_MESSAGES.cognitiveConfirmPrompt);
         }
         return { handled: false };
       },
@@ -674,7 +690,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           return { handled };
         }
         if (resolveRes.needClarify) {
-          setPending("请补充记录编号与状态（例如：C-20260130-001 DONE）");
+          setPending(INTERACTION_MESSAGES.cognitiveStatusPrompt);
         }
         return { handled: false };
       },
@@ -687,7 +703,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       }),
       run: async () => {
         if (channel !== "telegram") {
-          setPending(rejectText("当前仅支持 Telegram 图表导出。"));
+          setPending(rejectText(INTERACTION_MESSAGES.chartTelegramOnly));
           return { handled: false };
         }
         const handled = await handleResolvedChartIntent({
@@ -3633,7 +3649,7 @@ async function handleOpsCommand(params: {
     if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
     const isAllowed = policyOk ? res.allowed : allowed;
     if (!isAllowed) {
-      await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
+      await send(chatId, res.deny_message || rejectText(ACCESS_MESSAGES.ownerOnlyExplain));
       return true;
     }
     const status = renderStatus(pm2PsNames);
@@ -3648,7 +3664,7 @@ async function handleOpsCommand(params: {
     if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
     const isAllowed = policyOk ? res.allowed : allowed;
     if (!isAllowed) {
-      await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
+      await send(chatId, res.deny_message || rejectText(ACCESS_MESSAGES.ownerOnlyExplain));
       return true;
     }
     await send(chatId, renderPs(pm2PsNames));
@@ -3660,7 +3676,7 @@ async function handleOpsCommand(params: {
     if (res.require?.mention_bot_for_ops && !mentionsBot) return true;
     const isAllowed = policyOk ? res.allowed : allowed;
     if (!isAllowed) {
-      await send(chatId, res.deny_message || rejectText("未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。"));
+      await send(chatId, res.deny_message || rejectText(ACCESS_MESSAGES.ownerOnlyExplain));
       return true;
     }
     const parts = cleanedText.split(/\s+/).filter(Boolean);
@@ -3725,7 +3741,7 @@ async function handlePrivateMessage(params: {
   }
 
   if (trimmedText === "/help" || trimmedText === "help") {
-    await send(chatId, "用法：回复一条告警发“解释一下”；回复新闻发“摘要 200”。");
+    await send(chatId, INTERACTION_MESSAGES.quickHelp);
     return true;
   }
 
@@ -3917,8 +3933,8 @@ async function handleParsedCommand(params: {
       await send(chatId, COMMAND_MESSAGES.signalsUsage(maxWindow));
       return;
     }
-    if (cmd.minutes > maxWindow) {
-      await send(chatId, `Window too large. Max ${maxWindow}m.`);
+  if (cmd.minutes > maxWindow) {
+      await send(chatId, COMMAND_MESSAGES.signalsTooLarge(maxWindow));
       return;
     }
 
@@ -4079,7 +4095,7 @@ async function handleParsedCommand(params: {
   }
 
   // unknown
-  await send(chatId, "unknown command. /help");
+  await send(chatId, INTERACTION_MESSAGES.unknownCommand);
   appendLedger(storageDir, { ...baseAudit, cmd: "unknown" });
 }
 
@@ -4163,7 +4179,7 @@ export async function handleMessage(opts: {
   if (trimmedText === "👍" || trimmedText === "👎") {
     const last = getLastExplainTrace(chatId);
     if (!last) {
-      await send(chatId, "没有可反馈的解释。");
+      await send(chatId, INTERACTION_MESSAGES.explainFeedbackMissing);
       return;
     }
     writeExplainFeedback(storageDir, {
@@ -4173,7 +4189,7 @@ export async function handleMessage(opts: {
       user_id: userId,
       feedback: trimmedText === "👍" ? "up" : "down",
     });
-    await send(chatId, "已记录反馈。");
+    await send(chatId, INTERACTION_MESSAGES.explainFeedbackRecorded);
     return;
   }
 
@@ -4196,7 +4212,7 @@ export async function handleMessage(opts: {
     // ---- Group command path: allow commands without @bot (still owner/allowlist gated) ----
     if (isCommand) {
       if (!allowed) {
-        await send(chatId, "🚫 未授权操作\n本群 Bot 仅对项目 Owner 开放解释能力。");
+        await send(chatId, ACCESS_MESSAGES.ownerOnlyExplainWithEmoji);
         return;
       }
       // fall through to command parsing/dispatch below
