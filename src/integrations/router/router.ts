@@ -68,59 +68,76 @@ function parseIntEnv(name: string, fallback: number): number {
   return Math.max(0, Math.floor(val));
 }
 
-type ResolveIntentMeta = {
-  intent: string;
+type IntentMeta = {
+  name: string;
   enabledKey?: string;
   disabledMessage?: string;
   allowGroup?: boolean;
   requiresAuth?: boolean;
 };
 
-const RESOLVE_INTENT_META: Record<string, ResolveIntentMeta> = {
+const INTENT_REGISTRY: Record<string, IntentMeta> = {
+  alert_strategy: {
+    name: "alert_strategy",
+    enabledKey: "alert_strategy",
+  },
+  alert_query: {
+    name: "alert_query",
+    enabledKey: "alert_query",
+  },
+  alert_explain: {
+    name: "alert_explain",
+    enabledKey: "alert_explain",
+  },
+  news_summary: {
+    name: "news_summary",
+    enabledKey: "news_summary",
+    disabledMessage: "未开放新闻摘要能力。",
+  },
   data_feeds_status: {
-    intent: "data_feeds_status",
+    name: "data_feeds_status",
     enabledKey: "data_feeds_status",
     disabledMessage: "未开放数据源查询能力。",
     allowGroup: false,
     requiresAuth: true,
   },
   data_feeds_asset_status: {
-    intent: "data_feeds_asset_status",
+    name: "data_feeds_asset_status",
     enabledKey: "data_feeds_asset_status",
     disabledMessage: "未开放数据源查询能力。",
     allowGroup: false,
     requiresAuth: true,
   },
   data_feeds_source_status: {
-    intent: "data_feeds_source_status",
+    name: "data_feeds_source_status",
     enabledKey: "data_feeds_source_status",
     disabledMessage: "未开放数据源查询能力。",
     allowGroup: false,
     requiresAuth: true,
   },
   data_feeds_hotspots: {
-    intent: "data_feeds_hotspots",
+    name: "data_feeds_hotspots",
     enabledKey: "data_feeds_hotspots",
     disabledMessage: "未开放数据源查询能力。",
     allowGroup: false,
     requiresAuth: true,
   },
   data_feeds_ops_summary: {
-    intent: "data_feeds_ops_summary",
+    name: "data_feeds_ops_summary",
     enabledKey: "data_feeds_ops_summary",
     disabledMessage: "未开放数据源查询能力。",
     allowGroup: false,
     requiresAuth: true,
   },
   news_hot: {
-    intent: "news_hot",
+    name: "news_hot",
     enabledKey: "news_hot",
     disabledMessage: "未开放新闻查询能力。",
     allowGroup: false,
     requiresAuth: true,
   },
   news_refresh: {
-    intent: "news_refresh",
+    name: "news_refresh",
     enabledKey: "news_refresh",
     disabledMessage: "未开放新闻查询能力。",
     allowGroup: false,
@@ -128,29 +145,40 @@ const RESOLVE_INTENT_META: Record<string, ResolveIntentMeta> = {
   },
 };
 
+type ResolveIntentMeta = IntentMeta;
+
+const RESOLVE_INTENT_META: Record<string, ResolveIntentMeta> = {
+  data_feeds_status: INTENT_REGISTRY.data_feeds_status,
+  data_feeds_asset_status: INTENT_REGISTRY.data_feeds_asset_status,
+  data_feeds_source_status: INTENT_REGISTRY.data_feeds_source_status,
+  data_feeds_hotspots: INTENT_REGISTRY.data_feeds_hotspots,
+  data_feeds_ops_summary: INTENT_REGISTRY.data_feeds_ops_summary,
+  news_hot: INTENT_REGISTRY.news_hot,
+  news_refresh: INTENT_REGISTRY.news_refresh,
+};
+
 const RESOLVE_GROUP_SKIP_INTENTS = new Set(
   Object.values(RESOLVE_INTENT_META)
     .filter(meta => meta.allowGroup === false)
-    .map(meta => meta.intent),
+    .map(meta => meta.name),
 );
 
-type PrimaryCommandMeta = {
+type PrimaryCommandMeta = IntentMeta & {
   name: "alert_strategy" | "alert_query";
-  enabledKey: string;
   commandPattern: RegExp;
   groupCommandPattern?: RegExp;
 };
 
 const PRIMARY_COMMAND_META: Record<PrimaryCommandMeta["name"], PrimaryCommandMeta> = {
   alert_strategy: {
+    ...INTENT_REGISTRY.alert_strategy,
     name: "alert_strategy",
-    enabledKey: "alert_strategy",
     commandPattern: /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i,
     groupCommandPattern: /^\/strategy\b/i,
   },
   alert_query: {
+    ...INTENT_REGISTRY.alert_query,
     name: "alert_query",
-    enabledKey: "alert_query",
     commandPattern: /^\/(event|evidence|gate|eval|evaluation|reliability|config|health)\b/i,
   },
 };
@@ -185,8 +213,19 @@ type AdapterContext = {
   defaultWindowSpecId?: string;
 };
 
+function getIntentMeta(name?: string | null): IntentMeta | null {
+  if (!name) return null;
+  return INTENT_REGISTRY[name] || null;
+}
+
+function isIntentEnabledByName(name: string): boolean {
+  const meta = getIntentMeta(name);
+  const key = meta?.enabledKey || name;
+  return isIntentEnabled(key);
+}
+
 function matchPrimaryCommand(meta: PrimaryCommandMeta, ctx: AdapterContext): boolean {
-  if (!isIntentEnabled(meta.enabledKey)) return false;
+  if (!isIntentEnabledByName(meta.name)) return false;
   if (!meta.commandPattern.test(ctx.cleanedText)) return false;
   if (ctx.isGroup && meta.groupCommandPattern && !meta.groupCommandPattern.test(ctx.cleanedText)) {
     return false;
@@ -873,7 +912,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       name: "news_summary",
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_summary" }),
       run: async () => {
-        if (!isIntentEnabled("news_summary")) {
+        if (!isIntentEnabledByName("news_summary")) {
           setPending(rejectText("未开放新闻摘要能力。"));
           return { handled: false };
         }
@@ -950,7 +989,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           return { handled: true };
         }
         if (isNewsAlert(rawAlert)) {
-          if (!isIntentEnabled("news_summary")) {
+          if (!isIntentEnabledByName("news_summary")) {
             await send(chatId, rejectText("未开放新闻摘要能力。"));
             return { handled: true };
           }
@@ -1202,7 +1241,7 @@ const EXPLAIN_SUMMARY_STEPS: Array<PipelineStep<AdapterContext, any>> = [
     name: "alert_explain",
     priority: 10,
     match: (c) => ({
-      matched: c.explainRequested && isIntentEnabled("alert_explain"),
+      matched: c.explainRequested && isIntentEnabledByName("alert_explain"),
     }),
     run: async (c) => {
       const handled = await handleAlertExplainIntent({
@@ -1232,7 +1271,7 @@ const EXPLAIN_SUMMARY_STEPS: Array<PipelineStep<AdapterContext, any>> = [
       matched: c.summaryRequested || c.explainRequested,
     }),
     run: async (c) => {
-      if (!isIntentEnabled("news_summary")) return { handled: false };
+      if (!isIntentEnabledByName("news_summary")) return { handled: false };
 
       let rawAlert = c.trimmedReplyText;
       if (!rawAlert && !c.isGroup) {
@@ -1386,7 +1425,7 @@ async function runExplainSummaryFlow(
     return true;
   }
 
-  if (!isIntentEnabled("news_summary")) {
+  if (!isIntentEnabledByName("news_summary")) {
     if (await sendPendingIfAny(pendingResolveResponse, send, chatId)) {
       return true;
     }
@@ -1672,26 +1711,28 @@ function resolveIntentMeta(intent?: string | null): ResolveIntentMeta | null {
   return RESOLVE_INTENT_META[intent] || null;
 }
 
-async function ensureResolveIntentEnabled(
+async function ensureIntentEnabled(
   ctx: AdapterContext,
   intent: string,
+  meta?: IntentMeta | null,
 ): Promise<boolean> {
-  const meta = resolveIntentMeta(intent);
-  if (!meta?.enabledKey) return true;
-  if (!isIntentEnabled(meta.enabledKey)) {
-    const message = meta.disabledMessage || "未开放相关能力。";
+  const resolved = meta ?? getIntentMeta(intent);
+  const key = resolved?.enabledKey || intent;
+  if (!isIntentEnabled(key)) {
+    const message = resolved?.disabledMessage || "未开放相关能力。";
     await ctx.send(ctx.chatId, rejectText(message));
     return false;
   }
   return true;
 }
 
-async function ensureResolveIntentAuthorized(
+async function ensureIntentAuthorized(
   ctx: AdapterContext,
   intent: string,
+  meta?: IntentMeta | null,
 ): Promise<boolean> {
-  const meta = resolveIntentMeta(intent);
-  if (!meta?.requiresAuth) return true;
+  const resolved = meta ?? getIntentMeta(intent);
+  if (!resolved?.requiresAuth) return true;
   if (!isAllowedChat({
     storageDir: ctx.storageDir,
     allowlistMode: ctx.allowlistMode,
@@ -1706,6 +1747,20 @@ async function ensureResolveIntentAuthorized(
     return false;
   }
   return true;
+}
+
+async function ensureResolveIntentEnabled(
+  ctx: AdapterContext,
+  intent: string,
+): Promise<boolean> {
+  return ensureIntentEnabled(ctx, intent, resolveIntentMeta(intent));
+}
+
+async function ensureResolveIntentAuthorized(
+  ctx: AdapterContext,
+  intent: string,
+): Promise<boolean> {
+  return ensureIntentAuthorized(ctx, intent, resolveIntentMeta(intent));
 }
 
 type OnDemandConfig = { url: string; token: string; projectId?: string | null };
