@@ -75,6 +75,8 @@ type IntentMeta = {
   allowGroup?: boolean;
   requiresAuth?: boolean;
   groupDenyAction?: "ignore" | "reject";
+  denyMessage?: string;
+  groupDenyMessage?: string;
   gateKind?: "explain";
 };
 
@@ -82,10 +84,12 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
   alert_strategy: {
     name: "alert_strategy",
     enabledKey: "alert_strategy",
+    denyMessage: "未授权操作",
   },
   alert_query: {
     name: "alert_query",
     enabledKey: "alert_query",
+    denyMessage: "未授权操作",
   },
   alert_explain: {
     name: "alert_explain",
@@ -105,6 +109,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     allowGroup: false,
     requiresAuth: true,
     groupDenyAction: "ignore",
+    denyMessage: "未授权操作",
   },
   data_feeds_asset_status: {
     name: "data_feeds_asset_status",
@@ -113,6 +118,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     allowGroup: false,
     requiresAuth: true,
     groupDenyAction: "ignore",
+    denyMessage: "未授权操作",
   },
   data_feeds_source_status: {
     name: "data_feeds_source_status",
@@ -121,6 +127,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     allowGroup: false,
     requiresAuth: true,
     groupDenyAction: "ignore",
+    denyMessage: "未授权操作",
   },
   data_feeds_hotspots: {
     name: "data_feeds_hotspots",
@@ -129,6 +136,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     allowGroup: false,
     requiresAuth: true,
     groupDenyAction: "ignore",
+    denyMessage: "未授权操作",
   },
   data_feeds_ops_summary: {
     name: "data_feeds_ops_summary",
@@ -137,6 +145,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     allowGroup: false,
     requiresAuth: true,
     groupDenyAction: "ignore",
+    denyMessage: "未授权操作",
   },
   news_hot: {
     name: "news_hot",
@@ -145,6 +154,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     allowGroup: false,
     requiresAuth: true,
     groupDenyAction: "ignore",
+    denyMessage: "未授权操作",
   },
   news_refresh: {
     name: "news_refresh",
@@ -153,6 +163,7 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
     allowGroup: false,
     requiresAuth: true,
     groupDenyAction: "ignore",
+    denyMessage: "未授权操作",
   },
 };
 
@@ -1111,14 +1122,14 @@ async function runResolveFlow(ctx: AdapterContext): Promise<ResolveFlowResult> {
 
     if (resolveRes.ok && resolveRes.intent && isGroup) {
       const groupAction = resolveGroupDenyAction(resolveRes.intent);
-      if (groupAction === "ignore") {
-        return { done: true, result: false, pending: null };
-      }
-      if (groupAction === "reject") {
-        const meta = getIntentMeta(resolveRes.intent);
-        await send(chatId, rejectText(meta?.disabledMessage || "未开放相关能力。"));
-        return { done: true, result: true, pending: null };
-      }
+  if (groupAction === "ignore") {
+    return { done: true, result: false, pending: null };
+  }
+  if (groupAction === "reject") {
+    const meta = getIntentMeta(resolveRes.intent);
+    await send(chatId, rejectText(meta?.groupDenyMessage || meta?.disabledMessage || "未开放相关能力。"));
+    return { done: true, result: true, pending: null };
+  }
     }
 
     const steps = buildResolveSteps({ ctx, resolveRes, adapterIds, resolvedIntent, setPending });
@@ -1707,7 +1718,8 @@ async function ensureIntentAuthorized(
     userId: ctx.userId,
     isGroup: ctx.isGroup,
   })) {
-    await ctx.send(ctx.chatId, rejectText("未授权操作"));
+    const message = resolved?.denyMessage || "未授权操作";
+    await ctx.send(ctx.chatId, rejectText(message));
     return false;
   }
   return true;
