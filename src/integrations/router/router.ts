@@ -190,6 +190,13 @@ const INTENT_REGISTRY: Record<string, IntentMeta> = {
   },
 };
 
+const RESOLVE_MESSAGES = {
+  clarifyUnknown: "我没有理解你的意图，请用一句话明确你要做的事。",
+  resolveFailed: "当前解析失败，请稍后重试。",
+  missingProject: "未配置默认项目，无法解析请求。",
+  missingMessageId: "请求缺少 messageId/parent_id，无法解析。",
+};
+
 type ResolveIntentMeta = IntentMeta;
 
 type PrimaryCommandMeta = IntentMeta & {
@@ -256,6 +263,11 @@ function resolveIntentMessage(intent: string, key: keyof IntentMessages, fallbac
   return getIntentMessage(intent, key) || fallback;
 }
 
+function resolveIntentDisabledMessage(intent: string, fallback: string): string {
+  const meta = getIntentMeta(intent);
+  return meta?.disabledMessage || fallback;
+}
+
 function resolveGroupDenyAction(intent?: string | null): "allow" | "ignore" | "reject" {
   const meta = getIntentMeta(intent);
   if (!meta || meta.allowGroup !== false) return "allow";
@@ -266,6 +278,17 @@ function isIntentEnabledByName(name: string): boolean {
   const meta = getIntentMeta(name);
   const key = meta?.enabledKey || name;
   return isIntentEnabled(key);
+}
+
+async function ensureIntentEnabledForCommand(
+  send: (chatId: string, text: string) => Promise<void>,
+  chatId: string,
+  intent: string,
+  fallback: string,
+): Promise<boolean> {
+  if (isIntentEnabledByName(intent)) return true;
+  await send(chatId, rejectText(resolveIntentDisabledMessage(intent, fallback)));
+  return false;
 }
 
 function matchPrimaryCommand(meta: PrimaryCommandMeta, ctx: AdapterContext): boolean {
@@ -1041,7 +1064,10 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
         }
         if (isNewsAlert(rawAlert)) {
           if (!isIntentEnabledByName("news_summary")) {
-            await send(chatId, rejectText("未开放新闻摘要能力。"));
+            await send(
+              chatId,
+              rejectText(resolveIntentDisabledMessage("news_summary", "未开放新闻摘要能力。")),
+            );
             return { handled: true };
           }
           await send(chatId, "🧠 正在生成新闻摘要…");
@@ -1193,14 +1219,14 @@ async function runResolveFlow(ctx: AdapterContext): Promise<ResolveFlowResult> {
     }
 
     if (resolveRes.ok && (resolveRes.needClarify || resolveRes.intent === "unknown")) {
-      pendingResolveResponse = clarifyText("我没有理解你的意图，请用一句话明确你要做的事。");
+      pendingResolveResponse = clarifyText(RESOLVE_MESSAGES.clarifyUnknown);
     } else if (!resolveRes.ok) {
-      pendingResolveResponse = errorText("当前解析失败，请稍后重试。");
+      pendingResolveResponse = errorText(RESOLVE_MESSAGES.resolveFailed);
     }
   } else if (adapterIds && !projectId) {
-    pendingResolveResponse = rejectText("未配置默认项目，无法解析请求。");
+    pendingResolveResponse = rejectText(RESOLVE_MESSAGES.missingProject);
   } else if (isPrivate) {
-    pendingResolveResponse = rejectText("请求缺少 messageId/parent_id，无法解析。");
+    pendingResolveResponse = rejectText(RESOLVE_MESSAGES.missingMessageId);
   }
 
   return { done: false, result: false, pending: pendingResolveResponse };
@@ -3755,10 +3781,7 @@ async function handleParsedCommand(params: {
     return;
 
   } else if (cmd.kind === "news_hot") {
-    if (!isIntentEnabled("news_hot")) {
-      await send(chatId, rejectText("未开放新闻查询能力。"));
-      return;
-    }
+    if (!await ensureIntentEnabledForCommand(send, chatId, "news_hot", "未开放新闻查询能力。")) return;
     await runNewsQuery({
       storageDir,
       chatId,
@@ -3772,10 +3795,7 @@ async function handleParsedCommand(params: {
     return;
 
   } else if (cmd.kind === "news_refresh") {
-    if (!isIntentEnabled("news_refresh")) {
-      await send(chatId, rejectText("未开放新闻查询能力。"));
-      return;
-    }
+    if (!await ensureIntentEnabledForCommand(send, chatId, "news_refresh", "未开放新闻查询能力。")) return;
     await runNewsQuery({
       storageDir,
       chatId,
@@ -3789,10 +3809,12 @@ async function handleParsedCommand(params: {
     return;
 
   } else if (cmd.kind === "feeds_status") {
-    if (!isIntentEnabled("data_feeds_status")) {
-      await send(chatId, rejectText("未开放数据源查询能力。"));
-      return;
-    }
+    if (!await ensureIntentEnabledForCommand(
+      send,
+      chatId,
+      "data_feeds_status",
+      "未开放数据源查询能力。",
+    )) return;
     await runDataFeedsStatus({
       storageDir,
       chatId,
@@ -3804,10 +3826,12 @@ async function handleParsedCommand(params: {
     return;
 
   } else if (cmd.kind === "feeds_asset") {
-    if (!isIntentEnabled("data_feeds_asset_status")) {
-      await send(chatId, rejectText("未开放数据源查询能力。"));
-      return;
-    }
+    if (!await ensureIntentEnabledForCommand(
+      send,
+      chatId,
+      "data_feeds_asset_status",
+      "未开放数据源查询能力。",
+    )) return;
     const symbol = String(cmd.symbol || "").trim();
     if (!symbol) {
       await send(chatId, "Usage: /feeds asset <SYMBOL>");
@@ -3825,10 +3849,12 @@ async function handleParsedCommand(params: {
     return;
 
   } else if (cmd.kind === "feeds_source") {
-    if (!isIntentEnabled("data_feeds_source_status")) {
-      await send(chatId, rejectText("未开放数据源查询能力。"));
-      return;
-    }
+    if (!await ensureIntentEnabledForCommand(
+      send,
+      chatId,
+      "data_feeds_source_status",
+      "未开放数据源查询能力。",
+    )) return;
     const feedId = String(cmd.feedId || "").trim();
     if (!feedId) {
       await send(chatId, "Usage: /feeds source <feed_id>");
@@ -3846,10 +3872,12 @@ async function handleParsedCommand(params: {
     return;
 
   } else if (cmd.kind === "feeds_hotspots") {
-    if (!isIntentEnabled("data_feeds_hotspots")) {
-      await send(chatId, rejectText("未开放数据源查询能力。"));
-      return;
-    }
+    if (!await ensureIntentEnabledForCommand(
+      send,
+      chatId,
+      "data_feeds_hotspots",
+      "未开放数据源查询能力。",
+    )) return;
     await runDataFeedsHotspots({
       storageDir,
       chatId,
@@ -3862,10 +3890,12 @@ async function handleParsedCommand(params: {
     return;
 
   } else if (cmd.kind === "feeds_ops") {
-    if (!isIntentEnabled("data_feeds_ops_summary")) {
-      await send(chatId, rejectText("未开放数据源查询能力。"));
-      return;
-    }
+    if (!await ensureIntentEnabledForCommand(
+      send,
+      chatId,
+      "data_feeds_ops_summary",
+      "未开放数据源查询能力。",
+    )) return;
     await runDataFeedsOpsSummary({
       storageDir,
       chatId,
