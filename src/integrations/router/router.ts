@@ -197,6 +197,17 @@ const RESOLVE_MESSAGES = {
   missingMessageId: "请求缺少 messageId/parent_id，无法解析。",
 };
 
+const COMMAND_MESSAGES = {
+  authDenied: "permission denied",
+  feedsAssetMissing: "请指定资产（例如：ETHUSDT）。",
+  feedsSourceMissing: "请指定 feed_id（例如：ohlcv_1m）。",
+  feedsAssetUsage: "Usage: /feeds asset <SYMBOL>",
+  feedsSourceUsage: "Usage: /feeds source <feed_id>",
+  analyzeUsage: "Usage: /analyze <incident description>",
+  suggestUsage: "Usage: /suggest <incident description>",
+  signalsUsage: (maxWindow: number) => `Usage: /signals [N]m|[N]h (default 60m, max ${maxWindow}m)`,
+};
+
 type ResolveIntentMeta = IntentMeta;
 
 type PrimaryCommandMeta = IntentMeta & {
@@ -813,7 +824,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
         }
         const symbol = String(resolveRes.params?.symbol || "").trim();
         if (!symbol || resolveRes.needClarify) {
-          await send(chatId, "请指定资产（例如：ETHUSDT）。");
+          await send(chatId, COMMAND_MESSAGES.feedsAssetMissing);
           return { handled: true };
         }
         if (!await ensureResolveIntentAuthorized(ctx, "data_feeds_asset_status")) {
@@ -844,7 +855,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
         }
         const feedId = String(resolveRes.params?.feed_id || "").trim();
         if (!feedId || resolveRes.needClarify) {
-          await send(chatId, "请指定 feed_id（例如：ohlcv_1m）。");
+          await send(chatId, COMMAND_MESSAGES.feedsSourceMissing);
           return { handled: true };
         }
         if (!await ensureResolveIntentAuthorized(ctx, "data_feeds_source_status")) {
@@ -3742,7 +3753,7 @@ async function handleParsedCommand(params: {
 
   // auth commands only owner
   if (cmd.kind.startsWith("auth_") && !isOwner) {
-    await send(chatId, rejectText("permission denied"));
+    await send(chatId, rejectText(COMMAND_MESSAGES.authDenied));
     return;
   }
 
@@ -3827,7 +3838,7 @@ async function handleParsedCommand(params: {
     )) return;
     const symbol = String(cmd.symbol || "").trim();
     if (!symbol) {
-      await send(chatId, "Usage: /feeds asset <SYMBOL>");
+      await send(chatId, COMMAND_MESSAGES.feedsAssetUsage);
       return;
     }
     await runDataFeedsAssetStatus({
@@ -3850,7 +3861,7 @@ async function handleParsedCommand(params: {
     )) return;
     const feedId = String(cmd.feedId || "").trim();
     if (!feedId) {
-      await send(chatId, "Usage: /feeds source <feed_id>");
+      await send(chatId, COMMAND_MESSAGES.feedsSourceUsage);
       return;
     }
     await runDataFeedsSourceStatus({
@@ -3903,7 +3914,7 @@ async function handleParsedCommand(params: {
   } else if (cmd.kind === "signals") {
     const maxWindow = getMaxWindowMinutes();
     if (!cmd.minutes) {
-      await send(chatId, `Usage: /signals [N]m|[N]h (default 60m, max ${maxWindow}m)`);
+      await send(chatId, COMMAND_MESSAGES.signalsUsage(maxWindow));
       return;
     }
     if (cmd.minutes > maxWindow) {
@@ -3951,7 +3962,7 @@ async function handleParsedCommand(params: {
   } else if (cmd.kind === "analyze") {
     const prompt = (cmd.q || "").trim();
     if (!prompt) {
-      await send(chatId, "Usage: /analyze <incident description>");
+      await send(chatId, COMMAND_MESSAGES.analyzeUsage);
       return;
     }
 
@@ -3986,7 +3997,7 @@ async function handleParsedCommand(params: {
   } else if (cmd.kind === "suggest") {
     const prompt = (cmd.q || "").trim();
     if (!prompt) {
-      await send(chatId, "Usage: /suggest <incident description>");
+      await send(chatId, COMMAND_MESSAGES.suggestUsage);
       return;
     }
 
