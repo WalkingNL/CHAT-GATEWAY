@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "check:intents": "tsx scripts/intent_hints.test.ts && tsx scripts/intent_gate.test.ts && tsx scripts/intent_registry.test.ts",
+    "check:core-boundary": "node scripts/check_core_boundary.mjs",
+    "check": "npm run check:core-boundary"
   },
   "dependencies": {
     "yaml": "^2.5.0"
