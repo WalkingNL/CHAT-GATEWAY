@@ -911,7 +911,8 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
       match: () => ({ matched: resolveRes.ok && resolveRes.intent === "news_summary" }),
       run: async () => {
         if (!isIntentEnabledByName("news_summary")) {
-          setPending(rejectText("未开放新闻摘要能力。"));
+          const meta = getIntentMeta("news_summary");
+          setPending(rejectText(meta?.disabledMessage || "未开放新闻摘要能力。"));
           return { handled: false };
         }
         const resolvedParams = resolveRes.params && typeof resolveRes.params === "object"
@@ -935,25 +936,23 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           await send(chatId, "当前仅支持新闻摘要，请回复新闻告警再发“摘要 200”。");
           return { handled: true };
         }
-        const gate = checkExplainGate({
-          storageDir,
-          config,
-          allowlistMode,
-          ownerChatId,
-          ownerUserId,
-          channel,
-          chatId,
-          userId,
-          isGroup,
-          mentionsBot,
-          hasReply: Boolean(trimmedReplyText),
-        });
-        if (!gate.allowed) {
-          if (gate.block === "reply" && gate.message) {
-            await send(chatId, gate.message);
+          const gateResult = await applyExplainGate({
+            storageDir,
+            config,
+            allowlistMode,
+            ownerChatId,
+            ownerUserId,
+            channel,
+            chatId,
+            userId,
+            isGroup,
+            mentionsBot,
+            hasReply: Boolean(trimmedReplyText),
+            send,
+          });
+          if (!gateResult.allowed) {
+            return { handled: gateResult.handled };
           }
-          return { handled: gate.block !== "ignore" };
-        }
         await send(chatId, "🧠 正在生成新闻摘要…");
         await runNewsSummary({
           storageDir,
@@ -1010,25 +1009,23 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           });
           return { handled: true };
         }
-        const gate = checkExplainGate({
-          storageDir,
-          config,
-          allowlistMode,
-          ownerChatId,
-          ownerUserId,
-          channel,
-          chatId,
-          userId,
-          isGroup,
-          mentionsBot,
-          hasReply: Boolean(trimmedReplyText),
-        });
-        if (!gate.allowed) {
-          if (gate.block === "reply" && gate.message) {
-            await send(chatId, gate.message);
+          const gateResult = await applyExplainGate({
+            storageDir,
+            config,
+            allowlistMode,
+            ownerChatId,
+            ownerUserId,
+            channel,
+            chatId,
+            userId,
+            isGroup,
+            mentionsBot,
+            hasReply: Boolean(trimmedReplyText),
+            send,
+          });
+          if (!gateResult.allowed) {
+            return { handled: gateResult.handled };
           }
-          return { handled: gate.block !== "ignore" };
-        }
         await send(chatId, "🧠 我看一下…");
         const explainResult = await runExplain({
           storageDir,
@@ -1276,7 +1273,7 @@ const EXPLAIN_SUMMARY_STEPS: Array<PipelineStep<AdapterContext, any>> = [
     match: (c) => ({
       matched: c.summaryRequested || c.explainRequested,
     }),
-    run: async (c) => {
+      run: async (c) => {
       if (!isIntentEnabledByName("news_summary")) return { handled: false };
 
       let rawAlert = c.trimmedReplyText;
@@ -1301,7 +1298,7 @@ const EXPLAIN_SUMMARY_STEPS: Array<PipelineStep<AdapterContext, any>> = [
         return { handled: true };
       }
 
-      const gate = checkExplainGate({
+      const gateResult = await applyExplainGate({
         storageDir: c.storageDir,
         config: c.config,
         allowlistMode: c.allowlistMode,
@@ -1313,12 +1310,10 @@ const EXPLAIN_SUMMARY_STEPS: Array<PipelineStep<AdapterContext, any>> = [
         isGroup: c.isGroup,
         mentionsBot: c.mentionsBot,
         hasReply: Boolean(c.trimmedReplyText),
+        send: c.send,
       });
-      if (!gate.allowed) {
-        if (gate.block === "reply" && gate.message) {
-          await c.send(c.chatId, gate.message);
-        }
-        return { handled: gate.block !== "ignore" };
+      if (!gateResult.allowed) {
+        return { handled: gateResult.handled };
       }
 
       const adapterIds = resolveAdapterRequestIds({
@@ -1752,6 +1747,42 @@ async function ensureIntentAuthorized(
     return false;
   }
   return true;
+}
+
+async function applyExplainGate(params: {
+  storageDir: string;
+  config: LoadedConfig | undefined;
+  allowlistMode: "owner_only" | "auth";
+  ownerChatId: string;
+  ownerUserId: string;
+  channel: "telegram" | "feishu";
+  chatId: string;
+  userId: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  hasReply: boolean;
+  send: (chatId: string, text: string) => Promise<void>;
+}): Promise<{ allowed: boolean; handled: boolean }> {
+  const gate = checkExplainGate({
+    storageDir: params.storageDir,
+    config: params.config,
+    allowlistMode: params.allowlistMode,
+    ownerChatId: params.ownerChatId,
+    ownerUserId: params.ownerUserId,
+    channel: params.channel,
+    chatId: params.chatId,
+    userId: params.userId,
+    isGroup: params.isGroup,
+    mentionsBot: params.mentionsBot,
+    hasReply: params.hasReply,
+  });
+  if (!gate.allowed) {
+    if (gate.block === "reply" && gate.message) {
+      await params.send(params.chatId, gate.message);
+    }
+    return { allowed: false, handled: gate.block !== "ignore" };
+  }
+  return { allowed: true, handled: false };
 }
 
 async function ensureResolveIntentEnabled(
@@ -2990,7 +3021,7 @@ async function handleAlertExplainIntent(params: {
     return false;
   }
 
-  const gate = checkExplainGate({
+  const gateResult = await applyExplainGate({
     storageDir,
     config,
     allowlistMode,
@@ -3002,12 +3033,10 @@ async function handleAlertExplainIntent(params: {
     isGroup,
     mentionsBot,
     hasReply: Boolean(replyText),
+    send,
   });
-  if (!gate.allowed) {
-    if (gate.block === "reply" && gate.message) {
-      await send(chatId, gate.message);
-    }
-    return gate.block !== "ignore";
+  if (!gateResult.allowed) {
+    return gateResult.handled;
   }
 
   const adapterIds = resolveAdapterRequestIds({
