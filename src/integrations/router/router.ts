@@ -1737,15 +1737,7 @@ export async function handleAdapterIntentIfAny(params: {
       ? trimmedText.replace(mentionPattern, "").trim()
       : trimmedText;
 
-  const intentCommand = /^\/i\b/i.test(cleanedText);
-  const intentCommandText = intentCommand
-    ? cleanedText.replace(/^\/i\b/i, "").trim()
-    : "";
-  const intentRawText = intentCommand ? intentCommandText : cleanedText;
-  if (intentCommand && !intentRawText) {
-    await send(chatId, "用法：/i <你的问题>");
-    return true;
-  }
+  const intentRawText = cleanedText;
 
   const explicitRetry = wantsRetry(intentRawText);
   const isPrivate = !isGroup;
@@ -1853,9 +1845,9 @@ export async function handleAdapterIntentIfAny(params: {
   const explainRequested = isExplainRequest(intentRawText);
   const feedbackStripped = stripFeedbackPrefix(intentRawText);
   const resolveText = feedbackStripped.text;
-  let allowResolve = intentCommand
-    ? Boolean(resolveText)
-    : shouldAttemptResolve({
+  const allowResolve = !explainRequested
+    && !summaryRequested
+    && shouldAttemptResolve({
       rawText: intentRawText,
       strippedText: resolveText,
       isGroup,
@@ -1863,9 +1855,6 @@ export async function handleAdapterIntentIfAny(params: {
       replyToId,
       usedFeedbackPrefix: feedbackStripped.used,
     });
-  if (isGroup && !intentCommand) {
-    allowResolve = false;
-  }
   let pendingResolveResponse: string | null = null;
 
   if (trimmedReplyText && isPrivate) {
@@ -2590,11 +2579,7 @@ export async function handleAdapterIntentIfAny(params: {
     }
   }
 
-  if (intentCommand && allowResolve && !pendingResolveResponse) {
-    pendingResolveResponse = clarifyText("我没有理解你的意图，请用一句话明确你要做的事。");
-  }
-
-  if (isGroup && !allowResolve) {
+  if (isGroup && !allowResolve && !explainRequested && !summaryRequested) {
     return false;
   }
 
@@ -3217,7 +3202,6 @@ async function handleParsedCommand(params: {
   if (cmd.kind === "help") {
     const out = [
       "/help",
-      "/i <自然语言>",
       "/status",
       "/signals [N]m|[N]h",
       "/news [N]",
