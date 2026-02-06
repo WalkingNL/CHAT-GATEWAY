@@ -1,5 +1,6 @@
 import { loadProjectRegistry } from "./project_registry.js";
 import { EXPORT_API_VERSION } from "./intent_schema.js";
+import { postJsonWithAuth } from "./http_client.js";
 
 type OnDemandSettings = {
   url?: string;
@@ -130,39 +131,13 @@ function sanitizeFilters(raw: Record<string, any> | undefined): { filters: Recor
   return { filters: out, dropped };
 }
 
-async function postJson(url: string, token: string, body: any, timeoutMs?: number): Promise<any> {
-  const timeout = Number(
+function resolveDefaultTimeout(timeoutMs?: number): number {
+  return Number(
     timeoutMs
       ?? process.env.CHAT_GATEWAY_EXPORT_ACK_TIMEOUT_MS
       ?? process.env.CHAT_GATEWAY_CHART_ACK_TIMEOUT_MS
       ?? "2000",
   );
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    const text = await res.text();
-    let data: any = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      data = { ok: false, error: "invalid_json", raw: text };
-    }
-    if (!res.ok) {
-      throw new Error(`on_demand_http_${res.status}: ${data?.error || text}`);
-    }
-    return data;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 export async function requestDashboardExport(params: {
@@ -194,7 +169,12 @@ export async function requestDashboardExport(params: {
     if (params.windowSpecId) payload.window_spec_id = params.windowSpecId;
     if (params.schemaVersion) payload.schema_version = params.schemaVersion;
     if (params.intentVersion) payload.intent_version = params.intentVersion;
-    const res = await postJson(`${cfg.url}/v1/dashboard_export`, cfg.token, payload);
+    const res = await postJsonWithAuth(
+      `${cfg.url}/v1/dashboard_export`,
+      cfg.token,
+      payload,
+      { timeoutMs: resolveDefaultTimeout() },
+    );
     return {
       ok: Boolean(res?.ok),
       status: res?.status ? String(res.status) : undefined,
@@ -229,7 +209,12 @@ export async function requestIntentResolve(params: {
       user_id: params.userId,
     };
     if (params.replyText) payload.reply_text = params.replyText;
-    const res = await postJson(`${cfg.url}/v1/intent/resolve`, cfg.token, payload, timeoutMs);
+    const res = await postJsonWithAuth(
+      `${cfg.url}/v1/intent/resolve`,
+      cfg.token,
+      payload,
+      { timeoutMs },
+    );
     return {
       ok: Boolean(res?.ok),
       intent: res?.intent ? String(res.intent) : undefined,

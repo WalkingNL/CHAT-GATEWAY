@@ -22,6 +22,7 @@ import { buildErrorResultRef, buildTextResultRef } from "../runtime/on_demand_ma
 import { clarifyText, errorText, rejectText } from "../runtime/response_templates.js";
 import { buildDashboardIntentFromResolve, dispatchDashboardExport, handleAlertFeedbackIntent, handleResolvedChartIntent } from "../runtime/handlers.js";
 import { isIntentEnabled } from "../runtime/capabilities.js";
+import { postJsonWithAuth } from "../runtime/http_client.js";
 import { checkExplainGate } from "./intent_gate.js";
 import { getLastAlert, getLastExplainTrace, setLastAlert, setLastExplainTrace } from "./state_cache.js";
 import { handleStrategyIfAny } from "../runtime/strategy.js";
@@ -376,35 +377,6 @@ function resolveOnDemandConfigForNews(config?: LoadedConfig): OnDemandConfig {
 
 function resolveOnDemandConfigForFeeds(config?: LoadedConfig): OnDemandConfig {
   return resolveOnDemandConfigForNews(config);
-}
-
-async function postOnDemandJson(url: string, token: string, body: any, timeoutMs: number): Promise<any> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    const text = await res.text();
-    let data: any = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      data = { ok: false, error: "invalid_json", raw: text };
-    }
-    if (!res.ok) {
-      throw new Error(`on_demand_http_${res.status}: ${data?.error || text}`);
-    }
-    return data;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 function getProject(config?: LoadedConfig) {
@@ -896,7 +868,7 @@ async function runNewsSummary(params: {
     if (cfg.projectId) payload.target = { project_id: cfg.projectId };
 
     const tAgent = Date.now();
-    const res = await postOnDemandJson(`${cfg.url}/v1/news_summary`, cfg.token, payload, timeoutMs);
+    const res = await postJsonWithAuth(`${cfg.url}/v1/news_summary`, cfg.token, payload, { timeoutMs });
     agentLatencyMs = Date.now() - tAgent;
     if (res?.ok && res?.summary) {
       summary = String(res.summary || "").trim();
@@ -1075,7 +1047,7 @@ async function runNewsQuery(params: {
     };
     if (cfg.projectId) payload.target = { project_id: cfg.projectId };
     const endpoint = kind === "news_refresh" ? "/v1/news/refresh" : "/v1/news/hot";
-    const res = await postOnDemandJson(`${cfg.url}${endpoint}`, cfg.token, payload, timeoutMs);
+    const res = await postJsonWithAuth(`${cfg.url}${endpoint}`, cfg.token, payload, { timeoutMs });
     if (!res?.ok) {
       throw new Error(res?.error || "news_query_failed");
     }
@@ -1244,7 +1216,7 @@ async function runDataFeedsStatus(params: {
     const cfg = resolveOnDemandConfigForFeeds(config);
     const timeoutMs = Number(process.env.CHAT_GATEWAY_FEEDS_QUERY_TIMEOUT_MS || "8000");
     const payload: any = { request_id: requestId, schema_version: INTENT_SCHEMA_VERSION, intent_version: INTENT_VERSION };
-    const res = await postOnDemandJson(`${cfg.url}/v1/data_feeds/status`, cfg.token, payload, timeoutMs);
+    const res = await postJsonWithAuth(`${cfg.url}/v1/data_feeds/status`, cfg.token, payload, { timeoutMs });
     if (!res?.ok) throw new Error(res?.error || "feeds_status_failed");
     output = formatFeedSummary(res.summary || {});
     ok = true;
@@ -1306,7 +1278,7 @@ async function runDataFeedsAssetStatus(params: {
       intent_version: INTENT_VERSION,
       symbol,
     };
-    const res = await postOnDemandJson(`${cfg.url}/v1/data_feeds/asset_status`, cfg.token, payload, timeoutMs);
+    const res = await postJsonWithAuth(`${cfg.url}/v1/data_feeds/asset_status`, cfg.token, payload, { timeoutMs });
     if (!res?.ok) throw new Error(res?.error || "feeds_asset_status_failed");
     output = formatAssetStatus(res.result || {});
     ok = true;
@@ -1369,7 +1341,7 @@ async function runDataFeedsSourceStatus(params: {
       intent_version: INTENT_VERSION,
       feed_id: feedId,
     };
-    const res = await postOnDemandJson(`${cfg.url}/v1/data_feeds/source_status`, cfg.token, payload, timeoutMs);
+    const res = await postJsonWithAuth(`${cfg.url}/v1/data_feeds/source_status`, cfg.token, payload, { timeoutMs });
     if (!res?.ok) throw new Error(res?.error || "feeds_source_status_failed");
     output = formatSourceStatus(res.result || {});
     ok = true;
@@ -1433,7 +1405,7 @@ async function runDataFeedsHotspots(params: {
       intent_version: INTENT_VERSION,
       limit: requestLimit,
     };
-    const res = await postOnDemandJson(`${cfg.url}/v1/data_feeds/hotspots`, cfg.token, payload, timeoutMs);
+    const res = await postJsonWithAuth(`${cfg.url}/v1/data_feeds/hotspots`, cfg.token, payload, { timeoutMs });
     if (!res?.ok) throw new Error(res?.error || "feeds_hotspots_failed");
     output = formatFeedHotspots(Array.isArray(res.hotspots) ? res.hotspots : []);
     ok = true;
@@ -1497,7 +1469,7 @@ async function runDataFeedsOpsSummary(params: {
       intent_version: INTENT_VERSION,
       limit: requestLimit,
     };
-    const res = await postOnDemandJson(`${cfg.url}/v1/data_feeds/ops_summary`, cfg.token, payload, timeoutMs);
+    const res = await postJsonWithAuth(`${cfg.url}/v1/data_feeds/ops_summary`, cfg.token, payload, { timeoutMs });
     if (!res?.ok) throw new Error(res?.error || "feeds_ops_summary_failed");
     const summary = String(res?.summary || "").trim();
     if (summary) {

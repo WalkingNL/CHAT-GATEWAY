@@ -1,4 +1,5 @@
 import { loadProjectRegistry } from "../runtime/project_registry.js";
+import { postJsonWithAuth } from "../runtime/http_client.js";
 
 export type ChartKind = "factor_timeline" | "daily_activity";
 
@@ -193,53 +194,17 @@ function buildRenderPayload(
   return payload;
 }
 
-async function postJson(url: string, token: string, body: any): Promise<any> {
+async function postChartJson(url: string, token: string, body: any): Promise<any> {
   const timeoutMs = Number(process.env.CHAT_GATEWAY_CHART_ACK_TIMEOUT_MS || "8000");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-    } catch (e: any) {
-      const cause = e?.cause;
-      const info = {
-        url,
-        timeoutMs,
-        error: String(e?.message || e),
-        cause: cause
-          ? {
-              message: String(cause?.message || cause),
-              code: String(cause?.code || ""),
-              errno: String(cause?.errno || ""),
-              syscall: String(cause?.syscall || ""),
-            }
-          : undefined,
-      };
-      console.error("[chart][fetch] failed", info);
-      throw e;
-    }
-    const text = await res.text();
-    let data: any = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      data = { ok: false, error: "invalid_json", raw: text };
-    }
-    if (!res.ok) {
-      throw new Error(`on_demand_http_${res.status}: ${data?.error || text}`);
-    }
-    return data;
-  } finally {
-    clearTimeout(timer);
+    return await postJsonWithAuth(url, token, body, { timeoutMs });
+  } catch (e: any) {
+    console.error("[chart][fetch] failed", {
+      url,
+      timeoutMs,
+      error: String(e?.message || e),
+    });
+    throw e;
   }
 }
 
@@ -254,7 +219,7 @@ export async function renderChart(
     channel: opts?.channel,
     chatId: opts?.chatId,
   });
-  const res = await postJson(`${cfg.url}/v1/render`, cfg.token, payload);
+  const res = await postChartJson(`${cfg.url}/v1/render`, cfg.token, payload);
   return {
     kind: intent.kind,
     ok: Boolean(res?.ok),
