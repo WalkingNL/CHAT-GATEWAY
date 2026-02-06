@@ -105,6 +105,13 @@ npx tsx src/entrypoints/all_in_one.ts
 - `CHAT_GATEWAY_CIRCUIT_OPEN_MS_TELEGRAM`, `CHAT_GATEWAY_CIRCUIT_OPEN_MS_FEISHU`, `CHAT_GATEWAY_CIRCUIT_OPEN_MS_NOTIFY`: per-module overrides
 - `CHAT_GATEWAY_MAX_RESTARTS_PER_HOUR` (default 30) and `CHAT_GATEWAY_MAX_RESTARTS_TELEGRAM_PER_HOUR`/`FEISHU`/`NOTIFY`
 - `CHAT_GATEWAY_SUPERVISE_RESET_MS` and `CHAT_GATEWAY_SUPERVISE_RESET_MS_TELEGRAM`/`FEISHU`/`NOTIFY`
+- `CHAT_GATEWAY_LAST_ALERT_TTL_MS`, `CHAT_GATEWAY_LAST_ALERT_MAX_ITEMS`, `CHAT_GATEWAY_LAST_ALERT_MAX_CHARS`: 私聊上下文缓存 TTL/上限
+- `CHAT_GATEWAY_LAST_ALERT_PERSIST`: 设为 `1` 时持久化私聊上下文到 `storageDir/state_last_alerts.json`
+- `CHAT_GATEWAY_LAST_EXPLAIN_TTL_MS`, `CHAT_GATEWAY_LAST_EXPLAIN_MAX_ITEMS`: 解释反馈缓存 TTL/上限
+- `CHAT_GATEWAY_DEDUPE_CLEANUP_MS`: intent 去重缓存清理周期
+- `CHAT_GATEWAY_NEWS_SUMMARY_CACHE_MAX_ITEMS`, `CHAT_GATEWAY_NEWS_SUMMARY_CACHE_CLEANUP_MS`: 新闻摘要缓存清理参数
+- `CHAT_GATEWAY_HTTP_TIMEOUT_MS`: 默认 HTTP 超时（ms）
+- `CHAT_GATEWAY_HTTP_RETRIES`, `CHAT_GATEWAY_HTTP_RETRY_BASE_MS`, `CHAT_GATEWAY_HTTP_RETRY_MAX_MS`, `CHAT_GATEWAY_HTTP_RETRY_JITTER_MS`: HTTP 重试与退避参数
 
 Supervisor backoff defaults: 1s → 2s → 5s → 10s → 30s (max 30s). Not currently configurable.
 
@@ -151,6 +158,7 @@ Registry extensions (`config/projects.yml`):
 ## Verification
 
 - Type check: `npm run build` (tsc); for tsx-only flows, run `tsx --typecheck` if needed.
+- Intent routing smoke tests: `npm run check:intents`
 - Lint (if configured in this repo).
 
 ## Networking note
