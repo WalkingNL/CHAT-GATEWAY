@@ -134,6 +134,27 @@ const RESOLVE_GROUP_SKIP_INTENTS = new Set(
     .map(meta => meta.intent),
 );
 
+type PrimaryCommandMeta = {
+  name: "alert_strategy" | "alert_query";
+  enabledKey: string;
+  commandPattern: RegExp;
+  groupCommandPattern?: RegExp;
+};
+
+const PRIMARY_COMMAND_META: Record<PrimaryCommandMeta["name"], PrimaryCommandMeta> = {
+  alert_strategy: {
+    name: "alert_strategy",
+    enabledKey: "alert_strategy",
+    commandPattern: /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i,
+    groupCommandPattern: /^\/strategy\b/i,
+  },
+  alert_query: {
+    name: "alert_query",
+    enabledKey: "alert_query",
+    commandPattern: /^\/(event|evidence|gate|eval|evaluation|reliability|config|health)\b/i,
+  },
+};
+
 type AdapterContext = {
   storageDir: string;
   config: LoadedConfig;
@@ -163,6 +184,25 @@ type AdapterContext = {
   projectId: string | null;
   defaultWindowSpecId?: string;
 };
+
+function matchPrimaryCommand(meta: PrimaryCommandMeta, ctx: AdapterContext): boolean {
+  if (!isIntentEnabled(meta.enabledKey)) return false;
+  if (!meta.commandPattern.test(ctx.cleanedText)) return false;
+  if (ctx.isGroup && meta.groupCommandPattern && !meta.groupCommandPattern.test(ctx.cleanedText)) {
+    return false;
+  }
+  return true;
+}
+
+function resolveAdapterIdsForContext(ctx: AdapterContext) {
+  return resolveAdapterRequestIds({
+    channel: ctx.channel,
+    chatId: ctx.chatId,
+    messageId: ctx.messageId,
+    replyToId: ctx.replyToId,
+    explicitRetry: ctx.explicitRetry,
+  });
+}
 
 function buildAdapterContext(params: {
   storageDir: string;
@@ -217,18 +257,10 @@ async function runPrimaryIntentPipeline(ctx: AdapterContext): Promise<boolean> {
       name: "alert_strategy",
       priority: 30,
       match: (c) => {
-        const requested = /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i.test(c.cleanedText);
-        const commandOk = !c.isGroup || /^\/strategy\b/i.test(c.cleanedText);
-        return { matched: requested && commandOk && isIntentEnabled("alert_strategy") };
+        return { matched: matchPrimaryCommand(PRIMARY_COMMAND_META.alert_strategy, c) };
       },
       run: async (c) => {
-        const adapterIds = resolveAdapterRequestIds({
-          channel: c.channel,
-          chatId: c.chatId,
-          messageId: c.messageId,
-          replyToId: c.replyToId,
-          explicitRetry: c.explicitRetry,
-        });
+        const adapterIds = resolveAdapterIdsForContext(c);
         const handled = await handleStrategyIfAny({
           storageDir: c.storageDir,
           config: c.config,
@@ -254,17 +286,10 @@ async function runPrimaryIntentPipeline(ctx: AdapterContext): Promise<boolean> {
       name: "alert_query",
       priority: 20,
       match: (c) => {
-        const requested = /^\/(event|evidence|gate|eval|evaluation|reliability|config|health)\b/i.test(c.cleanedText);
-        return { matched: requested && isIntentEnabled("alert_query") };
+        return { matched: matchPrimaryCommand(PRIMARY_COMMAND_META.alert_query, c) };
       },
       run: async (c) => {
-        const adapterIds = resolveAdapterRequestIds({
-          channel: c.channel,
-          chatId: c.chatId,
-          messageId: c.messageId,
-          replyToId: c.replyToId,
-          explicitRetry: c.explicitRetry,
-        });
+        const adapterIds = resolveAdapterIdsForContext(c);
         const handled = await handleQueryIfAny({
           storageDir: c.storageDir,
           config: c.config,
@@ -300,13 +325,7 @@ async function runPrimaryIntentPipeline(ctx: AdapterContext): Promise<boolean> {
       run: async (c, match: MatchResult<ReturnType<typeof parseDashboardIntent>>) => {
         const dashIntent = match.data;
         if (!dashIntent) return { handled: false };
-        const adapterIds = resolveAdapterRequestIds({
-          channel: c.channel,
-          chatId: c.chatId,
-          messageId: c.messageId,
-          replyToId: c.replyToId,
-          explicitRetry: c.explicitRetry,
-        });
+        const adapterIds = resolveAdapterIdsForContext(c);
         const handled = await dispatchDashboardExport({
           storageDir: c.storageDir,
           config: c.config,
