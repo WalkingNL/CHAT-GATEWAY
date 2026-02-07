@@ -13,12 +13,20 @@ import { writeExplainFeedback } from "../audit/trace_writer.js";
 import { getLastExplainTrace, setLastAlert } from "./state_cache.js";
 import { handleStrategyIfAny } from "../runtime/strategy.js";
 import { handleQueryIfAny } from "../runtime/query.js";
-import { ACCESS_MESSAGES, INTERACTION_MESSAGES, INTENT_REGISTRY, isIntentEnabledByName, type IntentMeta } from "./intent_policy.js";
+import { clarifyText } from "../runtime/response_templates.js";
+import {
+  ACCESS_MESSAGES,
+  INTERACTION_MESSAGES,
+  INTENT_REGISTRY,
+  RESOLVE_MESSAGES,
+  isIntentEnabledByName,
+  type IntentMeta,
+} from "./intent_policy.js";
 import { resolveProjectId } from "./intent_handlers.js";
 import { resolveAdapterRequestIds, runExplainSummaryFlow, runResolveFlow } from "./resolve_flow.js";
 import { handleOpsCommand, handleParsedCommand, handlePrivateMessage } from "./command_flow.js";
 import type { AdapterContext } from "./router_types.js";
-import { clip, nowIso, taskPrefix } from "./router_utils.js";
+import { clip, nowIso } from "./router_utils.js";
 
 type PrimaryCommandMeta = IntentMeta & {
   name: "alert_strategy" | "alert_query";
@@ -39,6 +47,22 @@ const PRIMARY_COMMAND_META: Record<PrimaryCommandMeta["name"], PrimaryCommandMet
     commandPattern: /^\/(event|evidence|gate|eval|evaluation|reliability|config|health)\b/i,
   },
 };
+
+const UNIFIED_COMMAND = "/i";
+const UNIFIED_COMMAND_RE = /^\/i(?:@[A-Za-z0-9_]+)?(?:\s+|$)/i;
+
+function parseUnifiedCommand(text: string): { payload: string } | null {
+  const trimmed = String(text || "").trim();
+  if (!UNIFIED_COMMAND_RE.test(trimmed)) return null;
+  const rest = trimmed.replace(UNIFIED_COMMAND_RE, "");
+  return { payload: rest.trim() };
+}
+
+function normalizeUnifiedPayload(payload: string): string {
+  const raw = String(payload || "").trim();
+  if (!raw) return "";
+  return raw.replace(/^\/+/, "").trim();
+}
 
 function matchPrimaryCommand(meta: PrimaryCommandMeta, ctx: AdapterContext): boolean {
   if (!isIntentEnabledByName(meta.name)) return false;
@@ -80,6 +104,7 @@ function buildAdapterContext(params: {
   isGroup: boolean;
   mentionsBot: boolean;
   send: (chatId: string, text: string) => Promise<void>;
+  forceAllowResolve?: boolean;
 }): AdapterContext {
   const trimmedText = String(params.text || "").trim();
   const trimmedReplyText = String(params.replyText || "").trim();
@@ -90,6 +115,9 @@ function buildAdapterContext(params: {
     mentionsBot: params.mentionsBot,
     replyToId: params.replyToId,
   });
+  const allowResolve = params.forceAllowResolve
+    ? (!hints.explainRequested && !hints.summaryRequested && Boolean(hints.resolveText))
+    : hints.allowResolve;
   const explicitRetry = wantsRetry(hints.intentRawText);
   const isPrivate = !params.isGroup;
   const projectId = resolveProjectId(params.config);
@@ -103,7 +131,7 @@ function buildAdapterContext(params: {
     summaryRequested: hints.summaryRequested,
     explainRequested: hints.explainRequested,
     resolveText: hints.resolveText,
-    allowResolve: hints.allowResolve,
+    allowResolve,
     explicitRetry,
     isPrivate,
     projectId,
@@ -251,6 +279,53 @@ export async function handleAdapterIntentIfAny(params: {
     send,
   } = params;
 
+  const preHints = buildIntentHints({
+    channel,
+    text,
+    isGroup,
+    mentionsBot,
+    replyToId,
+  });
+  const unified = parseUnifiedCommand(preHints.cleanedText);
+  if (unified) {
+    const payload = normalizeUnifiedPayload(unified.payload);
+    if (!payload) {
+      await send(chatId, INTERACTION_MESSAGES.unifiedUsage);
+      return true;
+    }
+    const ctx = buildAdapterContext({
+      storageDir,
+      config,
+      allowlistMode,
+      ownerChatId,
+      ownerUserId,
+      channel,
+      chatId,
+      messageId,
+      replyToId,
+      userId,
+      text: payload,
+      replyText,
+      isGroup,
+      mentionsBot: true,
+      send,
+      forceAllowResolve: true,
+    });
+
+    if (ctx.trimmedReplyText && ctx.isPrivate) {
+      setLastAlert(storageDir, chatId, ctx.trimmedReplyText);
+    }
+
+    const resolveFlow = await runResolveFlow(ctx);
+    if (!resolveFlow.done) {
+      const handled = await runExplainSummaryFlow(ctx, resolveFlow.pending);
+      if (!handled) {
+        await send(chatId, clarifyText(RESOLVE_MESSAGES.clarifyUnknown));
+      }
+    }
+    return true;
+  }
+
   const ctx = buildAdapterContext({
     storageDir,
     config,
@@ -381,7 +456,6 @@ export async function handleMessage(opts: {
     channel === "telegram" && isGroup && mentionsBot && mentionPattern
       ? trimmedText.replace(mentionPattern, "").trim()
       : trimmedText;
-  const taskIdPrefix = taskPrefix(channel);
   const isCommand = cleanedText.startsWith("/");
 
   const trimmedReplyText = (replyText || "").trim();
@@ -447,7 +521,6 @@ export async function handleMessage(opts: {
   if (!isGroup) {
     const handledPrivate = await handlePrivateMessage({
       channel,
-      taskIdPrefix,
       storageDir,
       chatId,
       userId,
@@ -468,7 +541,6 @@ export async function handleMessage(opts: {
   await handleParsedCommand({
     cmd,
     channel,
-    taskIdPrefix,
     storageDir,
     chatId,
     userId,

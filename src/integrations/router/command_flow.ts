@@ -2,29 +2,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
-import { handleAskCommand } from "./commands.js";
 import { appendLedger } from "../audit/ledger.js";
 import { getStatusFacts } from "./context.js";
 import { loadAuth, saveAuth } from "../auth/store.js";
-import { submitTask } from "../../core/internal_client.js";
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
-import { errorText, rejectText } from "../runtime/response_templates.js";
-import { COMMAND_MESSAGES, INTERACTION_MESSAGES, ensureIntentEnabledForCommand } from "./intent_policy.js";
+import { rejectText } from "../runtime/response_templates.js";
+import { COMMAND_MESSAGES, INTERACTION_MESSAGES } from "./intent_policy.js";
 import { ACCESS_MESSAGES } from "./intent_policy.js";
 import { nowIso } from "./router_utils.js";
 import type { SendFn } from "./router_types.js";
-import {
-  formatSignalsDigest,
-  getSignalsDigest,
-  resolveProjectId,
-  runDataFeedsAssetStatus,
-  runDataFeedsHotspots,
-  runDataFeedsOpsSummary,
-  runDataFeedsSourceStatus,
-  runDataFeedsStatus,
-  runNewsQuery,
-} from "./intent_handlers.js";
+import { resolveProjectId } from "./intent_handlers.js";
 import { setLastAlert } from "./state_cache.js";
 
 export type ParsedCommand = ReturnType<typeof import("./commands.js").parseCommand>;
@@ -43,12 +31,6 @@ function getOpsLimits(): OpsLimits {
     telegramSafeMax,
   );
   return { maxLinesDefault, maxLogChars, telegramSafeMax };
-}
-
-function getMaxWindowMinutes(): number {
-  const raw = Number(process.env.MAX_WINDOW_MINUTES || 1440);
-  if (!Number.isFinite(raw) || raw <= 0) return 1440;
-  return Math.floor(raw);
 }
 
 function clampLines(n: number, maxLinesDefault: number) {
@@ -284,7 +266,6 @@ export async function handleOpsCommand(params: {
 
 export async function handlePrivateMessage(params: {
   channel: string;
-  taskIdPrefix: string;
   storageDir: string;
   chatId: string;
   userId: string;
@@ -298,7 +279,6 @@ export async function handlePrivateMessage(params: {
 }): Promise<boolean> {
   const {
     channel,
-    taskIdPrefix,
     storageDir,
     chatId,
     userId,
@@ -307,8 +287,8 @@ export async function handlePrivateMessage(params: {
     trimmedText,
     trimmedReplyText,
     isCommand,
-    send,
-    config,
+  send,
+  config,
   } = params;
 
   if (trimmedReplyText) {
@@ -330,7 +310,6 @@ export async function handlePrivateMessage(params: {
 export async function handleParsedCommand(params: {
   cmd: ParsedCommand;
   channel: string;
-  taskIdPrefix: string;
   storageDir: string;
   chatId: string;
   userId: string;
@@ -340,7 +319,7 @@ export async function handleParsedCommand(params: {
   send: SendFn;
   config?: LoadedConfig;
 }) {
-  const { cmd, channel, taskIdPrefix, storageDir, chatId, userId, text, isOwner, authState, send, config } = params;
+  const { cmd, channel, storageDir, chatId, userId, text, isOwner, authState, send, config } = params;
 
   // auth commands only owner
   if (cmd.kind.startsWith("auth_") && !isOwner) {
@@ -354,295 +333,20 @@ export async function handleParsedCommand(params: {
   if (cmd.kind === "help") {
     const out = [
       "/help",
+      "/i <自然语言>",
       "/status",
-      "/signals [N]m|[N]h",
-      "/news [N]",
-      "/news refresh [N]",
-      "/feeds status",
-      "/feeds asset <SYMBOL>",
-      "/feeds source <feed_id>",
-      "/feeds hotspots [N]",
-      "/feeds ops [N]",
-      "/ask <q>",
-      "/analyze <incident description>",
-      "/suggest <incident description>",
+      "/ps",
+      "/logs <name> [lines]",
       "/auth add <chat_id>",
       "/auth del <chat_id>",
       "/auth list",
-      "/feedback <描述>（例如：告警太多了 / 告警太少了）",
+      "/feedback <描述>（例如：告警太多了 / 只推高等级）",
+      "/chart <query>（仅 Telegram）",
+      "/strategy ...",
+      "/event|/eval|/health ...",
     ].join("\n");
     await send(chatId, out);
     appendLedger(storageDir, { ...baseAudit, cmd: "help" });
-    return;
-
-  } else if (cmd.kind === "news_hot") {
-    if (!await ensureIntentEnabledForCommand(send, chatId, "news_hot", "未开放新闻查询能力。")) return;
-    await runNewsQuery({
-      storageDir,
-      chatId,
-      userId,
-      channel,
-      send,
-      config,
-      kind: "news_hot",
-      limit: cmd.limit ?? undefined,
-    });
-    return;
-
-  } else if (cmd.kind === "news_refresh") {
-    if (!await ensureIntentEnabledForCommand(send, chatId, "news_refresh", "未开放新闻查询能力。")) return;
-    await runNewsQuery({
-      storageDir,
-      chatId,
-      userId,
-      channel,
-      send,
-      config,
-      kind: "news_refresh",
-      limit: cmd.limit ?? undefined,
-    });
-    return;
-
-  } else if (cmd.kind === "feeds_status") {
-    if (!await ensureIntentEnabledForCommand(
-      send,
-      chatId,
-      "data_feeds_status",
-      "未开放数据源查询能力。",
-    )) return;
-    await runDataFeedsStatus({
-      storageDir,
-      chatId,
-      userId,
-      channel,
-      send,
-      config,
-    });
-    return;
-
-  } else if (cmd.kind === "feeds_asset") {
-    if (!await ensureIntentEnabledForCommand(
-      send,
-      chatId,
-      "data_feeds_asset_status",
-      "未开放数据源查询能力。",
-    )) return;
-    const symbol = String(cmd.symbol || "").trim();
-    if (!symbol) {
-      await send(chatId, COMMAND_MESSAGES.feedsAssetUsage);
-      return;
-    }
-    await runDataFeedsAssetStatus({
-      storageDir,
-      chatId,
-      userId,
-      channel,
-      send,
-      config,
-      symbol,
-    });
-    return;
-
-  } else if (cmd.kind === "feeds_source") {
-    if (!await ensureIntentEnabledForCommand(
-      send,
-      chatId,
-      "data_feeds_source_status",
-      "未开放数据源查询能力。",
-    )) return;
-    const feedId = String(cmd.feedId || "").trim();
-    if (!feedId) {
-      await send(chatId, COMMAND_MESSAGES.feedsSourceUsage);
-      return;
-    }
-    await runDataFeedsSourceStatus({
-      storageDir,
-      chatId,
-      userId,
-      channel,
-      send,
-      config,
-      feedId,
-    });
-    return;
-
-  } else if (cmd.kind === "feeds_hotspots") {
-    if (!await ensureIntentEnabledForCommand(
-      send,
-      chatId,
-      "data_feeds_hotspots",
-      "未开放数据源查询能力。",
-    )) return;
-    await runDataFeedsHotspots({
-      storageDir,
-      chatId,
-      userId,
-      channel,
-      send,
-      config,
-      limit: cmd.limit ?? undefined,
-    });
-    return;
-
-  } else if (cmd.kind === "feeds_ops") {
-    if (!await ensureIntentEnabledForCommand(
-      send,
-      chatId,
-      "data_feeds_ops_summary",
-      "未开放数据源查询能力。",
-    )) return;
-    await runDataFeedsOpsSummary({
-      storageDir,
-      chatId,
-      userId,
-      channel,
-      send,
-      config,
-      limit: cmd.limit ?? undefined,
-    });
-    return;
-
-  } else if (cmd.kind === "signals") {
-    const maxWindow = getMaxWindowMinutes();
-    if (!cmd.minutes) {
-      await send(chatId, COMMAND_MESSAGES.signalsUsage(maxWindow));
-      return;
-    }
-    if (cmd.minutes > maxWindow) {
-      await send(chatId, COMMAND_MESSAGES.signalsTooLarge(maxWindow));
-      return;
-    }
-
-    try {
-      const digest = await getSignalsDigest(config, cmd.minutes);
-      if (!digest.ok) {
-        const msg = digest.error === "signals_dir_missing"
-          ? "signals data dir missing"
-          : "signals source not configured";
-        await send(chatId, errorText(msg));
-        return;
-      }
-
-      const out = formatSignalsDigest(cmd.minutes, digest.summary);
-      await send(chatId, out);
-      appendLedger(storageDir, {
-        ...baseAudit,
-        cmd: "signals",
-        minutes: cmd.minutes,
-        raw_count: digest.summary.rawCount,
-        dedup_count: digest.summary.dedupCount,
-        top_symbols: digest.summary.topSymbols,
-        top_kinds: digest.summary.topKinds,
-      });
-    } catch (e: any) {
-      await send(chatId, errorText(`signals read failed: ${String(e?.message || e)}`));
-    }
-    return;
-
-  } else if (cmd.kind === "ask") {
-    await handleAskCommand({
-      chatId,
-      channel,
-      taskIdPrefix,
-      text: cmd.q,
-      reply: (m) => send(chatId, m),
-    });
-    appendLedger(storageDir, { ...baseAudit, cmd: "ask" });
-    return;
-
-  } else if (cmd.kind === "analyze") {
-    const prompt = (cmd.q || "").trim();
-    if (!prompt) {
-      await send(chatId, COMMAND_MESSAGES.analyzeUsage);
-      return;
-    }
-
-    const taskId = `${taskIdPrefix}_analyze_${chatId}_${Date.now()}`;
-
-    try {
-      const res = await submitTask({
-        task_id: taskId,
-        stage: "analyze",
-        prompt,
-        context: {
-          source: channel,
-          chat_id: chatId,
-          user_id: userId,
-        },
-      });
-
-      if (!res?.ok) {
-        await send(chatId, errorText(`Gateway error: ${res?.error || "unknown"}`));
-        appendLedger(storageDir, { ...baseAudit, cmd: "analyze", taskId, ok: false, error: res?.error || "unknown" });
-        return;
-      }
-
-      await send(chatId, `🧠 Analysis (facts-only)\n\n${res.summary}`);
-    } catch (e: any) {
-      await send(chatId, errorText(`analyze failed: ${String(e?.message || e)}`));
-    }
-
-    appendLedger(storageDir, { ...baseAudit, cmd: "analyze", taskId });
-    return;
-
-  } else if (cmd.kind === "suggest") {
-    const prompt = (cmd.q || "").trim();
-    if (!prompt) {
-      await send(chatId, COMMAND_MESSAGES.suggestUsage);
-      return;
-    }
-
-    const taskId = `${taskIdPrefix}_suggest_${chatId}_${Date.now()}`;
-
-    try {
-      const res = await submitTask({
-        task_id: taskId,
-        stage: "suggest",
-        prompt,
-        context: {
-          source: channel,
-          chat_id: chatId,
-          user_id: userId,
-        },
-      });
-
-      if (!res?.ok) {
-        await send(chatId, errorText(`Gateway error: ${res?.error || "unknown"}`));
-        appendLedger(storageDir, { ...baseAudit, cmd: "suggest", taskId, ok: false, error: res?.error || "unknown" });
-        return;
-      }
-
-      let out = `🛠️ Suggestion (facts-only)\n\n`;
-      out += `Summary:\n${res.summary}\n`;
-
-      if (res.files_touched?.length) {
-        out += `\nFiles:\n`;
-        for (const f of res.files_touched) out += `- ${f}\n`;
-      }
-
-      if (res.verify_cmds?.length) {
-        out += `\nVerify:\n`;
-        for (const c of res.verify_cmds) out += `- ${c}\n`;
-      }
-
-      if (res.warnings?.length) {
-        out += `\nWarnings:\n`;
-        for (const w of res.warnings) out += `- ${w}\n`;
-      }
-
-      await send(chatId, out);
-    } catch (e: any) {
-      await send(chatId, errorText(`suggest failed: ${String(e?.message || e)}`));
-    }
-
-    appendLedger(storageDir, { ...baseAudit, cmd: "suggest", taskId });
-    return;
-  }
-
-  if (cmd.kind === "status") {
-    const out = getStatusFacts(storageDir);
-    await send(chatId, out);
-    appendLedger(storageDir, { ...baseAudit, cmd: "status", out_tail: out.slice(-800) });
     return;
   }
 

@@ -148,10 +148,11 @@ export const ACCESS_MESSAGES = {
 };
 
 export const INTERACTION_MESSAGES = {
-  quickHelp: "用法：回复一条告警发“解释一下”；回复新闻发“摘要 200”。",
+  quickHelp: "用法：群聊用 /i + 自然语言（回复告警：/i 解释一下；回复新闻：/i 摘要 200）。私聊可直接发自然语言。",
   explainFeedbackMissing: "没有可反馈的解释。",
   explainFeedbackRecorded: "已记录反馈。",
-  unknownCommand: "unknown command. /help",
+  unknownCommand: "未知指令。用 /i <自然语言> 或 /help。",
+  unifiedUsage: "用法：/i <自然语言>（例如：/i 解释一下 / /i 摘要 200 / /i 新闻 热点 5）。",
   cognitiveConfirmPrompt: "请回复：记 / 不记",
   cognitiveStatusPrompt: "请补充记录编号与状态（例如：C-20260130-001 DONE）",
   chartTelegramOnly: "当前仅支持 Telegram 图表导出。",
