@@ -25,9 +25,7 @@ export function shouldAttemptResolve(params: {
   if (!raw) return false;
   const isCommand = raw.startsWith("/") && !params.usedFeedbackPrefix;
   if (isCommand) return false;
-  if (params.isGroup) {
-    if (!params.mentionsBot) return false;
-  }
+  if (params.isGroup) return false;
   return Boolean(params.strippedText);
 }
 

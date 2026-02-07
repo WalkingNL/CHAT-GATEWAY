@@ -37,7 +37,7 @@ const groupNoReply = hint({
   mentionsBot: true,
   replyToId: "",
 });
-assert.equal(groupNoReply.allowResolve, true, "group with mention should allow resolve");
+assert.equal(groupNoReply.allowResolve, false, "group mention should not allow resolve without /i");
 
 const groupWithReply = hint({
   text: "@SoliaNLBot 帮我看看",
@@ -45,7 +45,7 @@ const groupWithReply = hint({
   mentionsBot: true,
   replyToId: "456",
 });
-assert.equal(groupWithReply.allowResolve, true, "group with reply should allow resolve");
+assert.equal(groupWithReply.allowResolve, false, "group mention should not allow resolve without /i");
 
 const groupNoMention = hint({
   text: "解释一下",
