@@ -10,12 +10,14 @@ import { loadProjectRegistry } from "../runtime/project_registry.js";
 import { postJsonWithAuth } from "../runtime/http_client.js";
 import { errorText, rejectText } from "../runtime/response_templates.js";
 import { submitTask } from "../../core/internal_client.js";
+import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
 import { clip, clipToLen, nowIso, parseIntEnv } from "./router_utils.js";
 import { setLastExplainTrace } from "./state_cache.js";
 
 export const NEWS_SUMMARY_DEFAULT_CHARS = 200;
 export const NEWS_SUMMARY_MAX_CHARS = 1200;
+const EXPLAIN_MAX_CHARS_DEFAULT = parseIntEnv("CHAT_GATEWAY_EXPLAIN_MAX_CHARS", 0);
 const NEWS_QUERY_DEFAULT_LIMIT = 5;
 const NEWS_QUERY_MAX_LIMIT = 20;
 const FEEDS_QUERY_DEFAULT_LIMIT = 5;
@@ -516,6 +518,86 @@ function formatSignalsContext(ctx?: SignalsContext | null): string {
   ].join("\n");
 }
 
+
+function resolveExplainMaxChars(params: {
+  config?: LoadedConfig;
+  channel: string;
+  chatId: string;
+  userId: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  hasReply: boolean;
+}): number | null {
+  const { config, channel, chatId, userId, isGroup, mentionsBot, hasReply } = params;
+  if (!config) return EXPLAIN_MAX_CHARS_DEFAULT || null;
+  const res = evaluate(config, {
+    channel,
+    capability: "alerts.explain",
+    chat_id: chatId,
+    chat_type: isGroup ? "group" : "private",
+    user_id: userId,
+    mention_bot: mentionsBot,
+    has_reply: hasReply,
+  });
+  const policyMax = res?.limits?.max_chars;
+  const hardMax = EXPLAIN_MAX_CHARS_DEFAULT || 0;
+  let maxChars = typeof policyMax === "number" && policyMax > 0 ? policyMax : null;
+  if (hardMax > 0) {
+    if (!maxChars || hardMax < maxChars) {
+      maxChars = hardMax;
+    }
+  }
+  return maxChars;
+}
+
+function trimExplainSummary(text: string, maxChars: number): { text: string; truncated: boolean } {
+  if (text.length <= maxChars) return { text, truncated: false };
+  const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+  const internalIdx = lines.findIndex((line) => line.startsWith("系统内部解释"));
+  const externalIdx = lines.findIndex((line) => line.startsWith("系统外部解释"));
+  if (internalIdx >= 0 && externalIdx >= 0) {
+    let internal = lines[internalIdx];
+    const external = lines[externalIdx];
+    const gap = 1;
+    let budget = maxChars - external.length - gap;
+    if (budget < 0) budget = 0;
+    if (internal.length > budget) {
+      if (budget > 3) {
+        internal = internal.slice(0, budget - 3) + "...";
+      } else {
+        internal = internal.slice(0, budget);
+      }
+    }
+    const combined = budget > 0 ? `${internal}\n${external}` : external.slice(0, maxChars);
+    return { text: combined, truncated: true };
+  }
+  const clipped = maxChars > 3 ? text.slice(0, maxChars - 3) + "..." : text.slice(0, maxChars);
+  return { text: clipped, truncated: true };
+}
+
+function applyExplainOutputLimit(params: {
+  summary: string;
+  signalsNote: string;
+  maxChars: number | null;
+}): { text: string; truncated: boolean } {
+  const { summary, signalsNote, maxChars } = params;
+  const base = summary;
+  let combined = signalsNote ? `${signalsNote}\n\n${base}` : base;
+  if (!maxChars || maxChars <= 0) {
+    return { text: combined, truncated: false };
+  }
+  let droppedSignals = false;
+  if (signalsNote && combined.length > maxChars) {
+    combined = base;
+    droppedSignals = true;
+  }
+  const trimmed = trimExplainSummary(combined, maxChars);
+  if (droppedSignals && !trimmed.truncated) {
+    return { text: trimmed.text, truncated: true };
+  }
+  return trimmed;
+}
+
 export async function runExplain(params: {
   storageDir: string;
   chatId: string;
@@ -525,17 +607,30 @@ export async function runExplain(params: {
   config?: LoadedConfig;
   channel: string;
   taskIdPrefix: string;
+  isGroup: boolean;
+  mentionsBot: boolean;
+  hasReply: boolean;
 }): Promise<{ ok: boolean; summary: string; errCode: string; latencyMs: number }> {
-  const { storageDir, chatId, userId, rawAlert, send, config, channel, taskIdPrefix } = params;
+  const { storageDir, chatId, userId, rawAlert, send, config, channel, taskIdPrefix, isGroup, mentionsBot, hasReply } = params;
   const t0 = Date.now();
   const ctx = await buildExplainContext(rawAlert, config);
   const signalsNote = formatSignalsContext(ctx.signals);
+  const maxChars = resolveExplainMaxChars({
+    config,
+    channel,
+    chatId,
+    userId,
+    isGroup,
+    mentionsBot,
+    hasReply,
+  });
   const input = { alert_raw: rawAlert, parsed: ctx.parsed, facts: ctx.facts, mode: channel };
   const decision = routeExplain(input);
   const taskId = `${taskIdPrefix}_${chatId}_${Date.now()}`;
 
   let summary = "";
   let ok = false;
+  let truncated = false;
   let errCode = "";
   let latencyMs = 0;
 
@@ -555,9 +650,9 @@ export async function runExplain(params: {
     } else {
       ok = true;
       summary = String(res.summary || "");
-      if (signalsNote) {
-        summary = `${signalsNote}\n\n${summary}`;
-      }
+      const limited = applyExplainOutputLimit({ summary, signalsNote, maxChars });
+      summary = limited.text;
+      truncated = limited.truncated;
       await send(chatId, summary);
     }
   } catch (e: any) {
@@ -590,7 +685,7 @@ export async function runExplain(params: {
     },
     output_meta: {
       chars: summary.length,
-      truncated: false,
+      truncated,
     },
     trace_id: taskId,
   };

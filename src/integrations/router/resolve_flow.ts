@@ -917,6 +917,9 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           config,
           channel,
           taskIdPrefix: `${taskPrefix(channel)}_explain`,
+          isGroup,
+          mentionsBot,
+          hasReply: Boolean(trimmedReplyText),
         });
         appendAlertExplainLedger({
           storageDir,
@@ -1059,6 +1062,9 @@ async function handleAlertExplainIntent(params: {
     config,
     channel,
     taskIdPrefix: `${taskPrefix(channel)}_explain`,
+    isGroup,
+    mentionsBot,
+    hasReply: Boolean(trimmedReplyText),
   });
   appendAlertExplainLedger({
     storageDir,
