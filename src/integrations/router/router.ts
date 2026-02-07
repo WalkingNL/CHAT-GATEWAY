@@ -11,44 +11,18 @@ import { dispatchDashboardExport } from "../runtime/handlers.js";
 import { isIntentEnabled } from "../runtime/capabilities.js";
 import { writeExplainFeedback } from "../audit/trace_writer.js";
 import { getLastExplainTrace, setLastAlert } from "./state_cache.js";
-import { handleStrategyIfAny } from "../runtime/strategy.js";
-import { handleQueryIfAny } from "../runtime/query.js";
 import { clarifyText } from "../runtime/response_templates.js";
 import {
   ACCESS_MESSAGES,
   INTERACTION_MESSAGES,
-  INTENT_REGISTRY,
   RESOLVE_MESSAGES,
   isIntentEnabledByName,
-  type IntentMeta,
 } from "./intent_policy.js";
 import { resolveProjectId } from "./intent_handlers.js";
 import { resolveAdapterRequestIds, runExplainSummaryFlow, runResolveFlow } from "./resolve_flow.js";
 import { handleOpsCommand, handleParsedCommand, handlePrivateMessage } from "./command_flow.js";
 import type { AdapterContext } from "./router_types.js";
 import { clip, nowIso } from "./router_utils.js";
-
-type PrimaryCommandMeta = IntentMeta & {
-  name: "alert_strategy" | "alert_query";
-  commandPattern: RegExp;
-  groupCommandPattern?: RegExp;
-};
-
-const PRIMARY_COMMAND_META: Record<PrimaryCommandMeta["name"], PrimaryCommandMeta> = {
-  alert_strategy: {
-    ...INTENT_REGISTRY.alert_strategy,
-    name: "alert_strategy",
-    commandPattern: /^(?:\/strategy|策略|告警策略|alert_strategy)\b/i,
-    groupCommandPattern: /^\/strategy\b/i,
-  },
-  alert_query: {
-    ...INTENT_REGISTRY.alert_query,
-    name: "alert_query",
-    commandPattern: /^\/(event|evidence|gate|eval|evaluation|reliability|config|health)\b/i,
-  },
-};
-
-const UNIFIED_COMMAND = "/i";
 const UNIFIED_COMMAND_RE = /^\/i(?:@[A-Za-z0-9_]+)?(?:\s+|$)/i;
 
 function parseUnifiedCommand(text: string): { payload: string } | null {
@@ -62,15 +36,6 @@ function normalizeUnifiedPayload(payload: string): string {
   const raw = String(payload || "").trim();
   if (!raw) return "";
   return raw.replace(/^\/+/, "").trim();
-}
-
-function matchPrimaryCommand(meta: PrimaryCommandMeta, ctx: AdapterContext): boolean {
-  if (!isIntentEnabledByName(meta.name)) return false;
-  if (!meta.commandPattern.test(ctx.cleanedText)) return false;
-  if (ctx.isGroup && meta.groupCommandPattern && !meta.groupCommandPattern.test(ctx.cleanedText)) {
-    return false;
-  }
-  return true;
 }
 
 function resolveAdapterIdsForContext(ctx: AdapterContext) {
@@ -141,64 +106,6 @@ function buildAdapterContext(params: {
 
 async function runPrimaryIntentPipeline(ctx: AdapterContext): Promise<boolean> {
   const steps: Array<PipelineStep<AdapterContext, any>> = [
-    {
-      name: "alert_strategy",
-      priority: 30,
-      match: (c) => {
-        return { matched: matchPrimaryCommand(PRIMARY_COMMAND_META.alert_strategy, c) };
-      },
-      run: async (c) => {
-        const adapterIds = resolveAdapterIdsForContext(c);
-        const handled = await handleStrategyIfAny({
-          storageDir: c.storageDir,
-          config: c.config,
-          allowlistMode: c.allowlistMode,
-          ownerChatId: c.ownerChatId,
-          ownerUserId: c.ownerUserId,
-          channel: c.channel,
-          chatId: c.chatId,
-          userId: c.userId,
-          isGroup: c.isGroup,
-          mentionsBot: c.mentionsBot,
-          text: c.cleanedText,
-          send: c.send,
-          adapterEntry: true,
-          requestId: adapterIds?.dispatchRequestId,
-          requestIdBase: adapterIds?.requestIdBase,
-          attempt: adapterIds?.attempt,
-        });
-        return { handled };
-      },
-    },
-    {
-      name: "alert_query",
-      priority: 20,
-      match: (c) => {
-        return { matched: matchPrimaryCommand(PRIMARY_COMMAND_META.alert_query, c) };
-      },
-      run: async (c) => {
-        const adapterIds = resolveAdapterIdsForContext(c);
-        const handled = await handleQueryIfAny({
-          storageDir: c.storageDir,
-          config: c.config,
-          allowlistMode: c.allowlistMode,
-          ownerChatId: c.ownerChatId,
-          ownerUserId: c.ownerUserId,
-          channel: c.channel,
-          chatId: c.chatId,
-          userId: c.userId,
-          isGroup: c.isGroup,
-          mentionsBot: c.mentionsBot,
-          text: c.cleanedText,
-          send: c.send,
-          adapterEntry: true,
-          requestId: adapterIds?.dispatchRequestId,
-          requestIdBase: adapterIds?.requestIdBase,
-          attempt: adapterIds?.attempt,
-        });
-        return { handled };
-      },
-    },
     {
       name: "dashboard_export",
       priority: 10,

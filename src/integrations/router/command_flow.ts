@@ -342,8 +342,6 @@ export async function handleParsedCommand(params: {
       "/auth list",
       "/feedback <描述>（例如：告警太多了 / 只推高等级）",
       "/chart <query>（仅 Telegram）",
-      "/strategy ...",
-      "/event|/eval|/health ...",
     ].join("\n");
     await send(chatId, out);
     appendLedger(storageDir, { ...baseAudit, cmd: "help" });
