@@ -18,7 +18,8 @@ const BASE_PROMPT =
   "系统外部解释：仅当 context 中有明确外部证据时输出，否则写“当前暂无”。\n" +
   "禁止：价格预测、交易建议、无依据故事。\n" +
   "若 facts.window_1h/24h/symbol_recent.ok 为 true，内部解释必须引用；为 false 才能说明窗口查询失败及其原因。\n" +
-  "若 facts.warnings 中仅有 history_truncated（或仅见 limit_exceeded），只可表述为“历史样本截断/对照样本不完整”，禁止写成“窗口查询失败”。\n";
+  "若 facts.warnings 中仅有 history_truncated（或仅见 limit_exceeded），只可表述为“历史样本截断/对照样本不完整”，禁止写成“窗口查询失败”。\n" +
+  "若 facts.warnings 包含 history_empty，表述为“近窗口无可用历史样本”，禁止写成“窗口查询失败”。\n";
 
 export type RouterDecision = {
   selected_paths: string[];

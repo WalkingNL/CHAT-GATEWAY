@@ -79,7 +79,7 @@ function listCandidateFiles(baseDir: string, glob: string, freshnessDays: number
       mtimeMs = 0;
     }
     const dateMs = parseDateFromFileNameMs(n);
-    const sortMs = dateMs ?? mtimeMs;
+    const sortMs = Math.max(dateMs ?? 0, mtimeMs || 0);
     if (sortMs < minMs) continue;
     out.push({ fullPath, sortMs });
   }
@@ -196,14 +196,7 @@ export class LocalFsFactsProvider {
         errors: ["dir_read_failed"],
       };
     }
-    if (!files.length) {
-      return {
-        window_1h: { ok: false, reason: "file_not_found" },
-        window_24h: { ok: false, reason: "file_not_found" },
-        symbol_recent: { ok: false, reason: "file_not_found" },
-        errors: ["file_not_found"],
-      };
-    }
+    const noFiles = files.length === 0;
 
     const w1h = { start: anchorMs - 60 * 60 * 1000, end: anchorMs };
     const w24h = { start: anchorMs - 24 * 60 * 60 * 1000, end: anchorMs };
@@ -253,7 +246,9 @@ export class LocalFsFactsProvider {
 
     const uniqErrors = [...new Set(errors)];
     const hardErrors = uniqErrors.filter((e) => e !== "limit_exceeded").slice(0, 5);
-    const warnings = uniqErrors.includes("limit_exceeded") ? ["history_truncated"] : [];
+    const warnings: string[] = [];
+    if (uniqErrors.includes("limit_exceeded")) warnings.push("history_truncated");
+    if (noFiles) warnings.push("history_empty");
     const failedReason = rows.length === 0 && hardErrors.includes("file_read_failed")
       ? "file_read_failed"
       : null;
