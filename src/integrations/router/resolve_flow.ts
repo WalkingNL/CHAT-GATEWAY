@@ -1064,7 +1064,7 @@ async function handleAlertExplainIntent(params: {
     taskIdPrefix: `${taskPrefix(channel)}_explain`,
     isGroup,
     mentionsBot,
-    hasReply: Boolean(trimmedReplyText),
+    hasReply: Boolean(replyText),
   });
   appendAlertExplainLedger({
     storageDir,

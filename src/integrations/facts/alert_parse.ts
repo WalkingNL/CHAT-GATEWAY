@@ -119,6 +119,7 @@ export function parseAlertText(raw: string): ParsedAlert {
 
   // --- change_pct ---
   let change_pct: number | null = null;
+  // change_pct 表示价格变化；告警格式会输出 "价 <pct>"，不要把价差/溢价当作 change_pct。
   const cm1 = text.match(/price_change\s*=\s*([+\-0-9.]+)%/i);
   const cm2 = text.match(/价格[:：]\s*([+\-0-9.]+)%/i);
   const cm3 = text.match(/(?:^|[；;\s])价\s*([+\-0-9.]+)%/i);
