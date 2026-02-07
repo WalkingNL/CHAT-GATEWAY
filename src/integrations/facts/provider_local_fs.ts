@@ -8,6 +8,7 @@ export type ExplainFacts = {
   window_24h: any;
   symbol_recent: any;
   errors?: string[];
+  warnings?: string[];
 };
 
 type AlertRow = {
@@ -47,6 +48,44 @@ function toMs(ts: any): number | null {
 
 function within(ms: number, start: number, end: number): boolean {
   return ms >= start && ms <= end;
+}
+
+function parseDateFromFileNameMs(name: string): number | null {
+  const m = name.match(/(\d{4}-\d{2}-\d{2})/);
+  if (!m) return null;
+  const ms = Date.parse(`${m[1]}T23:59:59.999Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+type FileRecord = {
+  fullPath: string;
+  sortMs: number;
+};
+
+function listCandidateFiles(baseDir: string, glob: string, freshnessDays: number, anchorMs: number): FileRecord[] {
+  const names = fs.readdirSync(baseDir);
+  const prefix = glob.split("*")[0];
+  const suffix = glob.split("*").slice(1).join("*");
+  const minMs = anchorMs - freshnessDays * 24 * 60 * 60 * 1000;
+  const out: FileRecord[] = [];
+
+  for (const n of names) {
+    if (!n.startsWith(prefix) || !n.endsWith(suffix)) continue;
+    const fullPath = path.join(baseDir, n);
+    let mtimeMs = 0;
+    try {
+      mtimeMs = fs.statSync(fullPath).mtimeMs || 0;
+    } catch {
+      mtimeMs = 0;
+    }
+    const dateMs = parseDateFromFileNameMs(n);
+    const sortMs = dateMs ?? mtimeMs;
+    if (sortMs < minMs) continue;
+    out.push({ fullPath, sortMs });
+  }
+
+  out.sort((a, b) => b.sortMs - a.sortMs);
+  return out;
 }
 
 function buildTopN(rows: AlertRow[], start: number, end: number) {
@@ -134,25 +173,6 @@ export class LocalFsFactsProvider {
     const glob = String(res.glob || "").trim();
     const maxLines = clamp(Number(res.max_lines || 400), 50, 2000);
     const maxBytes = clamp(Number(res.max_bytes || 400000), 50000, 2000000);
-
-    const baseDir = path.join(proj.root, base);
-    let files: string[] = [];
-    try {
-      const names = fs.readdirSync(baseDir);
-      const prefix = glob.split("*")[0];
-      const suffix = glob.split("*").slice(1).join("*");
-      files = names
-        .filter((n) => n.startsWith(prefix) && n.endsWith(suffix))
-        .map((n) => path.join(baseDir, n));
-    } catch {
-      return {
-        window_1h: { ok: false, reason: "dir_read_failed" },
-        window_24h: { ok: false, reason: "dir_read_failed" },
-        symbol_recent: { ok: false, reason: "dir_read_failed" },
-        errors: ["dir_read_failed"],
-      };
-    }
-
     const anchorMs = new Date(params.anchor_ts_utc).getTime();
     if (!Number.isFinite(anchorMs)) {
       return {
@@ -163,14 +183,36 @@ export class LocalFsFactsProvider {
       };
     }
 
+    const baseDir = path.join(proj.root, base);
+    let files: FileRecord[] = [];
+    try {
+      const freshnessDays = clamp(Number(res.freshness_days || 14), 1, 90);
+      files = listCandidateFiles(baseDir, glob, freshnessDays, anchorMs);
+    } catch {
+      return {
+        window_1h: { ok: false, reason: "dir_read_failed" },
+        window_24h: { ok: false, reason: "dir_read_failed" },
+        symbol_recent: { ok: false, reason: "dir_read_failed" },
+        errors: ["dir_read_failed"],
+      };
+    }
+    if (!files.length) {
+      return {
+        window_1h: { ok: false, reason: "file_not_found" },
+        window_24h: { ok: false, reason: "file_not_found" },
+        symbol_recent: { ok: false, reason: "file_not_found" },
+        errors: ["file_not_found"],
+      };
+    }
+
     const w1h = { start: anchorMs - 60 * 60 * 1000, end: anchorMs };
     const w24h = { start: anchorMs - 24 * 60 * 60 * 1000, end: anchorMs };
 
     const allLines: string[] = [];
     let totalBytes = 0;
-    for (const f of files) {
+    for (const file of files) {
       try {
-        const content = fs.readFileSync(f, "utf-8");
+        const content = fs.readFileSync(file.fullPath, "utf-8");
         const bytes = Buffer.byteLength(content, "utf-8");
         if (totalBytes + bytes > maxBytes) {
           errors.push("limit_exceeded");
@@ -209,27 +251,37 @@ export class LocalFsFactsProvider {
       return idx >= 0 ? idx + 1 : null;
     })() : null;
 
+    const uniqErrors = [...new Set(errors)];
+    const hardErrors = uniqErrors.filter((e) => e !== "limit_exceeded").slice(0, 5);
+    const warnings = uniqErrors.includes("limit_exceeded") ? ["history_truncated"] : [];
+    const failedReason = rows.length === 0 && hardErrors.includes("file_read_failed")
+      ? "file_read_failed"
+      : null;
+
     return {
       window_1h: {
-        ok: true,
+        ok: failedReason ? false : true,
+        ...(failedReason ? { reason: failedReason } : {}),
         total: top1h.total,
         symbol_count: top1h.symbol_count,
         top3: top1h.top3,
         symbol_rank: rank1h,
       },
       window_24h: {
-        ok: true,
+        ok: failedReason ? false : true,
+        ...(failedReason ? { reason: failedReason } : {}),
         total: top24h.total,
         symbol_count: top24h.symbol_count,
         top3: top24h.top3,
         symbol_rank: rank24h,
       },
       symbol_recent: {
-        ok: !!symbol,
-        reason: symbol ? undefined : "symbol_missing",
+        ok: failedReason ? false : !!symbol,
+        reason: failedReason || (symbol ? undefined : "symbol_missing"),
         items: symbolRecent,
       },
-      ...(errors.length ? { errors: [...new Set(errors)].slice(0, 5) } : {}),
+      ...(hardErrors.length ? { errors: hardErrors } : {}),
+      ...(warnings.length ? { warnings } : {}),
     };
   }
 }
