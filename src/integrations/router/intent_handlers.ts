@@ -12,7 +12,7 @@ import { errorText, rejectText } from "../runtime/response_templates.js";
 import { submitTask } from "../../core/internal_client.js";
 import { evaluate } from "../../core/config/index.js";
 import type { LoadedConfig } from "../../core/config/types.js";
-import { clip, clipToLen, nowIso, parseIntEnv } from "./router_utils.js";
+import { clipToLen, nowIso, parseIntEnv } from "./router_utils.js";
 import { setLastExplainTrace } from "./state_cache.js";
 
 export const NEWS_SUMMARY_DEFAULT_CHARS = 200;
@@ -146,18 +146,6 @@ export function parseNewsAlert(rawAlert: string): { items: NewsItem[]; facts: st
   return { items, facts: facts.join("\n") };
 }
 
-function buildNewsSummaryPrompt(facts: string, maxChars: number): string {
-  return [
-    "你是严格的新闻摘要器。",
-    "只允许基于给定新闻要点压缩，不得新增事实/因果/推断，不得引用外部信息。",
-    `输出一段中文摘要，不超过 ${maxChars} 个中文字符，尽量贴近上限。`,
-    "不要标题，不要列表，不要链接。",
-    "",
-    "新闻要点：",
-    facts || "(无)",
-  ].join("\n");
-}
-
 export function resolveProjectId(config?: LoadedConfig): string | null {
   const envId = String(process.env.GW_DEFAULT_PROJECT_ID || "").trim();
   if (envId) return envId;
@@ -214,22 +202,139 @@ function resolveOnDemandConfigForNews(config?: LoadedConfig): OnDemandConfig {
   return { url, token, projectId };
 }
 
+function resolveOnDemandUrl(baseUrl: string, pathName: string): string {
+  const base = String(baseUrl || "").trim();
+  const path = String(pathName || "").replace(/^\/+/, "");
+  if (!base) return `/${path}`;
+  const withSlash = base.endsWith("/") ? base : `${base}/`;
+  return `${withSlash}${path}`;
+}
+
+async function postOnDemand(
+  cfg: OnDemandConfig,
+  pathName: string,
+  body: Record<string, any>,
+): Promise<any> {
+  return postJsonWithAuth(resolveOnDemandUrl(cfg.url, pathName), cfg.token, body);
+}
+
+function formatNewsItemsForReply(itemsRaw: unknown): string {
+  const items = Array.isArray(itemsRaw) ? itemsRaw : [];
+  if (!items.length) return "";
+  const lines: string[] = [];
+  for (let i = 0; i < items.length; i += 1) {
+    const row = items[i] as any;
+    const title = String(row?.title || "").trim();
+    const source = String(row?.source || "").trim();
+    const published = String(row?.published_at || row?.published || "").trim();
+    const link = String(row?.url || row?.link || "").trim();
+    lines.push(`${i + 1}. ${title || "(无标题)"}`);
+    if (source || published) lines.push(`   ${[source, published].filter(Boolean).join(" | ")}`);
+    if (link) lines.push(`   ${link}`);
+  }
+  return lines.join("\n");
+}
+
+function formatNewsQueryReply(kind: "news_hot" | "news_refresh", res: any): string {
+  const direct = String(res?.text || res?.summary || res?.result || "").trim();
+  if (direct) return direct;
+  const mode = String(res?.mode || "").trim();
+  const header = kind === "news_refresh" ? "新闻刷新结果" : "热点新闻";
+  const itemBlock = formatNewsItemsForReply(res?.items);
+  const lines = [mode ? `${header}（${mode}）` : header];
+  if (itemBlock) {
+    lines.push(itemBlock);
+  } else {
+    lines.push("暂无可用新闻。");
+  }
+  const lastTs = String(res?.last_ts_utc || "").trim();
+  if (lastTs) lines.push(`最近时间: ${lastTs}`);
+  return lines.join("\n");
+}
+
+function stringifyForReply(value: unknown, maxChars = 3200): string {
+  if (value == null) return "";
+  if (typeof value === "string") return clipToLen(value, maxChars);
+  try {
+    return clipToLen(JSON.stringify(value, null, 2), maxChars);
+  } catch {
+    return clipToLen(String(value), maxChars);
+  }
+}
+
+function formatDataFeedsStatusReply(res: any): string {
+  const direct = String(res?.text || res?.result || "").trim();
+  if (direct) return direct;
+  if (typeof res?.summary === "string" && res.summary.trim()) return clipToLen(res.summary.trim(), 3500);
+
+  const summary = (res && typeof res.summary === "object" && res.summary) ? res.summary : null;
+  if (!summary) return "(无)";
+  const feeds = (typeof summary.feeds === "object" && summary.feeds) ? summary.feeds : {};
+  const feedIds = Object.keys(feeds).sort();
+  const lines: string[] = ["数据源总体状态"];
+  const healthDate = String(summary.health_date || "").trim();
+  const budgetDate = String(summary.budget_date || "").trim();
+  if (healthDate) lines.push(`health_date: ${healthDate}`);
+  if (budgetDate) lines.push(`budget_date: ${budgetDate}`);
+  if (!feedIds.length) {
+    lines.push("暂无 feed 状态。");
+    return lines.join("\n");
+  }
+  for (const feedId of feedIds) {
+    const row = (feeds as any)[feedId] || {};
+    lines.push(
+      `${feedId}: total=${Number(row.symbols_total || 0)} ok=${Number(row.symbols_ok || 0)} partial=${Number(row.symbols_partial || 0)} hour_hit=${Boolean(row.budget_hit_hour)} day_hit=${Boolean(row.budget_hit_day)}`,
+    );
+  }
+  return clipToLen(lines.join("\n"), 3500);
+}
+
+function formatDataFeedsHotspotsReply(res: any): string {
+  const direct = String(res?.summary || res?.text || res?.result || "").trim();
+  if (direct) return clipToLen(direct, 3500);
+  const hotspots = Array.isArray(res?.hotspots) ? res.hotspots : [];
+  if (!hotspots.length) return "(无)";
+  const lines: string[] = ["数据源热点"];
+  for (let i = 0; i < hotspots.length; i += 1) {
+    const row = hotspots[i] as any;
+    const kind = String(row?.kind || "unknown").trim();
+    const feedId = String(row?.feed_id || "").trim();
+    const symbol = String(row?.symbol || "").trim();
+    const reason = String(row?.reason || "").trim();
+    const parts = [`${i + 1}. ${kind}`];
+    if (feedId) parts.push(`feed=${feedId}`);
+    if (symbol) parts.push(`symbol=${symbol}`);
+    if (reason) parts.push(`reason=${reason}`);
+    lines.push(parts.join(" | "));
+  }
+  return clipToLen(lines.join("\n"), 3500);
+}
+
 async function fetchNewsSummary(params: {
+  requestId: string;
   rawAlert: string;
   maxChars: number;
   config?: LoadedConfig;
 }): Promise<{ ok: boolean; summary: string; error?: string; items: number | null }> {
-  const { rawAlert, maxChars, config } = params;
+  const { requestId, rawAlert, maxChars, config } = params;
   const parsed = parseNewsAlert(rawAlert);
-  const facts = parsed.facts || rawAlert;
-  const prompt = buildNewsSummaryPrompt(facts, maxChars);
   const cfg = resolveOnDemandConfigForNews(config);
-  const res = await postJsonWithAuth(cfg.url, cfg.token, {
-    kind: "news_summary",
-    prompt,
+  const payload: Record<string, any> = {
+    request_id: requestId,
     max_chars: maxChars,
-    project_id: cfg.projectId,
-  });
+  };
+  if (cfg.projectId) payload.project_id = cfg.projectId;
+  if (parsed.items.length) {
+    payload.items = parsed.items.map((item) => ({
+      title: String(item.title || "").trim(),
+      source: String(item.source || "").trim(),
+      published: String(item.published || "").trim(),
+      link: String(item.link || "").trim(),
+    }));
+  } else {
+    payload.raw_alert = rawAlert;
+  }
+  const res = await postOnDemand(cfg, "v1/news_summary", payload);
   if (!res.ok) {
     return { ok: false, summary: "", error: res.error || "unknown", items: parsed.items.length || null };
   }
@@ -777,7 +882,7 @@ export async function runNewsSummary(params: {
     return;
   }
 
-  const result = await fetchNewsSummary({ rawAlert, maxChars, config });
+  const result = await fetchNewsSummary({ requestId, rawAlert, maxChars, config });
   if (!result.ok) {
     await send(chatId, errorText(`摘要异常：${result.error || "unknown"}`));
     appendLedger(storageDir, {
@@ -867,10 +972,10 @@ export async function runNewsQuery(params: {
   const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
 
   const cfg = resolveOnDemandConfigForNews(config);
-  const res = await postJsonWithAuth(cfg.url, cfg.token, {
-    kind,
+  const res = await postOnDemand(cfg, kind === "news_refresh" ? "v1/news/refresh" : "v1/news/hot", {
+    request_id: requestId,
     limit: requestLimit,
-    project_id: cfg.projectId,
+    ...(cfg.projectId ? { project_id: cfg.projectId } : {}),
   });
   if (!res.ok) {
     await send(chatId, errorText(`新闻查询失败：${res.error || "unknown"}`));
@@ -895,7 +1000,7 @@ export async function runNewsQuery(params: {
     return;
   }
 
-  const text = String(res.text || res.result || "").trim();
+  const text = formatNewsQueryReply(kind, res);
   await send(chatId, text || "(无)" );
   appendLedger(storageDir, {
     ts_utc: nowIso(),
@@ -935,9 +1040,9 @@ export async function runDataFeedsStatus(params: {
   const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
 
   const cfg = resolveOnDemandConfigForNews(config);
-  const res = await postJsonWithAuth(cfg.url, cfg.token, {
-    kind: "data_feeds_status",
-    project_id: cfg.projectId,
+  const res = await postOnDemand(cfg, "v1/data_feeds/status", {
+    request_id: requestId,
+    ...(cfg.projectId ? { project_id: cfg.projectId } : {}),
   });
   if (!res.ok) {
     await send(chatId, errorText(`数据源状态异常：${res.error || "unknown"}`));
@@ -961,7 +1066,7 @@ export async function runDataFeedsStatus(params: {
     return;
   }
 
-  const summary = clip(String(res.summary || res.text || res.result || ""), 800);
+  const summary = formatDataFeedsStatusReply(res);
   await send(chatId, summary || "(无)" );
   appendLedger(storageDir, {
     ts_utc: nowIso(),
@@ -1001,10 +1106,10 @@ export async function runDataFeedsAssetStatus(params: {
   const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
 
   const cfg = resolveOnDemandConfigForNews(config);
-  const res = await postJsonWithAuth(cfg.url, cfg.token, {
-    kind: "data_feeds_asset_status",
+  const res = await postOnDemand(cfg, "v1/data_feeds/asset_status", {
+    request_id: requestId,
     symbol,
-    project_id: cfg.projectId,
+    ...(cfg.projectId ? { project_id: cfg.projectId } : {}),
   });
   if (!res.ok) {
     await send(chatId, errorText(`数据源资产异常：${res.error || "unknown"}`));
@@ -1028,7 +1133,7 @@ export async function runDataFeedsAssetStatus(params: {
     return;
   }
 
-  const summary = clip(String(res.summary || res.text || res.result || ""), 800);
+  const summary = stringifyForReply(res?.result || res?.summary || res?.text || res?.result);
   const lines: string[] = [`数据源资产状态：${symbol || "未知"}`];
   if (summary) lines.push(summary);
   const out = lines.join("\n");
@@ -1071,10 +1176,10 @@ export async function runDataFeedsSourceStatus(params: {
   const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
 
   const cfg = resolveOnDemandConfigForNews(config);
-  const res = await postJsonWithAuth(cfg.url, cfg.token, {
-    kind: "data_feeds_source_status",
+  const res = await postOnDemand(cfg, "v1/data_feeds/source_status", {
+    request_id: requestId,
     feed_id: feedId,
-    project_id: cfg.projectId,
+    ...(cfg.projectId ? { project_id: cfg.projectId } : {}),
   });
   if (!res.ok) {
     await send(chatId, errorText(`数据源 feed 异常：${res.error || "unknown"}`));
@@ -1098,7 +1203,7 @@ export async function runDataFeedsSourceStatus(params: {
     return;
   }
 
-  const summary = clip(String(res.summary || res.text || res.result || ""), 800);
+  const summary = stringifyForReply(res?.result || res?.summary || res?.text || res?.result);
   const lines: string[] = [`数据源状态：${feedId || "未知"}`];
   if (summary) lines.push(summary);
   const out = lines.join("\n");
@@ -1142,10 +1247,10 @@ export async function runDataFeedsHotspots(params: {
   const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
 
   const cfg = resolveOnDemandConfigForNews(config);
-  const res = await postJsonWithAuth(cfg.url, cfg.token, {
-    kind: "data_feeds_hotspots",
+  const res = await postOnDemand(cfg, "v1/data_feeds/hotspots", {
+    request_id: requestId,
     limit: requestLimit,
-    project_id: cfg.projectId,
+    ...(cfg.projectId ? { project_id: cfg.projectId } : {}),
   });
   if (!res.ok) {
     await send(chatId, errorText(`数据源热点异常：${res.error || "unknown"}`));
@@ -1170,7 +1275,7 @@ export async function runDataFeedsHotspots(params: {
     return;
   }
 
-  const out = clipToLen(String(res.summary || res.text || res.result || ""), 3500);
+  const out = formatDataFeedsHotspotsReply(res);
   await send(chatId, out || "(无)" );
   appendLedger(storageDir, {
     ts_utc: nowIso(),
@@ -1212,10 +1317,10 @@ export async function runDataFeedsOpsSummary(params: {
   const requestId = params.requestId || buildDispatchRequestId(requestIdBase, attempt);
 
   const cfg = resolveOnDemandConfigForNews(config);
-  const res = await postJsonWithAuth(cfg.url, cfg.token, {
-    kind: "data_feeds_ops_summary",
+  const res = await postOnDemand(cfg, "v1/data_feeds/ops_summary", {
+    request_id: requestId,
     limit: requestLimit,
-    project_id: cfg.projectId,
+    ...(cfg.projectId ? { project_id: cfg.projectId } : {}),
   });
   if (!res.ok) {
     await send(chatId, errorText(`数据源摘要异常：${res.error || "unknown"}`));
