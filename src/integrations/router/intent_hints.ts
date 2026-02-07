@@ -27,6 +27,7 @@ export function shouldAttemptResolve(params: {
   if (isCommand) return false;
   if (params.isGroup) {
     if (!params.mentionsBot) return false;
+    if (!params.replyToId && !params.usedFeedbackPrefix) return false;
   }
   return Boolean(params.strippedText);
 }
