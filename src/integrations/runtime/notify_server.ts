@@ -6,6 +6,8 @@ import { createHash } from "node:crypto";
 import { execFileLimited } from "./exec_limiter.js";
 import { loadProjectRegistry, resolveProjectNotifyTargets, tryLoadProjectRegistry } from "./project_registry.js";
 import { resolveTargetOverrides, type TargetOverrides } from "../../core/notify_overrides.js";
+import { createPublicInboundRuntime } from "./public_inbound.js";
+import type { LoadedConfig } from "../../core/config/types.js";
 let hupRegistered = false;
 
 export type NotifySenders = {
@@ -448,6 +450,9 @@ export function startNotifyServer(opts: {
   port: number;
   token: string;
   senders: NotifySenders;
+  cfg: any;
+  loaded: LoadedConfig;
+  storageDir: string;
 }) {
   const registryPath = String(process.env.PROJECTS_REGISTRY_PATH || "config/projects.yml");
   const initial = tryLoadProjectRegistry(registryPath);
@@ -460,6 +465,11 @@ export function startNotifyServer(opts: {
   let lastRegistryCheckMs = 0;
   const { host, port, token, senders } = opts;
   if (!token) throw new Error("Missing CHAT_GATEWAY_TOKEN");
+  const publicInbound = createPublicInboundRuntime({
+    cfg: opts.cfg,
+    loaded: opts.loaded,
+    storageDir: opts.storageDir,
+  });
 
   const reloadRegistry = (reason: string, mtimeOverride?: number) => {
     const mtime = mtimeOverride ?? readRegistryMtime(registryPath);
@@ -495,13 +505,50 @@ export function startNotifyServer(opts: {
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://${host}:${port}`);
+    const isPublicInboundPost = req.method === "POST" && url.pathname === "/v1/inbound/messages";
+    const isPublicInboundGet = req.method === "GET" && /^\/v1\/inbound\/messages\/[^/]+$/.test(url.pathname);
+    const isPublicInbound = isPublicInboundPost || isPublicInboundGet;
+
+    const auth = String(req.headers["authorization"] || "");
+    if (isPublicInbound) {
+      if (!publicInbound.enabled) return forbidden(res, "public_api_disabled");
+      if (auth !== `Bearer ${publicInbound.token}`) return unauthorized(res);
+      if (isPublicInboundPost) {
+        let body: any;
+        try {
+          body = await readJson(req);
+        } catch {
+          return badRequest(res, "invalid_json");
+        }
+        const idempotencyKey = String(req.headers["x-idempotency-key"] || "").trim();
+        const out = await publicInbound.postMessage(body, idempotencyKey || undefined);
+        if (!out.ok) {
+          res.statusCode = out.statusCode;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ ok: false, error: out.error }));
+          return;
+        }
+        return okJson(res, out.response);
+      }
+      let requestId = "";
+      try {
+        requestId = decodeURIComponent(url.pathname.split("/").pop() || "");
+      } catch {
+        return badRequest(res, "invalid_request_id");
+      }
+      const out = publicInbound.getMessage(requestId);
+      if (!out.ok) {
+        res.statusCode = out.statusCode;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ ok: false, error: out.error }));
+        return;
+      }
+      return okJson(res, out.response);
+    }
 
     const remote = normalizeRemoteAddress(req.socket.remoteAddress);
     if (!isInternalAddress(remote)) return forbidden(res);
-
     maybeReloadRegistry();
-
-    const auth = String(req.headers["authorization"] || "");
     if (auth !== `Bearer ${token}`) return unauthorized(res);
 
     if (req.method === "GET" && url.pathname === "/health") {

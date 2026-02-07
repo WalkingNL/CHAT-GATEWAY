@@ -207,6 +207,9 @@ function main() {
       host: integrationsHost,
       port: integrationsPort,
       token,
+      cfg: ctx.cfg,
+      loaded: ctx.loaded,
+      storageDir: ctx.storageDir,
       senders,
     });
     await new Promise<void>((resolve, reject) => {
