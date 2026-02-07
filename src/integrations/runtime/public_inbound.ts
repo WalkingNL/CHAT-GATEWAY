@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 
 import { handleAdapterIntentIfAny } from "../router/router.js";
 import { resolveProjectId } from "../router/intent_handlers.js";
@@ -108,6 +109,33 @@ function clampInt(raw: unknown, fallback: number, min: number, max: number): num
 
 function trimToString(raw: unknown): string {
   return String(raw ?? "").trim();
+}
+
+function sanitizeId(raw: string): string {
+  return String(raw || "")
+    .replace(/[^A-Za-z0-9._:-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80);
+}
+
+function hashString(raw: string): string {
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+function deriveIdentity(token: string, clientIdRaw?: string): { chatId: string; userId: string } {
+  const normalizedClientId = sanitizeId(trimToString(clientIdRaw));
+  if (normalizedClientId) {
+    return {
+      chatId: `ext:${normalizedClientId}`,
+      userId: `svc:${normalizedClientId}`,
+    };
+  }
+  const tokenHash = hashString(token).slice(0, 16);
+  return {
+    chatId: `ext:token:${tokenHash}`,
+    userId: `svc:token:${tokenHash}`,
+  };
 }
 
 function resolveChannel(raw: unknown): InboundChannel {
@@ -367,20 +395,21 @@ export function createPublicInboundRuntime(opts: RuntimeOpts) {
   const enabled = Boolean(token);
   const store = new InboundStore(opts.storageDir);
 
-  async function postMessage(rawBody: any, idempotencyKey?: string): Promise<RuntimePost> {
+  async function postMessage(rawBody: any, idempotencyKey?: string, clientId?: string): Promise<RuntimePost> {
     if (!enabled) return { ok: false, statusCode: 403, error: "public_api_disabled" };
     const body = (rawBody || {}) as PublicInboundMessageInput;
     const requestIdRaw = trimToString(body.request_id) || trimToString(idempotencyKey);
     if (!requestIdRaw) return invalidRequest("missing_required_field:request_id");
     const requestId = sanitizeRequestId(requestIdRaw);
     const text = trimToString(body.text);
-    const chatId = trimToString(body.chat_id);
-    const userId = trimToString(body.user_id);
+    const providedChatId = sanitizeId(trimToString(body.chat_id));
+    const providedUserId = sanitizeId(trimToString(body.user_id));
+    const derived = deriveIdentity(token, clientId);
+    const chatId = providedChatId || providedUserId || derived.chatId;
+    const userId = providedUserId || providedChatId || derived.userId;
     const chatType = resolveChatType(body.chat_type);
     if (!chatType) return invalidRequest("unsupported_chat_type");
     if (!text) return invalidRequest("missing_required_field:text");
-    if (!chatId) return invalidRequest("missing_required_field:chat_id");
-    if (!userId) return invalidRequest("missing_required_field:user_id");
     const waitMs = clampInt(body.wait_ms, 8000, 0, 20000);
 
     const cached = store.get(requestId);

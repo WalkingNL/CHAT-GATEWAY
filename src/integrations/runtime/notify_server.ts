@@ -521,7 +521,12 @@ export function startNotifyServer(opts: {
           return badRequest(res, "invalid_json");
         }
         const idempotencyKey = String(req.headers["x-idempotency-key"] || "").trim();
-        const out = await publicInbound.postMessage(body, idempotencyKey || undefined);
+        const clientId = String(req.headers["x-client-id"] || "").trim();
+        const out = await publicInbound.postMessage(
+          body,
+          idempotencyKey || undefined,
+          clientId || undefined,
+        );
         if (!out.ok) {
           res.statusCode = out.statusCode;
           res.setHeader("Content-Type", "application/json");
