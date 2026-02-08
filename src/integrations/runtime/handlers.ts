@@ -410,6 +410,21 @@ type ResolvedIntentPayload = {
   intentVersion?: string;
 };
 
+export type AdapterResultProbeState = {
+  status?: string;
+  imagePath?: string;
+  error?: string;
+};
+
+export type AdapterResultProbe = {
+  intent: "dashboard_export" | "chart_factor_timeline" | "chart_daily_activity";
+  requestId: string;
+  status?: string;
+  imagePath?: string;
+  error?: string;
+  probe?: () => Promise<AdapterResultProbeState>;
+};
+
 function clampConfidence(value: unknown, fallback: number): number {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
@@ -488,6 +503,7 @@ export async function dispatchDashboardExport(params: {
   requestIdBase?: string;
   attempt?: number;
   requestExpired?: boolean;
+  onResult?: (result: AdapterResultProbe) => void;
 }): Promise<boolean> {
   const {
     storageDir,
@@ -511,6 +527,7 @@ export async function dispatchDashboardExport(params: {
     requestIdBase: requestIdBaseOverride,
     attempt: attemptOverride,
     requestExpired,
+    onResult,
   } = params;
 
   const trimmed = String(intent?.raw_query || text || "").trim();
@@ -690,7 +707,7 @@ export async function dispatchDashboardExport(params: {
     return true;
   }
 
-  const result = await requestDashboardExport({
+  const exportRequest = {
     projectId,
     requestId,
     panelId: intent.params.panel_id,
@@ -700,7 +717,29 @@ export async function dispatchDashboardExport(params: {
     schemaVersion: intent.schema_version,
     intentVersion: intent.intent_version,
     target: { channel, chatId },
-  });
+  };
+  const result = await requestDashboardExport(exportRequest);
+  if (onResult) {
+    try {
+      onResult({
+        intent: "dashboard_export",
+        requestId,
+        status: result.status,
+        imagePath: result.imagePath,
+        error: result.error,
+        probe: async () => {
+          const refreshed = await requestDashboardExport(exportRequest);
+          return {
+            status: refreshed.status,
+            imagePath: refreshed.imagePath,
+            error: refreshed.error,
+          };
+        },
+      });
+    } catch {
+      // Keep delivery path unaffected even if result observer fails.
+    }
+  }
   const dispatchStatus = mapOnDemandStatus({
     status: result.status,
     error: result.error,
@@ -1024,6 +1063,7 @@ export async function handleResolvedChartIntent(params: {
   replyText: string;
   sendText: (chatId: string, text: string) => Promise<void>;
   resolved: any;
+  onResult?: (result: AdapterResultProbe) => void;
 }): Promise<boolean> {
   const {
     storageDir,
@@ -1041,6 +1081,7 @@ export async function handleResolvedChartIntent(params: {
     replyText,
     sendText,
     resolved,
+    onResult,
   } = params;
 
   if (!resolved || (resolved.intent !== "chart_factor_timeline" && resolved.intent !== "chart_daily_activity")) {
@@ -1151,20 +1192,65 @@ export async function handleResolvedChartIntent(params: {
       return true;
     }
 
+    const reqId = buildChartRequestId(channel || "telegram", requestKey, chatId, intent);
+    const resolvedIntentName = intent.kind === "factor_timeline"
+      ? "chart_factor_timeline"
+      : "chart_daily_activity";
+    const probe = async (): Promise<AdapterResultProbeState> => {
+      const refreshed = await renderChart(intent, {
+        projectId,
+        requestId: reqId,
+        channel,
+        chatId,
+      });
+      return {
+        status: refreshed.status,
+        imagePath: refreshed.imagePath,
+        error: refreshed.error,
+      };
+    };
+
     try {
-      const reqId = buildChartRequestId(channel || "telegram", requestKey, chatId, intent);
       const rendered = await renderChart(intent, {
         projectId,
         requestId: reqId,
         channel,
         chatId,
       });
+      if (onResult) {
+        try {
+          onResult({
+            intent: resolvedIntentName,
+            requestId: reqId,
+            status: rendered.status,
+            imagePath: rendered.imagePath,
+            error: rendered.error,
+            probe,
+          });
+        } catch {
+          // Keep delivery path unaffected even if result observer fails.
+        }
+      }
       if (!rendered.ok) {
         const trace = rendered.traceId ? ` trace_id=${rendered.traceId}` : "";
-        throw new Error(`${rendered.error || "render_failed"}${trace}`.trim());
+        const reason = `${rendered.error || "render_failed"}${trace}`.trim();
+        await sendText(chatId, errorText(`图表生成失败：${reason}`));
+        return true;
       }
       await sendText(chatId, "已请求生成图表，稍后发送。");
     } catch (e: any) {
+      if (onResult) {
+        try {
+          onResult({
+            intent: resolvedIntentName,
+            requestId: reqId,
+            error: String(e?.message || e),
+            probe,
+          });
+        } catch {
+          // Keep delivery path unaffected even if result observer fails.
+        }
+      }
       await sendText(chatId, errorText(`图表生成失败：${String(e?.message || e)}`));
       return true;
     }

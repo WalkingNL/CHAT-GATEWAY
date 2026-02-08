@@ -380,6 +380,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           requestIdBase: adapterIds.requestIdBase,
           attempt: adapterIds.attempt,
           requestExpired: adapterIds.expired,
+          onResult: ctx.reportResult,
         });
         return { handled: true, result: handled };
       },
@@ -524,6 +525,7 @@ function buildResolveSteps(params: ResolveStepParams): Array<PipelineStep<Adapte
           replyText: trimmedReplyText,
           sendText: send,
           resolved: resolveRes,
+          onResult: ctx.reportResult,
         });
         return { handled };
       },

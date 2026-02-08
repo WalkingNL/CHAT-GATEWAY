@@ -1,4 +1,5 @@
 import type { LoadedConfig } from "../../core/config/types.js";
+import type { AdapterResultProbe } from "../runtime/handlers.js";
 
 export type SendFn = (chatId: string, text: string) => Promise<void>;
 
@@ -18,6 +19,7 @@ export type AdapterContext = {
   isGroup: boolean;
   mentionsBot: boolean;
   send: SendFn;
+  reportResult?: (result: AdapterResultProbe) => void;
   trimmedText: string;
   trimmedReplyText: string;
   cleanedText: string;

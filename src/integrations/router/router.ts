@@ -69,6 +69,7 @@ function buildAdapterContext(params: {
   isGroup: boolean;
   mentionsBot: boolean;
   send: (chatId: string, text: string) => Promise<void>;
+  reportResult?: AdapterContext["reportResult"];
   forceAllowResolve?: boolean;
 }): AdapterContext {
   const trimmedText = String(params.text || "").trim();
@@ -143,6 +144,7 @@ async function runPrimaryIntentPipeline(ctx: AdapterContext): Promise<boolean> {
           requestIdBase: adapterIds?.requestIdBase,
           attempt: adapterIds?.attempt,
           requestExpired: adapterIds?.expired,
+          onResult: c.reportResult,
         });
         return { handled };
       },
@@ -167,6 +169,7 @@ export async function handleAdapterIntentIfAny(params: {
   mentionsBot: boolean;
   replyText: string;
   send: (chatId: string, text: string) => Promise<void>;
+  reportResult?: AdapterContext["reportResult"];
 }): Promise<boolean> {
   const {
     storageDir,
@@ -184,6 +187,7 @@ export async function handleAdapterIntentIfAny(params: {
     mentionsBot,
     replyText,
     send,
+    reportResult,
   } = params;
 
   const preHints = buildIntentHints({
@@ -216,6 +220,7 @@ export async function handleAdapterIntentIfAny(params: {
       isGroup,
       mentionsBot: true,
       send,
+      reportResult,
       forceAllowResolve: true,
     });
 
@@ -249,6 +254,7 @@ export async function handleAdapterIntentIfAny(params: {
     isGroup,
     mentionsBot,
     send,
+    reportResult,
   });
 
   const {

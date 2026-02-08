@@ -5,9 +5,24 @@ import { createHash } from "node:crypto";
 import { handleAdapterIntentIfAny } from "../router/router.js";
 import { resolveProjectId } from "../router/intent_handlers.js";
 import { requestIntentResolve, sanitizeRequestId } from "./intent_router.js";
+import type { AdapterResultProbe } from "./handlers.js";
 import type { LoadedConfig } from "../../core/config/types.js";
 
 type InboundChannel = "telegram" | "feishu";
+
+type InboundArtifact = {
+  type: "image_path";
+  value: string;
+  intent?: string;
+  request_id?: string;
+};
+
+type InboundRequestState = {
+  intent: string;
+  request_id: string;
+  status?: string;
+  error?: string;
+};
 
 type InboundRecord = {
   ok: boolean;
@@ -20,6 +35,8 @@ type InboundRecord = {
   error?: string;
   unknown_reason?: string;
   reason?: string;
+  artifacts?: InboundArtifact[];
+  requests?: InboundRequestState[];
   meta?: {
     latency_ms?: number;
     channel?: InboundChannel;
@@ -98,6 +115,13 @@ const ACK_PATTERNS = [
   /^🧠\s*我看一下/i,
 ];
 
+const ARTIFACT_POLL_INTERVAL_MS = clampInt(
+  process.env.CHAT_GATEWAY_PUBLIC_ARTIFACT_POLL_INTERVAL_MS,
+  1200,
+  200,
+  10_000,
+);
+
 const inflight = new Map<string, Promise<InboundRecord>>();
 
 function nowIso(): string {
@@ -124,6 +148,11 @@ function sanitizeId(raw: string): string {
 
 function hashString(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function deriveIdentity(token: string, clientIdRaw?: string): { chatId: string; userId: string } {
@@ -166,6 +195,102 @@ function pickReply(messages: string[]): string {
   const nonAck = trimmed.filter(text => !ACK_PATTERNS.some(re => re.test(text)));
   if (nonAck.length) return nonAck[nonAck.length - 1];
   return trimmed[trimmed.length - 1];
+}
+
+function collectArtifacts(signals: AdapterResultProbe[]): InboundArtifact[] {
+  const dedupe = new Set<string>();
+  const artifacts: InboundArtifact[] = [];
+  for (const signal of signals) {
+    const imagePath = trimToString(signal.imagePath);
+    if (!imagePath) continue;
+    const key = `image_path:${imagePath}`;
+    if (dedupe.has(key)) continue;
+    dedupe.add(key);
+    artifacts.push({
+      type: "image_path",
+      value: imagePath,
+      intent: signal.intent,
+      request_id: signal.requestId,
+    });
+  }
+  return artifacts;
+}
+
+function collectRequestStates(signals: AdapterResultProbe[]): InboundRequestState[] {
+  const map = new Map<string, InboundRequestState>();
+  for (const signal of signals) {
+    const requestId = trimToString(signal.requestId);
+    if (!requestId) continue;
+    const key = `${signal.intent}:${requestId}`;
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, {
+        intent: signal.intent,
+        request_id: requestId,
+        status: trimToString(signal.status) || undefined,
+        error: trimToString(signal.error) || undefined,
+      });
+      continue;
+    }
+    const status = trimToString(signal.status);
+    if (status) existing.status = status;
+    const error = trimToString(signal.error);
+    if (error) existing.error = error;
+  }
+  return Array.from(map.values());
+}
+
+function resolveArtifactWaitMs(waitMs: number): number {
+  return clampInt(
+    process.env.CHAT_GATEWAY_PUBLIC_ARTIFACT_WAIT_MS,
+    Math.max(waitMs, 12_000),
+    0,
+    120_000,
+  );
+}
+
+function shouldProbeSignal(signal: AdapterResultProbe): boolean {
+  if (!signal.probe) return false;
+  if (trimToString(signal.imagePath)) return false;
+  const status = trimToString(signal.status).toLowerCase();
+  const hasError = Boolean(trimToString(signal.error));
+  if (!status) return !hasError;
+  return (
+    status === "accepted"
+    || status === "in_progress"
+    || status === "processing"
+    || status === "queued"
+    || status === "done"
+  );
+}
+
+async function pollSignalsForArtifacts(signals: AdapterResultProbe[], waitMs: number): Promise<void> {
+  if (!signals.length || waitMs <= 0) return;
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    const pending = signals.filter(shouldProbeSignal);
+    if (!pending.length) return;
+
+    await Promise.all(pending.map(async (signal) => {
+      try {
+        const next = await signal.probe!();
+        const status = trimToString(next.status);
+        if (status) signal.status = status;
+        const imagePath = trimToString(next.imagePath);
+        if (imagePath) signal.imagePath = imagePath;
+        const error = trimToString(next.error);
+        if (error) signal.error = error;
+      } catch (e: any) {
+        const error = trimToString(e?.message || e);
+        if (error && !signal.error) signal.error = error;
+      }
+    }));
+
+    if (collectArtifacts(signals).length) return;
+    const remain = deadline - Date.now();
+    if (remain <= 0) return;
+    await sleep(Math.min(ARTIFACT_POLL_INTERVAL_MS, remain));
+  }
 }
 
 function ensureDir(dir: string) {
@@ -346,6 +471,7 @@ async function processInbound(opts: RuntimeOpts, body: Required<PublicInboundMes
   }
 
   const messages: string[] = [];
+  const resultSignals: AdapterResultProbe[] = [];
   const send = async (_targetChatId: string, out: string) => {
     const value = String(out || "").trim();
     if (value) messages.push(value);
@@ -368,6 +494,9 @@ async function processInbound(opts: RuntimeOpts, body: Required<PublicInboundMes
     mentionsBot,
     replyText,
     send,
+    reportResult: (result) => {
+      resultSignals.push(result);
+    },
   });
 
   if (!handled) {
@@ -383,6 +512,12 @@ async function processInbound(opts: RuntimeOpts, body: Required<PublicInboundMes
   }
 
   const reply = pickReply(messages);
+  if (resultSignals.some(shouldProbeSignal)) {
+    const artifactWaitMs = resolveArtifactWaitMs(clampInt(body.wait_ms, 8000, 0, 20_000));
+    await pollSignalsForArtifacts(resultSignals, artifactWaitMs);
+  }
+  const artifacts = collectArtifacts(resultSignals);
+  const requests = collectRequestStates(resultSignals);
   return withMeta({
     ok: true,
     status: "completed",
@@ -390,6 +525,8 @@ async function processInbound(opts: RuntimeOpts, body: Required<PublicInboundMes
     confidence,
     need_clarify: false,
     reply_text: reply || "(无输出)",
+    artifacts: artifacts.length ? artifacts : undefined,
+    requests: requests.length ? requests : undefined,
   });
 }
 
