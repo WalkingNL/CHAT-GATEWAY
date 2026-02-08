@@ -266,9 +266,9 @@ function normalizeStoredArtifact(raw: any, fallbackRequestId: string): StoredInb
 }
 
 function toPublicArtifact(requestId: string, artifact: StoredInboundArtifact): InboundArtifact {
-  const effectiveRequestId = sanitizeRequestId(trimToString(artifact.request_id) || requestId);
-  const previewPath = buildArtifactPath(effectiveRequestId, artifact.id, "preview");
-  const downloadPath = buildArtifactPath(effectiveRequestId, artifact.id, "download");
+  const locatorRequestId = sanitizeRequestId(requestId);
+  const previewPath = buildArtifactPath(locatorRequestId, artifact.id, "preview");
+  const downloadPath = buildArtifactPath(locatorRequestId, artifact.id, "download");
   return {
     id: artifact.id,
     type: "image_path",
@@ -280,7 +280,7 @@ function toPublicArtifact(requestId: string, artifact: StoredInboundArtifact): I
     size_bytes: artifact.size_bytes,
     expires_at: artifact.expires_at,
     intent: artifact.intent,
-    request_id: effectiveRequestId,
+    request_id: locatorRequestId,
   };
 }
 
