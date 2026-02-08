@@ -699,9 +699,15 @@ export function createPublicInboundRuntime(opts: RuntimeOpts) {
   const token = String(process.env.CHAT_GATEWAY_PUBLIC_TOKEN || "").trim();
   const enabled = Boolean(token);
   const trustClientIdentity = String(process.env.CHAT_GATEWAY_PUBLIC_TRUST_CLIENT_IDENTITY || "").trim() === "1";
+  const trustedIdentityToken = String(process.env.CHAT_GATEWAY_PUBLIC_TRUSTED_IDENTITY_TOKEN || "").trim();
   const store = new InboundStore(opts.storageDir);
 
-  async function postMessage(rawBody: any, idempotencyKey?: string, clientId?: string): Promise<RuntimePost> {
+  async function postMessage(
+    rawBody: any,
+    idempotencyKey?: string,
+    clientId?: string,
+    trustedIdentityTokenRaw?: string,
+  ): Promise<RuntimePost> {
     if (!enabled) return { ok: false, statusCode: 403, error: "public_api_disabled" };
     const body = (rawBody || {}) as PublicInboundMessageInput;
     const requestIdRaw = trimToString(body.request_id) || trimToString(idempotencyKey);
@@ -710,16 +716,21 @@ export function createPublicInboundRuntime(opts: RuntimeOpts) {
     const text = trimToString(body.text);
     const providedChatId = sanitizeId(trimToString(body.chat_id));
     const providedUserId = sanitizeId(trimToString(body.user_id));
-    // In untrusted mode, caller identity is never used directly for auth checks.
-    // We only treat caller fields as seed to derive namespaced external ids.
-    const derivedSeed = trimToString(clientId) || providedChatId || providedUserId;
-    const derived = deriveIdentity(token, derivedSeed || undefined);
-    const chatId = trustClientIdentity
-      ? (providedChatId || providedUserId || derived.chatId)
-      : derived.chatId;
-    const userId = trustClientIdentity
-      ? (providedUserId || providedChatId || derived.userId)
-      : derived.userId;
+    const trustedIdentityEnabled = (
+      trustClientIdentity
+      && Boolean(trustedIdentityToken)
+      && trimToString(trustedIdentityTokenRaw) === trustedIdentityToken
+    );
+    // Default path derives identity from public token only.
+    // Caller-supplied identity fields (body/header) are ignored unless trusted identity mode is enabled.
+    const defaultDerived = deriveIdentity(token);
+    const trustedDerived = deriveIdentity(token, trimToString(clientId) || undefined);
+    const chatId = trustedIdentityEnabled
+      ? (providedChatId || providedUserId || trustedDerived.chatId)
+      : defaultDerived.chatId;
+    const userId = trustedIdentityEnabled
+      ? (providedUserId || providedChatId || trustedDerived.userId)
+      : defaultDerived.userId;
     const chatType = resolveChatType(body.chat_type);
     if (!chatType) return invalidRequest("unsupported_chat_type");
     if (!text) return invalidRequest("missing_required_field:text");

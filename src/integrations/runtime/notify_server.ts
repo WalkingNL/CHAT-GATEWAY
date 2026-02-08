@@ -526,10 +526,12 @@ export function startNotifyServer(opts: {
         }
         const idempotencyKey = String(req.headers["x-idempotency-key"] || "").trim();
         const clientId = String(req.headers["x-client-id"] || "").trim();
+        const trustedIdentityToken = String(req.headers["x-trusted-identity-token"] || "").trim();
         const out = await publicInbound.postMessage(
           body,
           idempotencyKey || undefined,
           clientId || undefined,
+          trustedIdentityToken || undefined,
         );
         if (!out.ok) {
           res.statusCode = out.statusCode;
