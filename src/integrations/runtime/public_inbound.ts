@@ -181,6 +181,13 @@ function hashString(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
 }
 
+function normalizeExternalClientId(raw: unknown): string {
+  let v = sanitizeId(trimToString(raw));
+  if (!v) return "";
+  v = v.replace(/^(ext|svc):/i, "");
+  return sanitizeId(v);
+}
+
 function sleep(ms: number): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -318,7 +325,7 @@ function toPublicResult(stored: StoredInboundResult): PublicInboundResult {
 }
 
 function deriveIdentity(token: string, clientIdRaw?: string): { chatId: string; userId: string } {
-  const normalizedClientId = sanitizeId(trimToString(clientIdRaw));
+  const normalizedClientId = normalizeExternalClientId(clientIdRaw);
   if (normalizedClientId) {
     return {
       chatId: `ext:${normalizedClientId}`,
