@@ -10,9 +10,28 @@ import type { LoadedConfig } from "../../core/config/types.js";
 
 type InboundChannel = "telegram" | "feishu";
 
+type StoredInboundArtifact = {
+  id: string;
+  type: "image_path";
+  file_path: string;
+  mime?: string;
+  filename?: string;
+  size_bytes?: number;
+  expires_at?: string;
+  intent?: string;
+  request_id?: string;
+};
+
 type InboundArtifact = {
+  id: string;
   type: "image_path";
   value: string;
+  preview_url: string;
+  download_url: string;
+  mime?: string;
+  filename?: string;
+  size_bytes?: number;
+  expires_at?: string;
   intent?: string;
   request_id?: string;
 };
@@ -24,7 +43,7 @@ type InboundRequestState = {
   error?: string;
 };
 
-type InboundRecord = {
+type InboundRecordStored = {
   ok: boolean;
   request_id: string;
   status: "completed" | "clarify" | "error";
@@ -35,7 +54,7 @@ type InboundRecord = {
   error?: string;
   unknown_reason?: string;
   reason?: string;
-  artifacts?: InboundArtifact[];
+  artifacts?: StoredInboundArtifact[];
   requests?: InboundRequestState[];
   meta?: {
     latency_ms?: number;
@@ -46,6 +65,10 @@ type InboundRecord = {
   ts_utc: string;
 };
 
+type InboundRecord = Omit<InboundRecordStored, "artifacts"> & {
+  artifacts?: InboundArtifact[];
+};
+
 type InboundAccepted = {
   ok: true;
   request_id: string;
@@ -54,6 +77,7 @@ type InboundAccepted = {
 };
 
 export type PublicInboundResult = InboundRecord | InboundAccepted;
+type StoredInboundResult = InboundRecordStored | InboundAccepted;
 
 type PublicInboundMessageInput = {
   request_id?: unknown;
@@ -121,8 +145,15 @@ const ARTIFACT_POLL_INTERVAL_MS = clampInt(
   200,
   10_000,
 );
+const PUBLIC_ARTIFACT_TTL_SEC = clampInt(
+  process.env.CHAT_GATEWAY_PUBLIC_ARTIFACT_TTL_SEC || process.env.ON_DEMAND_RESULT_TTL_SEC,
+  86_400,
+  0,
+  604_800,
+);
+const PUBLIC_BASE_URL = String(process.env.CHAT_GATEWAY_PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
 
-const inflight = new Map<string, Promise<InboundRecord>>();
+const inflight = new Map<string, Promise<InboundRecordStored>>();
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -153,6 +184,137 @@ function hashString(raw: string): string {
 function sleep(ms: number): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function detectMime(filePath: string): string {
+  const lower = path.extname(String(filePath || "")).toLowerCase();
+  if (lower === ".png") return "image/png";
+  if (lower === ".jpg" || lower === ".jpeg") return "image/jpeg";
+  if (lower === ".webp") return "image/webp";
+  if (lower === ".gif") return "image/gif";
+  return "application/octet-stream";
+}
+
+function resolveSizeBytes(filePath: string): number | undefined {
+  try {
+    const stat = fs.statSync(filePath);
+    return Number.isFinite(stat.size) ? stat.size : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function calcExpiresAt(): string | undefined {
+  if (PUBLIC_ARTIFACT_TTL_SEC <= 0) return undefined;
+  return new Date(Date.now() + PUBLIC_ARTIFACT_TTL_SEC * 1000).toISOString();
+}
+
+function buildArtifactPath(requestId: string, artifactId: string, mode: "preview" | "download"): string {
+  const encodedRequestId = encodeURIComponent(requestId);
+  const encodedArtifactId = encodeURIComponent(artifactId);
+  return `/v1/inbound/artifacts/${encodedRequestId}/${encodedArtifactId}/${mode}`;
+}
+
+function withPublicBase(p: string): string {
+  if (!PUBLIC_BASE_URL) return p;
+  return `${PUBLIC_BASE_URL}${p}`;
+}
+
+function toStoredArtifact(signal: AdapterResultProbe): StoredInboundArtifact | null {
+  const filePath = trimToString(signal.imagePath);
+  const requestId = sanitizeRequestId(trimToString(signal.requestId));
+  if (!filePath || !requestId) return null;
+  const id = `art_${hashString(`${requestId}:${filePath}`).slice(0, 16)}`;
+  return {
+    id,
+    type: "image_path",
+    file_path: filePath,
+    mime: detectMime(filePath),
+    filename: path.basename(filePath),
+    size_bytes: resolveSizeBytes(filePath),
+    expires_at: calcExpiresAt(),
+    intent: signal.intent,
+    request_id: requestId,
+  };
+}
+
+function normalizeStoredArtifact(raw: any, fallbackRequestId: string): StoredInboundArtifact | null {
+  if (!raw || typeof raw !== "object") return null;
+  const filePath = trimToString(raw.file_path) || trimToString(raw.value);
+  const type = trimToString(raw.type);
+  if (!filePath || type !== "image_path") return null;
+  const requestId = sanitizeRequestId(trimToString(raw.request_id) || fallbackRequestId);
+  const id = sanitizeId(trimToString(raw.id) || `art_${hashString(`${requestId}:${filePath}`).slice(0, 16)}`);
+  return {
+    id,
+    type: "image_path",
+    file_path: filePath,
+    mime: trimToString(raw.mime) || detectMime(filePath),
+    filename: trimToString(raw.filename) || path.basename(filePath),
+    size_bytes: Number.isFinite(Number(raw.size_bytes)) ? Number(raw.size_bytes) : resolveSizeBytes(filePath),
+    expires_at: trimToString(raw.expires_at) || calcExpiresAt(),
+    intent: trimToString(raw.intent) || undefined,
+    request_id: requestId,
+  };
+}
+
+function toPublicArtifact(requestId: string, artifact: StoredInboundArtifact): InboundArtifact {
+  const effectiveRequestId = sanitizeRequestId(trimToString(artifact.request_id) || requestId);
+  const previewPath = buildArtifactPath(effectiveRequestId, artifact.id, "preview");
+  const downloadPath = buildArtifactPath(effectiveRequestId, artifact.id, "download");
+  return {
+    id: artifact.id,
+    type: "image_path",
+    value: withPublicBase(downloadPath),
+    preview_url: withPublicBase(previewPath),
+    download_url: withPublicBase(downloadPath),
+    mime: artifact.mime,
+    filename: artifact.filename,
+    size_bytes: artifact.size_bytes,
+    expires_at: artifact.expires_at,
+    intent: artifact.intent,
+    request_id: effectiveRequestId,
+  };
+}
+
+function normalizeStoredResult(raw: any): StoredInboundResult | null {
+  if (!raw || typeof raw !== "object") return null;
+  if (trimToString(raw.status) === "accepted") {
+    const requestId = sanitizeRequestId(trimToString(raw.request_id));
+    if (!requestId) return null;
+    return {
+      ok: true,
+      request_id: requestId,
+      status: "accepted",
+      ts_utc: trimToString(raw.ts_utc) || nowIso(),
+    };
+  }
+  const requestId = sanitizeRequestId(trimToString(raw.request_id));
+  if (!requestId) return null;
+  const rawArtifacts: any[] = Array.isArray(raw.artifacts) ? raw.artifacts : [];
+  const artifacts = rawArtifacts
+    .map((artifact: any) => normalizeStoredArtifact(artifact, requestId))
+    .filter((artifact: StoredInboundArtifact | null): artifact is StoredInboundArtifact => Boolean(artifact));
+  const statusRaw = trimToString(raw.status).toLowerCase();
+  const status = statusRaw === "clarify" || statusRaw === "error" ? statusRaw : "completed";
+  return {
+    ...(raw as InboundRecordStored),
+    request_id: requestId,
+    status,
+    artifacts: artifacts.length ? artifacts : undefined,
+    ts_utc: trimToString(raw.ts_utc) || nowIso(),
+  };
+}
+
+function toPublicResult(stored: StoredInboundResult): PublicInboundResult {
+  if (stored.status === "accepted") return stored;
+  const artifacts = Array.isArray(stored.artifacts)
+    ? stored.artifacts.map((artifact) => toPublicArtifact(stored.request_id, artifact))
+    : [];
+  return {
+    ...stored,
+    artifacts: artifacts.length ? artifacts : undefined,
+  };
 }
 
 function deriveIdentity(token: string, clientIdRaw?: string): { chatId: string; userId: string } {
@@ -197,21 +359,17 @@ function pickReply(messages: string[]): string {
   return trimmed[trimmed.length - 1];
 }
 
-function collectArtifacts(signals: AdapterResultProbe[]): InboundArtifact[] {
+function collectArtifacts(signals: AdapterResultProbe[]): StoredInboundArtifact[] {
   const dedupe = new Set<string>();
-  const artifacts: InboundArtifact[] = [];
+  const artifacts: StoredInboundArtifact[] = [];
   for (const signal of signals) {
-    const imagePath = trimToString(signal.imagePath);
-    if (!imagePath) continue;
+    const artifact = toStoredArtifact(signal);
+    if (!artifact) continue;
+    const imagePath = artifact.file_path;
     const key = `image_path:${imagePath}`;
     if (dedupe.has(key)) continue;
     dedupe.add(key);
-    artifacts.push({
-      type: "image_path",
-      value: imagePath,
-      intent: signal.intent,
-      request_id: signal.requestId,
-    });
+    artifacts.push(artifact);
   }
   return artifacts;
 }
@@ -314,17 +472,17 @@ class InboundStore {
     return path.join(this.baseDir(), `${sanitizeRequestId(requestId)}.json`);
   }
 
-  get(requestId: string): PublicInboundResult | null {
+  get(requestId: string): StoredInboundResult | null {
     const file = this.filePath(requestId);
     if (!fs.existsSync(file)) return null;
     try {
-      return JSON.parse(fs.readFileSync(file, "utf-8"));
+      return normalizeStoredResult(JSON.parse(fs.readFileSync(file, "utf-8")));
     } catch {
       return null;
     }
   }
 
-  put(requestId: string, record: PublicInboundResult) {
+  put(requestId: string, record: StoredInboundResult) {
     ensureDir(this.baseDir());
     atomicWriteJson(this.filePath(requestId), record);
   }
@@ -361,7 +519,7 @@ function resolveAuthContext(opts: RuntimeOpts, channel: InboundChannel) {
   } as const;
 }
 
-async function processInbound(opts: RuntimeOpts, body: Required<PublicInboundMessageInput>): Promise<InboundRecord> {
+async function processInbound(opts: RuntimeOpts, body: Required<PublicInboundMessageInput>): Promise<InboundRecordStored> {
   const t0 = Date.now();
   const requestId = sanitizeRequestId(trimToString(body.request_id));
   const channel = resolveChannel(body.channel);
@@ -375,7 +533,7 @@ async function processInbound(opts: RuntimeOpts, body: Required<PublicInboundMes
   const mentionsBot = Boolean(body.mentions_bot);
   const isGroup = chatType === "group";
 
-  const withMeta = <T extends Omit<InboundRecord, "request_id" | "ts_utc" | "meta">>(record: T): InboundRecord => ({
+  const withMeta = <T extends Omit<InboundRecordStored, "request_id" | "ts_utc" | "meta">>(record: T): InboundRecordStored => ({
     ...record,
     request_id: requestId,
     ts_utc: nowIso(),
@@ -533,6 +691,7 @@ async function processInbound(opts: RuntimeOpts, body: Required<PublicInboundMes
 export function createPublicInboundRuntime(opts: RuntimeOpts) {
   const token = String(process.env.CHAT_GATEWAY_PUBLIC_TOKEN || "").trim();
   const enabled = Boolean(token);
+  const trustClientIdentity = String(process.env.CHAT_GATEWAY_PUBLIC_TRUST_CLIENT_IDENTITY || "").trim() === "1";
   const store = new InboundStore(opts.storageDir);
 
   async function postMessage(rawBody: any, idempotencyKey?: string, clientId?: string): Promise<RuntimePost> {
@@ -544,9 +703,16 @@ export function createPublicInboundRuntime(opts: RuntimeOpts) {
     const text = trimToString(body.text);
     const providedChatId = sanitizeId(trimToString(body.chat_id));
     const providedUserId = sanitizeId(trimToString(body.user_id));
-    const derived = deriveIdentity(token, clientId);
-    const chatId = providedChatId || providedUserId || derived.chatId;
-    const userId = providedUserId || providedChatId || derived.userId;
+    // In untrusted mode, caller identity is never used directly for auth checks.
+    // We only treat caller fields as seed to derive namespaced external ids.
+    const derivedSeed = trimToString(clientId) || providedChatId || providedUserId;
+    const derived = deriveIdentity(token, derivedSeed || undefined);
+    const chatId = trustClientIdentity
+      ? (providedChatId || providedUserId || derived.chatId)
+      : derived.chatId;
+    const userId = trustClientIdentity
+      ? (providedUserId || providedChatId || derived.userId)
+      : derived.userId;
     const chatType = resolveChatType(body.chat_type);
     if (!chatType) return invalidRequest("unsupported_chat_type");
     if (!text) return invalidRequest("missing_required_field:text");
@@ -554,7 +720,7 @@ export function createPublicInboundRuntime(opts: RuntimeOpts) {
 
     const cached = store.get(requestId);
     if (cached && cached.status !== "accepted") {
-      return { ok: true, response: cached };
+      return { ok: true, response: toPublicResult(cached) };
     }
 
     let running = inflight.get(requestId);
@@ -578,7 +744,7 @@ export function createPublicInboundRuntime(opts: RuntimeOpts) {
           return result;
         })
         .catch((e: any) => {
-          const failed: InboundRecord = {
+          const failed: InboundRecordStored = {
             ok: false,
             request_id: requestId,
             status: "error",
@@ -597,7 +763,7 @@ export function createPublicInboundRuntime(opts: RuntimeOpts) {
 
     const waitResult = await waitWithTimeout(running, waitMs);
     if (waitResult.done) {
-      return { ok: true, response: waitResult.value };
+      return { ok: true, response: toPublicResult(waitResult.value) };
     }
 
     const accepted: InboundAccepted = {
@@ -614,7 +780,7 @@ export function createPublicInboundRuntime(opts: RuntimeOpts) {
     const requestId = sanitizeRequestId(trimToString(requestIdRaw));
     if (!requestId) return { ok: false, statusCode: 400, error: "missing_request_id" };
     const cached = store.get(requestId);
-    if (cached) return { ok: true, response: cached };
+    if (cached) return { ok: true, response: toPublicResult(cached) };
     if (inflight.has(requestId)) {
       return {
         ok: true,
@@ -629,10 +795,52 @@ export function createPublicInboundRuntime(opts: RuntimeOpts) {
     return { ok: false, statusCode: 404, error: "not_found" };
   }
 
+  function getArtifact(requestIdRaw: string, artifactIdRaw: string): {
+    ok: true;
+    artifact: {
+      filePath: string;
+      mime: string;
+      filename: string;
+      sizeBytes?: number;
+    };
+  } | {
+    ok: false;
+    statusCode: number;
+    error: string;
+  } {
+    if (!enabled) return { ok: false, statusCode: 403, error: "public_api_disabled" };
+    const requestId = sanitizeRequestId(trimToString(requestIdRaw));
+    const artifactId = sanitizeId(trimToString(artifactIdRaw));
+    if (!requestId || !artifactId) return { ok: false, statusCode: 400, error: "invalid_artifact_locator" };
+    const cached = store.get(requestId);
+    if (!cached || cached.status === "accepted") return { ok: false, statusCode: 404, error: "not_found" };
+    const artifacts = Array.isArray(cached.artifacts) ? cached.artifacts : [];
+    const artifact = artifacts.find(item => item.id === artifactId);
+    if (!artifact) return { ok: false, statusCode: 404, error: "artifact_not_found" };
+    if (artifact.expires_at) {
+      const expiresAt = Date.parse(artifact.expires_at);
+      if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
+        return { ok: false, statusCode: 410, error: "artifact_expired" };
+      }
+    }
+    const filePath = trimToString(artifact.file_path);
+    if (!filePath || !fs.existsSync(filePath)) return { ok: false, statusCode: 404, error: "artifact_missing" };
+    return {
+      ok: true,
+      artifact: {
+        filePath,
+        mime: trimToString(artifact.mime) || detectMime(filePath),
+        filename: trimToString(artifact.filename) || path.basename(filePath),
+        sizeBytes: Number.isFinite(Number(artifact.size_bytes)) ? Number(artifact.size_bytes) : resolveSizeBytes(filePath),
+      },
+    };
+  }
+
   return {
     enabled,
     token,
     postMessage,
     getMessage,
+    getArtifact,
   };
 }

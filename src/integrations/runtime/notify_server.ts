@@ -507,7 +507,11 @@ export function startNotifyServer(opts: {
     const url = new URL(req.url || "/", `http://${host}:${port}`);
     const isPublicInboundPost = req.method === "POST" && url.pathname === "/v1/inbound/messages";
     const isPublicInboundGet = req.method === "GET" && /^\/v1\/inbound\/messages\/[^/]+$/.test(url.pathname);
-    const isPublicInbound = isPublicInboundPost || isPublicInboundGet;
+    const publicInboundArtifactMatch = req.method === "GET"
+      ? url.pathname.match(/^\/v1\/inbound\/artifacts\/([^/]+)\/([^/]+)\/(download|preview)$/)
+      : null;
+    const isPublicInboundArtifactGet = Boolean(publicInboundArtifactMatch);
+    const isPublicInbound = isPublicInboundPost || isPublicInboundGet || isPublicInboundArtifactGet;
 
     const auth = String(req.headers["authorization"] || "");
     if (isPublicInbound) {
@@ -534,6 +538,45 @@ export function startNotifyServer(opts: {
           return;
         }
         return okJson(res, out.response);
+      }
+      if (isPublicInboundArtifactGet) {
+        let requestId = "";
+        let artifactId = "";
+        let mode: "download" | "preview" = "download";
+        try {
+          requestId = decodeURIComponent(publicInboundArtifactMatch![1] || "");
+          artifactId = decodeURIComponent(publicInboundArtifactMatch![2] || "");
+          mode = (publicInboundArtifactMatch![3] || "download") as "download" | "preview";
+        } catch {
+          return badRequest(res, "invalid_artifact_locator");
+        }
+        const out = publicInbound.getArtifact(requestId, artifactId);
+        if (!out.ok) {
+          res.statusCode = out.statusCode;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ ok: false, error: out.error }));
+          return;
+        }
+        const safeName = out.artifact.filename.replace(/[\r\n"]/g, "_") || "artifact.bin";
+        res.statusCode = 200;
+        res.setHeader("Content-Type", out.artifact.mime || "application/octet-stream");
+        if (Number.isFinite(out.artifact.sizeBytes as number)) {
+          res.setHeader("Content-Length", String(out.artifact.sizeBytes));
+        }
+        res.setHeader("Content-Disposition", `${mode === "preview" ? "inline" : "attachment"}; filename="${safeName}"`);
+        res.setHeader("Cache-Control", "private, max-age=300");
+        const stream = fs.createReadStream(out.artifact.filePath);
+        stream.on("error", () => {
+          if (!res.headersSent) {
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ ok: false, error: "artifact_missing" }));
+            return;
+          }
+          res.destroy();
+        });
+        stream.pipe(res);
+        return;
       }
       let requestId = "";
       try {
