@@ -1,6 +1,6 @@
 # Chat Gateway Business Logic Scan (Snapshot)
 
-Date: 2026-02-03
+Date: 2026-02-16
 Repo: CHAT-GATEWAY
 Scope: paths under src/ and config/, focus on business/domain coupling.
 
@@ -19,7 +19,8 @@ Scope: paths under src/ and config/, focus on business/domain coupling.
 - src/integrations/runtime/
   - intent_router.ts, intent_schema.ts, strategy.ts, response_templates.ts
   - notify_server.ts, query.ts, dispatch.ts, handlers.ts
-  - on_demand_mapping.ts, project_registry.ts
+  - on_demand_mapping.ts, project_registry.ts, public_inbound.ts
+  - seedance.ts: Seedance video generation adapter used by public inbound `/video`
 - src/integrations/auth/, src/integrations/audit/
   - auth store and audit ledger/trace writers used by integrations
 

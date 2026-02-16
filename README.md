@@ -112,6 +112,14 @@ npx tsx src/entrypoints/all_in_one.ts
 - `CHAT_GATEWAY_NEWS_SUMMARY_CACHE_MAX_ITEMS`, `CHAT_GATEWAY_NEWS_SUMMARY_CACHE_CLEANUP_MS`: 新闻摘要缓存清理参数
 - `CHAT_GATEWAY_HTTP_TIMEOUT_MS`: 默认 HTTP 超时（ms）
 - `CHAT_GATEWAY_HTTP_RETRIES`, `CHAT_GATEWAY_HTTP_RETRY_BASE_MS`, `CHAT_GATEWAY_HTTP_RETRY_MAX_MS`, `CHAT_GATEWAY_HTTP_RETRY_JITTER_MS`: HTTP 重试与退避参数
+- `SEEDANCE_API_KEY`: Seedance API key（启用 `/video` 必填）
+- `SEEDANCE_MODEL`: Seedance 模型 ID（默认 `doubao-seedance-1-0-pro-250528`）
+- `SEEDANCE_API_BASE_URL`: Seedance API 基础地址（默认 `https://ark.cn-beijing.volces.com`）
+- `SEEDANCE_CREATE_PATH`: 创建任务路径（默认 `/api/v3/contents/generations/tasks`）
+- `SEEDANCE_QUERY_PATH_PREFIX`: 查询任务路径前缀（默认 `/api/v3/contents/generations/tasks`）
+- `SEEDANCE_HTTP_TIMEOUT_MS`: Seedance HTTP 超时（默认 30000）
+- `SEEDANCE_POLL_INTERVAL_MS`, `SEEDANCE_TASK_TIMEOUT_MS`: `/video` 任务轮询间隔与最大等待时长
+- `SEEDANCE_DEFAULT_PROPERTIES_JSON`: Seedance 创建任务时附加的 `properties` JSON（可选）
 
 Supervisor backoff defaults: 1s → 2s → 5s → 10s → 30s (max 30s). Not currently configurable.
 
@@ -140,6 +148,20 @@ Registry: `config/projects.yml` auto-reloads on mtime change; `SIGHUP` forces re
 Response (text/image):
 - `ok: true`
 - `target_overrides`: per-target override map (chat_id -> min_priority|null), if configured
+
+## Public inbound `/video` (Seedance)
+
+`POST /v1/inbound/messages` 的 `text` 支持 `/video` 命令：
+
+- 基础：`/video <提示词>`
+- 可选：`--image <图片URL>`（图生视频）
+- 可选：`--duration <秒>`
+
+返回结果在 `artifacts` 中，类型为 `remote_url`，字段包含：
+
+- `preview_url`
+- `download_url`
+- `mime`（通常为 `video/mp4`）
 
 Registry extensions (`config/projects.yml`):
 - `on_demand.window_spec_id`: optional default `window_spec_id` for dashboard exports

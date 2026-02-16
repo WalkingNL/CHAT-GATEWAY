@@ -6,14 +6,26 @@ import { handleAdapterIntentIfAny } from "../router/router.js";
 import { resolveProjectId } from "../router/intent_handlers.js";
 import { requestIntentResolve, sanitizeRequestId } from "./intent_router.js";
 import type { AdapterResultProbe } from "./handlers.js";
+import {
+  createSeedanceTask,
+  isSeedanceEnabled,
+  isSeedanceTerminalStatus,
+  parseSeedanceCommand,
+  querySeedanceTask,
+  type SeedanceCommand,
+  type SeedanceTaskSnapshot,
+} from "./seedance.js";
 import type { LoadedConfig } from "../../core/config/types.js";
 
 type InboundChannel = "telegram" | "feishu";
 
 type StoredInboundArtifact = {
   id: string;
-  type: "image_path";
-  file_path: string;
+  type: "image_path" | "remote_url";
+  file_path?: string;
+  value?: string;
+  preview_url?: string;
+  download_url?: string;
   mime?: string;
   filename?: string;
   size_bytes?: number;
@@ -24,7 +36,7 @@ type StoredInboundArtifact = {
 
 type InboundArtifact = {
   id: string;
-  type: "image_path";
+  type: "image_path" | "remote_url";
   value: string;
   preview_url: string;
   download_url: string;
@@ -152,6 +164,18 @@ const PUBLIC_ARTIFACT_TTL_SEC = clampInt(
   604_800,
 );
 const PUBLIC_BASE_URL = String(process.env.CHAT_GATEWAY_PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
+const SEEDANCE_POLL_INTERVAL_MS = clampInt(
+  process.env.SEEDANCE_POLL_INTERVAL_MS,
+  3000,
+  500,
+  15_000,
+);
+const SEEDANCE_TASK_TIMEOUT_MS = clampInt(
+  process.env.SEEDANCE_TASK_TIMEOUT_MS,
+  300_000,
+  10_000,
+  1_800_000,
+);
 
 const inflight = new Map<string, Promise<InboundRecordStored>>();
 
@@ -167,6 +191,10 @@ function clampInt(raw: unknown, fallback: number, min: number, max: number): num
 
 function trimToString(raw: unknown): string {
   return String(raw ?? "").trim();
+}
+
+function isHttpUrl(raw: unknown): boolean {
+  return /^https?:\/\//i.test(trimToString(raw));
 }
 
 function sanitizeId(raw: string): string {
@@ -194,11 +222,25 @@ function sleep(ms: number): Promise<void> {
 }
 
 function detectMime(filePath: string): string {
-  const lower = path.extname(String(filePath || "")).toLowerCase();
+  const raw = String(filePath || "");
+  let lower = "";
+  if (isHttpUrl(raw)) {
+    try {
+      lower = path.extname(new URL(raw).pathname).toLowerCase();
+    } catch {
+      lower = path.extname(raw).toLowerCase();
+    }
+  } else {
+    lower = path.extname(raw).toLowerCase();
+  }
   if (lower === ".png") return "image/png";
   if (lower === ".jpg" || lower === ".jpeg") return "image/jpeg";
   if (lower === ".webp") return "image/webp";
   if (lower === ".gif") return "image/gif";
+  if (lower === ".mp4") return "video/mp4";
+  if (lower === ".webm") return "video/webm";
+  if (lower === ".mov") return "video/quicktime";
+  if (lower === ".mkv") return "video/x-matroska";
   return "application/octet-stream";
 }
 
@@ -227,6 +269,43 @@ function withPublicBase(p: string): string {
   return `${PUBLIC_BASE_URL}${p}`;
 }
 
+function toStoredRemoteArtifact(params: {
+  requestId: string;
+  value: string;
+  mime?: string;
+  filename?: string;
+  intent?: string;
+}): StoredInboundArtifact | null {
+  const requestId = sanitizeRequestId(trimToString(params.requestId));
+  const value = trimToString(params.value);
+  if (!requestId || !isHttpUrl(value)) return null;
+  let filename = trimToString(params.filename);
+  if (!filename) {
+    try {
+      filename = path.basename(new URL(value).pathname || "");
+    } catch {
+      filename = "";
+    }
+  }
+  if (!filename || filename === "/" || filename === ".") {
+    filename = "artifact.bin";
+  }
+  const id = `art_${hashString(`${requestId}:${value}`).slice(0, 16)}`;
+  const mime = trimToString(params.mime) || detectMime(value);
+  return {
+    id,
+    type: "remote_url",
+    value,
+    preview_url: value,
+    download_url: value,
+    mime,
+    filename,
+    expires_at: calcExpiresAt(),
+    intent: trimToString(params.intent) || undefined,
+    request_id: requestId,
+  };
+}
+
 function toStoredArtifact(signal: AdapterResultProbe): StoredInboundArtifact | null {
   const filePath = trimToString(signal.imagePath);
   const requestId = sanitizeRequestId(trimToString(signal.requestId));
@@ -247,10 +326,43 @@ function toStoredArtifact(signal: AdapterResultProbe): StoredInboundArtifact | n
 
 function normalizeStoredArtifact(raw: any, fallbackRequestId: string): StoredInboundArtifact | null {
   if (!raw || typeof raw !== "object") return null;
-  const filePath = trimToString(raw.file_path) || trimToString(raw.value);
-  const type = trimToString(raw.type);
-  if (!filePath || type !== "image_path") return null;
+  const typeRaw = trimToString(raw.type).toLowerCase();
   const requestId = sanitizeRequestId(trimToString(raw.request_id) || fallbackRequestId);
+  const filePath = trimToString(raw.file_path);
+  const remoteValue = trimToString(raw.value) || trimToString(raw.download_url) || trimToString(raw.preview_url);
+  const resolvedType: "image_path" | "remote_url" | "" = (
+    typeRaw === "image_path"
+    || (!typeRaw && filePath)
+  )
+    ? "image_path"
+    : ((typeRaw === "remote_url" || (!typeRaw && isHttpUrl(remoteValue))) ? "remote_url" : "");
+  if (!resolvedType || !requestId) return null;
+  if (resolvedType === "remote_url") {
+    if (!isHttpUrl(remoteValue)) return null;
+    const id = sanitizeId(trimToString(raw.id) || `art_${hashString(`${requestId}:${remoteValue}`).slice(0, 16)}`);
+    const previewUrl = trimToString(raw.preview_url) || remoteValue;
+    const downloadUrl = trimToString(raw.download_url) || remoteValue;
+    return {
+      id,
+      type: "remote_url",
+      value: remoteValue,
+      preview_url: previewUrl,
+      download_url: downloadUrl,
+      mime: trimToString(raw.mime) || detectMime(remoteValue),
+      filename: trimToString(raw.filename) || path.basename((() => {
+        try {
+          return new URL(remoteValue).pathname;
+        } catch {
+          return remoteValue;
+        }
+      })()),
+      size_bytes: Number.isFinite(Number(raw.size_bytes)) ? Number(raw.size_bytes) : undefined,
+      expires_at: trimToString(raw.expires_at) || calcExpiresAt(),
+      intent: trimToString(raw.intent) || undefined,
+      request_id: requestId,
+    };
+  }
+  if (!filePath) return null;
   const id = sanitizeId(trimToString(raw.id) || `art_${hashString(`${requestId}:${filePath}`).slice(0, 16)}`);
   return {
     id,
@@ -267,6 +379,24 @@ function normalizeStoredArtifact(raw: any, fallbackRequestId: string): StoredInb
 
 function toPublicArtifact(requestId: string, artifact: StoredInboundArtifact): InboundArtifact {
   const locatorRequestId = sanitizeRequestId(requestId);
+  if (artifact.type === "remote_url") {
+    const value = trimToString(artifact.value) || trimToString(artifact.download_url) || trimToString(artifact.preview_url);
+    const previewUrl = trimToString(artifact.preview_url) || value;
+    const downloadUrl = trimToString(artifact.download_url) || value;
+    return {
+      id: artifact.id,
+      type: "remote_url",
+      value,
+      preview_url: previewUrl,
+      download_url: downloadUrl,
+      mime: artifact.mime,
+      filename: artifact.filename,
+      size_bytes: artifact.size_bytes,
+      expires_at: artifact.expires_at,
+      intent: artifact.intent,
+      request_id: locatorRequestId,
+    };
+  }
   const previewPath = buildArtifactPath(locatorRequestId, artifact.id, "preview");
   const downloadPath = buildArtifactPath(locatorRequestId, artifact.id, "download");
   return {
@@ -339,6 +469,41 @@ function deriveIdentity(token: string, clientIdRaw?: string): { chatId: string; 
   };
 }
 
+type PublicInboundIdentityResolveInput = {
+  token: string;
+  clientIdRaw?: unknown;
+  trustClientIdentity: boolean;
+  trustedIdentityToken?: string;
+  trustedIdentityTokenRaw?: unknown;
+  providedChatIdRaw?: unknown;
+  providedUserIdRaw?: unknown;
+};
+
+export function resolvePublicInboundIdentity(input: PublicInboundIdentityResolveInput): {
+  chatId: string;
+  userId: string;
+  trustedIdentityEnabled: boolean;
+} {
+  const providedChatId = sanitizeId(trimToString(input.providedChatIdRaw));
+  const providedUserId = sanitizeId(trimToString(input.providedUserIdRaw));
+  const trustedIdentityEnabled = (
+    Boolean(input.trustClientIdentity)
+    && Boolean(trimToString(input.trustedIdentityToken))
+    && trimToString(input.trustedIdentityTokenRaw) === trimToString(input.trustedIdentityToken)
+  );
+  // Default path derives identity from public token only.
+  // Caller-supplied identity fields are ignored unless trusted identity mode is explicitly enabled.
+  const defaultDerived = deriveIdentity(String(input.token || ""));
+  const trustedDerived = deriveIdentity(String(input.token || ""), trimToString(input.clientIdRaw) || undefined);
+  const chatId = trustedIdentityEnabled
+    ? (providedChatId || providedUserId || trustedDerived.chatId)
+    : defaultDerived.chatId;
+  const userId = trustedIdentityEnabled
+    ? (providedUserId || providedChatId || trustedDerived.userId)
+    : defaultDerived.userId;
+  return { chatId, userId, trustedIdentityEnabled };
+}
+
 function resolveChannel(raw: unknown): InboundChannel {
   const channel = trimToString(raw).toLowerCase();
   if (channel === "feishu") return "feishu";
@@ -372,8 +537,10 @@ function collectArtifacts(signals: AdapterResultProbe[]): StoredInboundArtifact[
   for (const signal of signals) {
     const artifact = toStoredArtifact(signal);
     if (!artifact) continue;
-    const imagePath = artifact.file_path;
-    const key = `image_path:${imagePath}`;
+    const locator = artifact.type === "remote_url"
+      ? (trimToString(artifact.download_url) || trimToString(artifact.preview_url) || trimToString(artifact.value))
+      : trimToString(artifact.file_path);
+    const key = `${artifact.type}:${locator}`;
     if (dedupe.has(key)) continue;
     dedupe.add(key);
     artifacts.push(artifact);
@@ -526,6 +693,106 @@ function resolveAuthContext(opts: RuntimeOpts, channel: InboundChannel) {
   } as const;
 }
 
+function buildSeedanceRequestState(taskId: string, status?: string, error?: string): InboundRequestState {
+  const fallback = sanitizeRequestId(`seedance:${Date.now()}`);
+  const requestId = sanitizeRequestId(trimToString(taskId)) || fallback;
+  return {
+    intent: "seedance_video",
+    request_id: requestId,
+    status: trimToString(status) || undefined,
+    error: trimToString(error) || undefined,
+  };
+}
+
+async function processSeedanceCommand(
+  requestId: string,
+  command: SeedanceCommand,
+): Promise<Omit<InboundRecordStored, "request_id" | "ts_utc" | "meta">> {
+  const submit = await createSeedanceTask(command);
+  if (!submit.ok) {
+    return {
+      ok: false,
+      status: "error",
+      intent: "seedance_video",
+      confidence: 1,
+      need_clarify: false,
+      error: "seedance_submit_failed",
+      reason: submit.error,
+      reply_text: `视频生成提交失败：${submit.error || "unknown_error"}`,
+    };
+  }
+
+  let snapshot: SeedanceTaskSnapshot = submit.snapshot;
+  const providerTaskId = trimToString(snapshot.taskId);
+  const startedAt = Date.now();
+  while (!isSeedanceTerminalStatus(snapshot.status)) {
+    const remain = SEEDANCE_TASK_TIMEOUT_MS - (Date.now() - startedAt);
+    if (remain <= 0) break;
+    await sleep(Math.min(SEEDANCE_POLL_INTERVAL_MS, remain));
+    const next = await querySeedanceTask(providerTaskId);
+    if (!next.ok) {
+      snapshot = {
+        ...snapshot,
+        status: "failed",
+        error: next.error || snapshot.error,
+      };
+      break;
+    }
+    snapshot = next.snapshot;
+  }
+
+  const requestState = buildSeedanceRequestState(providerTaskId, snapshot.status, snapshot.error);
+  if (snapshot.videoUrl) {
+    const artifact = toStoredRemoteArtifact({
+      requestId,
+      value: snapshot.videoUrl,
+      mime: snapshot.mime || "video/mp4",
+      filename: snapshot.filename || "seedance-video.mp4",
+      intent: "seedance_video",
+    });
+    if (!artifact) {
+      return {
+        ok: false,
+        status: "error",
+        intent: "seedance_video",
+        confidence: 1,
+        need_clarify: false,
+        error: "seedance_invalid_video_url",
+        reason: "missing_or_invalid_video_url",
+        requests: [requestState],
+        reply_text: "视频生成完成，但结果链接无效。",
+      };
+    }
+    return {
+      ok: true,
+      status: "completed",
+      intent: "seedance_video",
+      confidence: 1,
+      need_clarify: false,
+      reply_text: "视频已生成，点击下方预览或下载。",
+      artifacts: [artifact],
+      requests: [requestState],
+    };
+  }
+
+  const terminalFailed = isSeedanceTerminalStatus(snapshot.status) && trimToString(snapshot.status).toLowerCase() === "failed";
+  const timeout = !terminalFailed && !isSeedanceTerminalStatus(snapshot.status);
+  const reason = trimToString(snapshot.error) || (timeout ? "seedance_timeout" : trimToString(snapshot.status) || "seedance_no_result");
+  return {
+    ok: false,
+    status: "error",
+    intent: "seedance_video",
+    confidence: 1,
+    need_clarify: false,
+    error: timeout ? "seedance_timeout" : "seedance_failed",
+    reason,
+    requests: [requestState],
+    reply_text: timeout
+      ? "视频生成超时，请稍后重试。"
+      : `视频生成失败：${reason}`,
+  };
+}
+
 async function processInbound(opts: RuntimeOpts, body: Required<PublicInboundMessageInput>): Promise<InboundRecordStored> {
   const t0 = Date.now();
   const requestId = sanitizeRequestId(trimToString(body.request_id));
@@ -585,6 +852,35 @@ async function processInbound(opts: RuntimeOpts, body: Required<PublicInboundMes
       reason: "empty_query",
       reply_text: "请提供自然语言请求内容。",
     });
+  }
+
+  const seedanceCommand = parseSeedanceCommand(resolveText);
+  if (seedanceCommand) {
+    if (!isSeedanceEnabled()) {
+      return withMeta({
+        ok: false,
+        status: "error",
+        intent: "seedance_video",
+        confidence: 1,
+        need_clarify: false,
+        error: "seedance_not_configured",
+        reason: "missing_seedance_api_key",
+        reply_text: "视频生成未启用，请先配置 SEEDANCE_API_KEY。",
+      });
+    }
+    if (!trimToString(seedanceCommand.prompt)) {
+      return withMeta({
+        ok: true,
+        status: "clarify",
+        intent: "seedance_video",
+        confidence: 1,
+        need_clarify: true,
+        reason: "missing_video_prompt",
+        reply_text: "请使用 /video <提示词>，可选参数：--image <图片URL> --duration <秒>。",
+      });
+    }
+    const seedanceRecord = await processSeedanceCommand(requestId, seedanceCommand);
+    return withMeta(seedanceRecord);
   }
 
   let resolved: Awaited<ReturnType<typeof requestIntentResolve>>;
@@ -714,23 +1010,17 @@ export function createPublicInboundRuntime(opts: RuntimeOpts) {
     if (!requestIdRaw) return invalidRequest("missing_required_field:request_id");
     const requestId = sanitizeRequestId(requestIdRaw);
     const text = trimToString(body.text);
-    const providedChatId = sanitizeId(trimToString(body.chat_id));
-    const providedUserId = sanitizeId(trimToString(body.user_id));
-    const trustedIdentityEnabled = (
-      trustClientIdentity
-      && Boolean(trustedIdentityToken)
-      && trimToString(trustedIdentityTokenRaw) === trustedIdentityToken
-    );
-    // Default path derives identity from public token only.
-    // Caller-supplied identity fields (body/header) are ignored unless trusted identity mode is enabled.
-    const defaultDerived = deriveIdentity(token);
-    const trustedDerived = deriveIdentity(token, trimToString(clientId) || undefined);
-    const chatId = trustedIdentityEnabled
-      ? (providedChatId || providedUserId || trustedDerived.chatId)
-      : defaultDerived.chatId;
-    const userId = trustedIdentityEnabled
-      ? (providedUserId || providedChatId || trustedDerived.userId)
-      : defaultDerived.userId;
+    const identity = resolvePublicInboundIdentity({
+      token,
+      clientIdRaw: clientId,
+      trustClientIdentity,
+      trustedIdentityToken,
+      trustedIdentityTokenRaw,
+      providedChatIdRaw: body.chat_id,
+      providedUserIdRaw: body.user_id,
+    });
+    const chatId = identity.chatId;
+    const userId = identity.userId;
     const chatType = resolveChatType(body.chat_type);
     if (!chatType) return invalidRequest("unsupported_chat_type");
     if (!text) return invalidRequest("missing_required_field:text");
@@ -835,6 +1125,9 @@ export function createPublicInboundRuntime(opts: RuntimeOpts) {
     const artifacts = Array.isArray(cached.artifacts) ? cached.artifacts : [];
     const artifact = artifacts.find(item => item.id === artifactId);
     if (!artifact) return { ok: false, statusCode: 404, error: "artifact_not_found" };
+    if (artifact.type !== "image_path") {
+      return { ok: false, statusCode: 400, error: "artifact_not_local_file" };
+    }
     if (artifact.expires_at) {
       const expiresAt = Date.parse(artifact.expires_at);
       if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
