@@ -14,6 +14,7 @@ import { nowIso } from "./router_utils.js";
 import type { SendFn } from "./router_types.js";
 import { resolveProjectId } from "./intent_handlers.js";
 import { setLastAlert } from "./state_cache.js";
+import { postJson } from "../runtime/http_client.js";
 
 export type ParsedCommand = ReturnType<typeof import("./commands.js").parseCommand>;
 
@@ -116,6 +117,50 @@ function renderStatus(allowedNames: string[]) {
 function resolvePm2LogPath(name: string, stream: "out" | "error") {
   const base = path.join(os.homedir(), ".pm2", "logs");
   return path.join(base, `${name}-${stream}.log`);
+}
+
+type VaReplyResult =
+  | { ok: true; roomId: string }
+  | { ok: false; error: string };
+
+function normalizeOperatorReplyUrl(raw: string): string {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  if (text.includes("/api/v1/public-agent/operator/reply")) return text;
+  return `${text.replace(/\/+$/, "")}/api/v1/public-agent/operator/reply`;
+}
+
+async function dispatchVaOperatorReply(contactId: string, text: string): Promise<VaReplyResult> {
+  const url = normalizeOperatorReplyUrl(String(process.env.PUBLIC_AGENT_OPERATOR_REPLY_URL || ""));
+  const token = String(process.env.PUBLIC_AGENT_OPERATOR_REPLY_TOKEN || "").trim();
+  const timeoutRaw = Number(process.env.PUBLIC_AGENT_OPERATOR_REPLY_TIMEOUT_MS || 8000);
+  const timeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.floor(timeoutRaw) : 8000;
+
+  if (!url) return { ok: false, error: "missing PUBLIC_AGENT_OPERATOR_REPLY_URL" };
+  if (!token) return { ok: false, error: "missing PUBLIC_AGENT_OPERATOR_REPLY_TOKEN" };
+
+  const body = {
+    contact_id: contactId,
+    text,
+    source: "chat_gateway",
+    operator_id: "chat_gateway",
+  };
+  const res = await postJson(url, token, body, { timeoutMs, retries: 0 });
+  if (!res.ok) {
+    const detail = res.error?.detail ? `: ${res.error.detail}` : "";
+    return { ok: false, error: `${res.error.code}${detail}` };
+  }
+  const payload = res.data && typeof res.data === "object" ? res.data : {};
+  const ok = Boolean((payload as any).ok);
+  if (!ok) {
+    const err = (payload as any).error;
+    const message = err && typeof err === "object"
+      ? String(err.message || err.code || "unknown")
+      : "unknown";
+    return { ok: false, error: `api_error: ${message}` };
+  }
+  const roomId = String((payload as any).data?.room_id || "").trim();
+  return { ok: true, roomId };
 }
 
 function tailFile(filePath: string, n: number): string {
@@ -337,6 +382,8 @@ export async function handleParsedCommand(params: {
       "/status",
       "/ps",
       "/logs <name> [lines]",
+      "/va help",
+      "/va reply <contact_id> <内容>",
       "/auth add <chat_id>",
       "/auth del <chat_id>",
       "/auth list",
@@ -368,6 +415,34 @@ export async function handleParsedCommand(params: {
     saveAuth(storageDir, authState, channel);
     await send(chatId, `deleted ${cmd.id}`);
     appendLedger(storageDir, { ...baseAudit, cmd: "auth_del", target: cmd.id });
+    return;
+  }
+
+  if (cmd.kind === "va_help") {
+    const out = [
+      "人工接管命令：",
+      "- /va reply <contact_id> <内容>",
+      "示例：/va reply ct_xxxxx 已收到，我会转告本人尽快联系你。",
+    ].join("\n");
+    await send(chatId, out);
+    appendLedger(storageDir, { ...baseAudit, cmd: "va_help" });
+    return;
+  }
+
+  if (cmd.kind === "va_reply") {
+    if (!isOwner) {
+      await send(chatId, rejectText(COMMAND_MESSAGES.authDenied));
+      appendLedger(storageDir, { ...baseAudit, cmd: "va_reply_denied", target: cmd.contactId });
+      return;
+    }
+    const result = await dispatchVaOperatorReply(cmd.contactId, cmd.text);
+    if (!result.ok) {
+      await send(chatId, `❌ 转发失败：${result.error}`);
+      appendLedger(storageDir, { ...baseAudit, cmd: "va_reply_failed", target: cmd.contactId, reason: result.error });
+      return;
+    }
+    await send(chatId, `✅ 已转发到访客会话（contact_id=${cmd.contactId}${result.roomId ? `, room=${result.roomId}` : ""}）`);
+    appendLedger(storageDir, { ...baseAudit, cmd: "va_reply", target: cmd.contactId, room_id: result.roomId });
     return;
   }
 

@@ -3,12 +3,24 @@ export type Cmd =
   | { kind: "auth_add"; id: string }
   | { kind: "auth_del"; id: string }
   | { kind: "auth_list" }
+  | { kind: "va_help" }
+  | { kind: "va_reply"; contactId: string; text: string }
   | { kind: "unknown"; raw: string };
 
 export function parseCommand(text: string): Cmd {
   const t = (text || "").trim();
 
   if (t === "/help") return { kind: "help" };
+
+  if (t === "/va" || t === "/va help") return { kind: "va_help" };
+  {
+    const m = t.match(/^\/va\s+reply\s+(\S+)\s+([\s\S]+)$/);
+    if (m) {
+      const contactId = String(m[1] || "").trim();
+      const replyText = String(m[2] || "").trim();
+      if (contactId && replyText) return { kind: "va_reply", contactId, text: replyText };
+    }
+  }
 
   if (t.startsWith("/auth")) {
     const parts = t.split(/\s+/);
