@@ -71,6 +71,30 @@ function computeBackoff(attempt: number, opts: RetryOptions): number {
   return capped + jitter;
 }
 
+function formatErrorPayload(errorPayload: any): string | undefined {
+  if (errorPayload == null) return undefined;
+  if (typeof errorPayload === "string") return errorPayload;
+  if (typeof errorPayload === "number" || typeof errorPayload === "boolean") return String(errorPayload);
+  if (typeof errorPayload !== "object") return String(errorPayload);
+  const message = String(errorPayload.message || errorPayload.code || "").trim();
+  const details = errorPayload.details;
+  if (message) {
+    if (details && typeof details === "object" && Object.keys(details).length > 0) {
+      try {
+        return `${message} details=${JSON.stringify(details).slice(0, 300)}`;
+      } catch {
+        return message;
+      }
+    }
+    return message;
+  }
+  try {
+    return JSON.stringify(errorPayload).slice(0, 400);
+  } catch {
+    return String(errorPayload);
+  }
+}
+
 async function postJsonOnce(url: string, token: string, body: any, timeoutMs?: number): Promise<JsonResult> {
   const controller = new AbortController();
   const timeout = Math.max(1, timeoutMs ?? parseIntEnv("CHAT_GATEWAY_HTTP_TIMEOUT_MS", 8000));
@@ -93,7 +117,7 @@ async function postJsonOnce(url: string, token: string, body: any, timeoutMs?: n
       data = null;
     }
     if (!res.ok) {
-      const detail = (data && typeof data === "object" && data.error) ? String(data.error) : undefined;
+      const detail = (data && typeof data === "object") ? formatErrorPayload(data.error) : undefined;
       return {
         ok: false,
         error: {
