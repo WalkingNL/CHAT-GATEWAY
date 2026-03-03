@@ -13,50 +13,57 @@ export type Cmd =
   | { kind: "unknown"; raw: string };
 
 export function parseCommand(text: string): Cmd {
-  const t = (text || "").trim();
+  const t = String(text || "")
+    .replace(/\u3000/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
 
   if (t === "/help") return { kind: "help" };
 
-  if (t === "/va" || t === "/va help") return { kind: "va_help" };
-  if (t === "/va inbox") return { kind: "va_inbox" };
   {
-    const m = t.match(/^\/va\s+reply\s+(\S+)\s+([\s\S]+)$/);
-    if (m) {
-      const contactId = String(m[1] || "").trim();
-      const replyText = String(m[2] || "").trim();
-      if (contactId && replyText) return { kind: "va_reply", contactId, text: replyText };
-    }
-  }
-  {
-    const m = t.match(/^\/va\s+take\s+(\S+)$/);
-    if (m) {
-      const ticketId = String(m[1] || "").trim().toUpperCase();
-      if (ticketId) return { kind: "va_take", ticketId };
-    }
-  }
-  {
-    const m = t.match(/^\/va\s+close(?:\s+(\S+))?$/);
-    if (m) {
-      const ticketId = String(m[1] || "").trim().toUpperCase();
-      return { kind: "va_close", ticketId };
-    }
-  }
-  {
-    const m = t.match(/^\/va\s+reject\s+(\S+)(?:\s+([\s\S]+))?$/);
-    if (m) {
-      const ticketId = String(m[1] || "").trim().toUpperCase();
-      const reason = String(m[2] || "").trim();
-      if (ticketId) return { kind: "va_reject", ticketId, reason };
-    }
-  }
-  {
-    const m = t.match(/^\/va\s+status\s+(\S+)$/);
-    if (m) {
-      const ticketId = String(m[1] || "").trim().toUpperCase();
-      if (ticketId) return { kind: "va_status", ticketId };
-    }
-  }
+    const va = t.match(/^\/va(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]+))?$/i);
+    if (va) {
+      const rest = String(va[1] || "").trim();
+      if (!rest || rest === "help") return { kind: "va_help" };
+      if (rest === "inbox") return { kind: "va_inbox" };
 
+      const m = rest.match(/^reply\s+(\S+)\s+([\s\S]+)$/i);
+      if (m) {
+        const contactId = String(m[1] || "").trim();
+        const replyText = String(m[2] || "").trim();
+        if (contactId && replyText) return { kind: "va_reply", contactId, text: replyText };
+      }
+      {
+        const m = rest.match(/^take\s+(\S+)$/i);
+        if (m) {
+          const ticketId = String(m[1] || "").trim().toUpperCase();
+          if (ticketId) return { kind: "va_take", ticketId };
+        }
+      }
+      {
+        const m = rest.match(/^close(?:\s+(\S+))?$/i);
+        if (m) {
+          const ticketId = String(m[1] || "").trim().toUpperCase();
+          return { kind: "va_close", ticketId };
+        }
+      }
+      {
+        const m = rest.match(/^reject\s+(\S+)(?:\s+([\s\S]+))?$/i);
+        if (m) {
+          const ticketId = String(m[1] || "").trim().toUpperCase();
+          const reason = String(m[2] || "").trim();
+          if (ticketId) return { kind: "va_reject", ticketId, reason };
+        }
+      }
+      {
+        const m = rest.match(/^status\s+(\S+)$/i);
+        if (m) {
+          const ticketId = String(m[1] || "").trim().toUpperCase();
+          if (ticketId) return { kind: "va_status", ticketId };
+        }
+      }
+    }
+  }
   if (t.startsWith("/auth")) {
     const parts = t.split(/\s+/);
     if (parts[1] === "add" && parts[2]) return { kind: "auth_add", id: parts[2] };
