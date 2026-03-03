@@ -1,4 +1,5 @@
 import { handleAdapterIntentIfAny, handleMessage } from "../router/router.js";
+import { hasActiveOperatorSession } from "../router/command_flow.js";
 import { handleChartIfAny, handleDashboardIntentIfAny, handleFeedbackIfAny } from "./handlers.js";
 import type { IntegrationContext } from "./context.js";
 import type { MessageEvent } from "./message_event.js";
@@ -29,6 +30,34 @@ export async function dispatchMessageEvent(ctx: IntegrationContext, event: Messa
   const allowlistMode = channel === "telegram" ? allowlistModeTelegram : allowlistModeFeishu;
   const ownerChatId = channel === "telegram" ? ownerTelegramChatId : ownerFeishuChatId;
   const ownerUserId = channel === "telegram" ? ownerTelegramUserId : ownerFeishuUserId;
+  const textTrimmed = String(event.text || "").trim();
+  const isCommand = textTrimmed.startsWith("/");
+  const isOwner = ownerUserId ? event.userId === ownerUserId : event.chatId === ownerChatId;
+  const inActiveManualSession = hasActiveOperatorSession(storageDir, channel, event.chatId);
+
+  // During manual handoff in owner DM, plain text should go directly to visitor relay.
+  // This must run before adapter-intent pipelines to avoid being consumed by /i logic.
+  if (!event.isGroup && isOwner && !isCommand && inActiveManualSession) {
+    await handleMessage({
+      storageDir,
+      channel,
+      ownerChatId,
+      ownerUserId,
+      allowlistMode,
+      config: loaded,
+      limiter,
+      chatId: event.chatId,
+      userId: event.userId,
+      messageId: event.messageId,
+      replyToId: event.replyToId,
+      text: event.text,
+      replyText: event.replyText,
+      isGroup: event.isGroup,
+      mentionsBot: event.mentionsBot,
+      send: senders.sendText,
+    });
+    return;
+  }
 
   if (await handleFeedbackIfAny({
     storageDir,

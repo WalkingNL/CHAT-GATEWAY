@@ -202,6 +202,10 @@ function getActiveSession(storageDir: string, channel: string, chatId: string): 
   return row;
 }
 
+export function hasActiveOperatorSession(storageDir: string, channel: string, chatId: string): boolean {
+  return Boolean(getActiveSession(storageDir, channel, chatId));
+}
+
 function setActiveSession(storageDir: string, channel: string, chatId: string, ticketId: string) {
   const sessions = loadOperatorSessions(storageDir);
   const key = operatorIdentity(channel, chatId);
