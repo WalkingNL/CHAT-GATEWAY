@@ -24,6 +24,18 @@ type OpsLimits = {
   telegramSafeMax: number;
 };
 
+function formatErrorDetail(value: any): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    const encoded = JSON.stringify(value);
+    return encoded && encoded !== "{}" ? encoded : "";
+  } catch {
+    return String(value);
+  }
+}
+
 function getOpsLimits(): OpsLimits {
   const telegramSafeMax = 3500;
   const maxLinesDefault = Number(process.env.GW_MAX_LOG_LINES || 200);
@@ -223,7 +235,8 @@ async function operatorApiCall(
   if (method === "POST") {
     const res = await postJson(url, token, body || {}, { timeoutMs, retries: 0 });
     if (!res.ok) {
-      const detail = res.error?.detail ? `: ${res.error.detail}` : "";
+      const detailText = formatErrorDetail(res.error?.detail);
+      const detail = detailText ? `: ${detailText}` : "";
       return { ok: false, error: `${res.error.code}${detail}` };
     }
     payload = res.data && typeof res.data === "object" ? res.data : {};
@@ -247,7 +260,7 @@ async function operatorApiCall(
         parsed = {};
       }
       if (!res.ok) {
-        const detail = parsed?.error?.message || text || "";
+        const detail = formatErrorDetail(parsed?.error) || text || "";
         return { ok: false, error: `http_${res.status}${detail ? `: ${String(detail).slice(0, 300)}` : ""}` };
       }
       payload = parsed && typeof parsed === "object" ? parsed : {};
@@ -745,6 +758,13 @@ export async function handleParsedCommand(params: {
     }
     const result = await dispatchVaOperatorClose(ticketId, channel, chatId);
     if (!result.ok) {
+      const err = String(result.error || "");
+      if (err.includes("manual_not_active") || err.includes("MANUAL_NOT_ACTIVE")) {
+        clearActiveSession(storageDir, channel, chatId);
+        await send(chatId, `ℹ️ 会话 ${ticketId} 已不在人工接管，已自动清理本地接管状态。`);
+        appendLedger(storageDir, { ...baseAudit, cmd: "va_close_stale", target: ticketId, reason: err });
+        return;
+      }
       await send(chatId, `❌ 关闭失败：${result.error}`);
       appendLedger(storageDir, { ...baseAudit, cmd: "va_close_failed", target: ticketId, reason: result.error });
       return;
