@@ -14,3 +14,8 @@ projects:
       # - target: telegram
       #   chat_id: "-5242302064"
       #   min_priority: "CRITICAL"
+  family_share_ops:
+    notify:
+      telegram_chat_ids:
+        - "1864053991"
+      feishu_chat_ids: []
