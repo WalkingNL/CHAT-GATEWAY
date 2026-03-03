@@ -416,6 +416,24 @@ export async function handleMessage(opts: {
   });
   if (handledOps) return;
 
+  if (!isCommand) {
+    const handledManualText = await handlePrivateMessage({
+      channel,
+      storageDir,
+      chatId,
+      isOwner,
+      userId,
+      messageId,
+      replyToId,
+      trimmedText,
+      trimmedReplyText,
+      isCommand,
+      send,
+      config,
+    });
+    if (handledManualText) return;
+  }
+
   if (isGroup) {
     // ---- Group command path: allow commands without @bot (still owner/allowlist gated) ----
     if (isCommand) {
@@ -430,24 +448,6 @@ export async function handleMessage(opts: {
   }
 
   if (!allowed && !isGroup) return;
-
-  if (!isGroup) {
-    const handledPrivate = await handlePrivateMessage({
-      channel,
-      storageDir,
-      chatId,
-      isOwner,
-      userId,
-      messageId,
-      replyToId,
-      trimmedText,
-      trimmedReplyText,
-      isCommand,
-      send,
-      config,
-    });
-    if (handledPrivate) return;
-  }
 
   if (!isCommand) return;
 
