@@ -436,6 +436,7 @@ export async function handleMessage(opts: {
       channel,
       storageDir,
       chatId,
+      isOwner,
       userId,
       messageId,
       replyToId,
