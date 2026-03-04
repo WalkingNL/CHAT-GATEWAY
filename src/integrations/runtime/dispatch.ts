@@ -35,9 +35,9 @@ export async function dispatchMessageEvent(ctx: IntegrationContext, event: Messa
   const isOwner = ownerUserId ? event.userId === ownerUserId : event.chatId === ownerChatId;
   const inActiveManualSession = hasActiveOperatorSession(storageDir, channel, event.chatId);
 
-  // During manual handoff in owner DM, plain text should go directly to visitor relay.
-  // This must run before adapter-intent pipelines to avoid being consumed by /i logic.
-  if (!event.isGroup && isOwner && !isCommand && inActiveManualSession) {
+  // During manual handoff, owner plain text should go directly to visitor relay
+  // before adapter-intent pipelines, otherwise it may be consumed by /i logic.
+  if (isOwner && !isCommand && inActiveManualSession) {
     await handleMessage({
       storageDir,
       channel,

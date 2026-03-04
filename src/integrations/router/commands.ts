@@ -10,6 +10,12 @@ export type Cmd =
   | { kind: "va_close"; ticketId: string }
   | { kind: "va_reject"; ticketId: string; reason: string }
   | { kind: "va_status"; ticketId: string }
+  | { kind: "wife_help" }
+  | { kind: "wife_inbox" }
+  | { kind: "wife_status"; jobId: string }
+  | { kind: "wife_approve"; jobId: string; selectedText: string }
+  | { kind: "wife_reject"; jobId: string; reason: string }
+  | { kind: "wife_skip"; jobId: string; reason: string }
   | { kind: "unknown"; raw: string };
 
 export function parseCommand(text: string): Cmd {
@@ -64,6 +70,48 @@ export function parseCommand(text: string): Cmd {
       }
     }
   }
+
+  {
+    const wife = t.match(/^\/wife(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]+))?$/i);
+    if (wife) {
+      const rest = String(wife[1] || "").trim();
+      if (!rest || rest === "help") return { kind: "wife_help" };
+      if (rest === "inbox") return { kind: "wife_inbox" };
+
+      {
+        const m = rest.match(/^status\s+(\S+)$/i);
+        if (m) {
+          const jobId = String(m[1] || "").trim();
+          if (jobId) return { kind: "wife_status", jobId };
+        }
+      }
+      {
+        const m = rest.match(/^approve\s+(\S+)(?:\s+([\s\S]+))?$/i);
+        if (m) {
+          const jobId = String(m[1] || "").trim();
+          const selectedText = String(m[2] || "").trim();
+          if (jobId) return { kind: "wife_approve", jobId, selectedText };
+        }
+      }
+      {
+        const m = rest.match(/^reject\s+(\S+)(?:\s+([\s\S]+))?$/i);
+        if (m) {
+          const jobId = String(m[1] || "").trim();
+          const reason = String(m[2] || "").trim();
+          if (jobId) return { kind: "wife_reject", jobId, reason };
+        }
+      }
+      {
+        const m = rest.match(/^skip\s+(\S+)(?:\s+([\s\S]+))?$/i);
+        if (m) {
+          const jobId = String(m[1] || "").trim();
+          const reason = String(m[2] || "").trim();
+          if (jobId) return { kind: "wife_skip", jobId, reason };
+        }
+      }
+    }
+  }
+
   if (t.startsWith("/auth")) {
     const parts = t.split(/\s+/);
     if (parts[1] === "add" && parts[2]) return { kind: "auth_add", id: parts[2] };

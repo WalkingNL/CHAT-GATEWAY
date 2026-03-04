@@ -135,6 +135,10 @@ type VaReplyResult =
   | { ok: true; roomId: string; ticketId?: string }
   | { ok: false; error: string };
 
+type WifeReviewResult =
+  | { ok: true; data: any }
+  | { ok: false; error: string };
+
 function normalizeOperatorReplyUrl(raw: string): string {
   const text = String(raw || "").trim();
   if (!text) return "";
@@ -148,10 +152,27 @@ function resolveOperatorBaseUrl(): string {
   return replyUrl.replace(/\/reply(?:\?.*)?$/i, "");
 }
 
+function normalizeWifeReviewBaseUrl(raw: string): string {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  if (text.includes("/api/v1/wife-agent/review")) return text.replace(/\/+$/, "");
+  return `${text.replace(/\/+$/, "")}/api/v1/wife-agent/review`;
+}
+
 function operatorApiConfig() {
   const baseUrl = resolveOperatorBaseUrl();
   const token = String(process.env.PUBLIC_AGENT_OPERATOR_REPLY_TOKEN || "").trim();
   const timeoutRaw = Number(process.env.PUBLIC_AGENT_OPERATOR_REPLY_TIMEOUT_MS || 8000);
+  const timeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.floor(timeoutRaw) : 8000;
+  return { baseUrl, token, timeoutMs };
+}
+
+function wifeReviewApiConfig() {
+  const baseUrl = normalizeWifeReviewBaseUrl(
+    String(process.env.WIFE_REVIEW_API_URL || process.env.WIFE_REVIEW_URL || ""),
+  );
+  const token = String(process.env.WIFE_REVIEW_TOKEN || "").trim();
+  const timeoutRaw = Number(process.env.WIFE_REVIEW_TIMEOUT_MS || 8000);
   const timeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.floor(timeoutRaw) : 8000;
   return { baseUrl, token, timeoutMs };
 }
@@ -378,6 +399,127 @@ async function dispatchVaOperatorReplyByContactId(contactId: string, text: strin
   }
   const roomId = String((payload as any).data?.room_id || "").trim();
   return { ok: true, roomId };
+}
+
+async function wifeReviewApiCall(
+  endpoint: string,
+  body?: Record<string, any>,
+  method: "GET" | "POST" = "POST",
+): Promise<WifeReviewResult> {
+  const { baseUrl, token, timeoutMs } = wifeReviewApiConfig();
+  if (!baseUrl) return { ok: false, error: "missing WIFE_REVIEW_API_URL" };
+  if (!token) return { ok: false, error: "missing WIFE_REVIEW_TOKEN" };
+  const url = `${baseUrl}/${endpoint.replace(/^\/+/, "")}`;
+  let payload: any = null;
+  if (method === "POST") {
+    const res = await postJson(url, token, body || {}, { timeoutMs, retries: 0 });
+    if (!res.ok) {
+      const detailText = formatErrorDetail(res.error?.detail);
+      const detail = detailText ? `: ${detailText}` : "";
+      return { ok: false, error: `${res.error.code}${detail}` };
+    }
+    payload = res.data && typeof res.data === "object" ? res.data : {};
+  } else {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+    try {
+      const res = await fetch(url, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        signal: controller.signal,
+      });
+      const text = await res.text();
+      let parsed: any = {};
+      try {
+        parsed = text ? JSON.parse(text) : {};
+      } catch {
+        parsed = {};
+      }
+      if (!res.ok) {
+        const detail = formatErrorDetail(parsed?.error) || text || "";
+        return { ok: false, error: `http_${res.status}${detail ? `: ${String(detail).slice(0, 300)}` : ""}` };
+      }
+      payload = parsed && typeof parsed === "object" ? parsed : {};
+    } catch (error: any) {
+      const message = String(error?.name === "AbortError" ? "timeout" : error?.message || "fetch_failed");
+      return { ok: false, error: message };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const ok = Boolean((payload as any).ok);
+  if (!ok) {
+    const err = (payload as any).error;
+    const message = err && typeof err === "object"
+      ? String(err.message || err.code || "unknown")
+      : "unknown";
+    return { ok: false, error: `api_error: ${message}` };
+  }
+  return { ok: true, data: (payload as any).data || {} };
+}
+
+async function dispatchWifeReviewInbox(limit = 10): Promise<WifeReviewResult> {
+  return wifeReviewApiCall(`inbox?limit=${Math.max(1, Math.min(limit, 100))}`, {}, "GET");
+}
+
+async function dispatchWifeReviewStatus(jobId: string): Promise<WifeReviewResult> {
+  const encoded = encodeURIComponent(String(jobId || "").trim());
+  return wifeReviewApiCall(`status?job_id=${encoded}`, {}, "GET");
+}
+
+async function dispatchWifeReviewApprove(
+  jobId: string,
+  selectedText: string,
+  channel: string,
+  chatId: string,
+): Promise<WifeReviewResult> {
+  return wifeReviewApiCall(
+    "approve",
+    {
+      job_id: String(jobId || "").trim(),
+      selected_text: String(selectedText || "").trim(),
+      operator_id: operatorIdentity(channel, chatId),
+    },
+    "POST",
+  );
+}
+
+async function dispatchWifeReviewReject(
+  jobId: string,
+  reason: string,
+  channel: string,
+  chatId: string,
+): Promise<WifeReviewResult> {
+  return wifeReviewApiCall(
+    "reject",
+    {
+      job_id: String(jobId || "").trim(),
+      reason: String(reason || "").trim(),
+      operator_id: operatorIdentity(channel, chatId),
+    },
+    "POST",
+  );
+}
+
+async function dispatchWifeReviewSkip(
+  jobId: string,
+  reason: string,
+  channel: string,
+  chatId: string,
+): Promise<WifeReviewResult> {
+  return wifeReviewApiCall(
+    "skip",
+    {
+      job_id: String(jobId || "").trim(),
+      reason: String(reason || "").trim(),
+      operator_id: operatorIdentity(channel, chatId),
+    },
+    "POST",
+  );
 }
 
 function tailFile(filePath: string, n: number): string {
@@ -636,6 +778,12 @@ export async function handleParsedCommand(params: {
       "/va close [ticket_id]",
       "/va reject <ticket_id> [原因]",
       "/va status <ticket_id>",
+      "/wife help",
+      "/wife inbox",
+      "/wife status <job_id>",
+      "/wife approve <job_id> [文案]",
+      "/wife reject <job_id> [原因]",
+      "/wife skip <job_id> [原因]",
       "/auth add <chat_id>",
       "/auth del <chat_id>",
       "/auth list",
@@ -836,6 +984,134 @@ export async function handleParsedCommand(params: {
     const label = String(result.ticketId || "").trim().toUpperCase();
     await send(chatId, label ? `✅ 已转发到访客会话（ticket=${label}）` : "✅ 已转发到访客会话（legacy）");
     appendLedger(storageDir, { ...baseAudit, cmd: "va_reply", target: cmd.contactId, room_id: result.roomId });
+    return;
+  }
+
+  if (cmd.kind === "wife_help") {
+    const out = [
+      "老婆专属 review 命令：",
+      "- /wife inbox",
+      "- /wife status <job_id>",
+      "- /wife approve <job_id> [文案]",
+      "- /wife reject <job_id> [原因]",
+      "- /wife skip <job_id> [原因]",
+    ].join("\n");
+    await send(chatId, out);
+    appendLedger(storageDir, { ...baseAudit, cmd: "wife_help" });
+    return;
+  }
+
+  if (cmd.kind === "wife_inbox") {
+    if (!isOwner) {
+      await send(chatId, rejectText(COMMAND_MESSAGES.authDenied));
+      appendLedger(storageDir, { ...baseAudit, cmd: "wife_inbox_denied" });
+      return;
+    }
+    const result = await dispatchWifeReviewInbox(10);
+    if (!result.ok) {
+      await send(chatId, `❌ 查询失败：${result.error}`);
+      appendLedger(storageDir, { ...baseAudit, cmd: "wife_inbox_failed", reason: result.error });
+      return;
+    }
+    const items = Array.isArray(result.data?.items) ? result.data.items : [];
+    if (!items.length) {
+      await send(chatId, "📭 当前没有待审核任务。");
+      appendLedger(storageDir, { ...baseAudit, cmd: "wife_inbox", count: 0 });
+      return;
+    }
+    const lines = ["💌 wife 审核队列："];
+    for (const item of items) {
+      const jobId = String(item?.job_id || "").trim();
+      const status = String(item?.status || "-").trim();
+      const eventLabel = String(item?.event_label || "").trim();
+      const eventDate = String(item?.event_date || "").trim();
+      const payload = item?.payload && typeof item.payload === "object" ? item.payload : {};
+      const candidates = Array.isArray(item?.candidates) ? item.candidates : [];
+      const firstCandidate = candidates.length ? candidates[0] : {};
+      const preview = String(payload?.selected_text || firstCandidate?.text || "").trim();
+      lines.push(`- ${jobId} | ${status} | ${eventLabel} ${eventDate}`.trim());
+      if (preview) lines.push(`  ${preview.slice(0, 120)}`);
+    }
+    await send(chatId, lines.join("\n"));
+    appendLedger(storageDir, { ...baseAudit, cmd: "wife_inbox", count: items.length });
+    return;
+  }
+
+  if (cmd.kind === "wife_status") {
+    if (!isOwner) {
+      await send(chatId, rejectText(COMMAND_MESSAGES.authDenied));
+      appendLedger(storageDir, { ...baseAudit, cmd: "wife_status_denied", target: cmd.jobId });
+      return;
+    }
+    const result = await dispatchWifeReviewStatus(cmd.jobId);
+    if (!result.ok) {
+      await send(chatId, `❌ 查询失败：${result.error}`);
+      appendLedger(storageDir, { ...baseAudit, cmd: "wife_status_failed", target: cmd.jobId, reason: result.error });
+      return;
+    }
+    const data = result.data || {};
+    const out = [
+      `job_id=${String(data.job_id || cmd.jobId).trim()}`,
+      `status=${String(data.status || "-")}`,
+      `event=${String(data.event_label || "-")} ${String(data.event_date || "-")}`.trim(),
+      `style=${String(data.style || "-")}`,
+    ].join("\n");
+    await send(chatId, out);
+    appendLedger(storageDir, { ...baseAudit, cmd: "wife_status", target: cmd.jobId });
+    return;
+  }
+
+  if (cmd.kind === "wife_approve") {
+    if (!isOwner) {
+      await send(chatId, rejectText(COMMAND_MESSAGES.authDenied));
+      appendLedger(storageDir, { ...baseAudit, cmd: "wife_approve_denied", target: cmd.jobId });
+      return;
+    }
+    const result = await dispatchWifeReviewApprove(cmd.jobId, cmd.selectedText, channel, chatId);
+    if (!result.ok) {
+      await send(chatId, `❌ 审核通过失败：${result.error}`);
+      appendLedger(storageDir, { ...baseAudit, cmd: "wife_approve_failed", target: cmd.jobId, reason: result.error });
+      return;
+    }
+    const status = String(result.data?.status || "scheduled");
+    await send(chatId, `✅ 已通过 ${cmd.jobId}（status=${status}）`);
+    appendLedger(storageDir, { ...baseAudit, cmd: "wife_approve", target: cmd.jobId, status });
+    return;
+  }
+
+  if (cmd.kind === "wife_reject") {
+    if (!isOwner) {
+      await send(chatId, rejectText(COMMAND_MESSAGES.authDenied));
+      appendLedger(storageDir, { ...baseAudit, cmd: "wife_reject_denied", target: cmd.jobId });
+      return;
+    }
+    const result = await dispatchWifeReviewReject(cmd.jobId, cmd.reason, channel, chatId);
+    if (!result.ok) {
+      await send(chatId, `❌ 驳回失败：${result.error}`);
+      appendLedger(storageDir, { ...baseAudit, cmd: "wife_reject_failed", target: cmd.jobId, reason: result.error });
+      return;
+    }
+    const status = String(result.data?.status || "rejected");
+    await send(chatId, `✅ 已驳回 ${cmd.jobId}（status=${status}）`);
+    appendLedger(storageDir, { ...baseAudit, cmd: "wife_reject", target: cmd.jobId, status });
+    return;
+  }
+
+  if (cmd.kind === "wife_skip") {
+    if (!isOwner) {
+      await send(chatId, rejectText(COMMAND_MESSAGES.authDenied));
+      appendLedger(storageDir, { ...baseAudit, cmd: "wife_skip_denied", target: cmd.jobId });
+      return;
+    }
+    const result = await dispatchWifeReviewSkip(cmd.jobId, cmd.reason, channel, chatId);
+    if (!result.ok) {
+      await send(chatId, `❌ 跳过失败：${result.error}`);
+      appendLedger(storageDir, { ...baseAudit, cmd: "wife_skip_failed", target: cmd.jobId, reason: result.error });
+      return;
+    }
+    const status = String(result.data?.status || "skipped");
+    await send(chatId, `✅ 已跳过 ${cmd.jobId}（status=${status}）`);
+    appendLedger(storageDir, { ...baseAudit, cmd: "wife_skip", target: cmd.jobId, status });
     return;
   }
 
