@@ -1,7 +1,6 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import YAML from "yaml";
+import { readText, resolveConfigPath } from "./file_utils.js";
 
 type IntentConfig = {
   enabled?: boolean;
@@ -27,12 +26,8 @@ const DEFAULT_SNAPSHOT: CapabilitiesSnapshot = {
 let snapshot: CapabilitiesSnapshot = DEFAULT_SNAPSHOT;
 let watcherStarted = false;
 
-function readText(filePath: string): string | null {
-  try {
-    return fs.readFileSync(filePath, "utf-8");
-  } catch {
-    return null;
-  }
+function resolveCapabilitiesPath(): string {
+  return resolveConfigPath("CAPABILITIES_PATH", "capabilities.yml");
 }
 
 function hashText(text: string): string {
@@ -73,12 +68,6 @@ function parseCapabilities(raw: string): CapabilitiesSnapshot {
     intents,
     loaded_at: new Date().toISOString(),
   };
-}
-
-function resolveCapabilitiesPath(): string {
-  const override = String(process.env.CAPABILITIES_PATH || "").trim();
-  if (override) return override;
-  return path.join("config", "capabilities.yml");
 }
 
 function loadCapabilitiesInternal(): void {

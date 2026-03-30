@@ -1,7 +1,6 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import YAML from "yaml";
+import { readText, resolveConfigPath } from "./file_utils.js";
 
 type ErrorCodesConfig = {
   version: string;
@@ -29,12 +28,12 @@ let errorCodes = DEFAULT_ERROR_CODES;
 let redactionPolicy = DEFAULT_REDACTION;
 let watcherStarted = false;
 
-function readText(filePath: string): string | null {
-  try {
-    return fs.readFileSync(filePath, "utf-8");
-  } catch {
-    return null;
-  }
+function resolveErrorCodesPath(): string {
+  return resolveConfigPath("ERROR_CODES_PATH", "error_codes.yaml");
+}
+
+function resolveRedactionPath(): string {
+  return resolveConfigPath("REDACTION_POLICY_PATH", "redaction_policy.yaml");
 }
 
 function parseErrorCodes(raw: string): ErrorCodesConfig {
@@ -62,18 +61,6 @@ function parseRedactionPolicy(raw: string): RedactionPolicy {
     hash_algo: hashAlgo,
     fields,
   };
-}
-
-function resolveErrorCodesPath(): string {
-  const override = String(process.env.ERROR_CODES_PATH || "").trim();
-  if (override) return override;
-  return path.join("config", "error_codes.yaml");
-}
-
-function resolveRedactionPath(): string {
-  const override = String(process.env.REDACTION_POLICY_PATH || "").trim();
-  if (override) return override;
-  return path.join("config", "redaction_policy.yaml");
 }
 
 function loadErrorCodes(): void {
