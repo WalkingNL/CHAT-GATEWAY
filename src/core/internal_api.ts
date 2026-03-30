@@ -3,6 +3,7 @@ import http from "node:http";
 import type { LLMProvider, ChatMessage } from "./providers/base.js";
 import { TaskStore } from "./task_store.js";
 import { CognitiveStore, type CognitiveStatus } from "./cognitive_store.js";
+import { readJson, badRequest, unauthorized, notFound, okJson } from "./http_helpers.js";
 
 export type InternalApiOpts = {
   host: string;
@@ -13,37 +14,6 @@ export type InternalApiOpts = {
 };
 
 export type InternalApiHandler = (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>;
-
-async function readJson(req: http.IncomingMessage): Promise<any> {
-  const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(Buffer.from(c));
-  const raw = Buffer.concat(chunks).toString("utf-8") || "{}";
-  return JSON.parse(raw);
-}
-
-function badRequest(res: http.ServerResponse, msg: string) {
-  res.statusCode = 400;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: msg }));
-}
-
-function unauthorized(res: http.ServerResponse) {
-  res.statusCode = 401;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: "unauthorized" }));
-}
-
-function notFound(res: http.ServerResponse) {
-  res.statusCode = 404;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: "not_found" }));
-}
-
-function okJson(res: http.ServerResponse, body: any) {
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify(body));
-}
 
 function extractFirstJsonObject(text: string): string | null {
   const s = String(text || "");

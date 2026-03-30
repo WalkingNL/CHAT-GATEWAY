@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { execFileLimited } from "./exec_limiter.js";
 import { loadProjectRegistry, resolveProjectNotifyTargets, tryLoadProjectRegistry } from "./project_registry.js";
 import { resolveTargetOverrides, type TargetOverrides } from "../../core/notify_overrides.js";
+import { readJson, badRequest, forbidden, unauthorized, okJson } from "../../core/http_helpers.js";
 let hupRegistered = false;
 
 export type NotifySenders = {
@@ -58,30 +59,6 @@ function buildTargetOverrideMap(
   return out;
 }
 
-function badRequest(res: http.ServerResponse, msg: string) {
-  res.statusCode = 400;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: msg }));
-}
-
-function forbidden(res: http.ServerResponse, msg = "forbidden") {
-  res.statusCode = 403;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: msg }));
-}
-
-function unauthorized(res: http.ServerResponse) {
-  res.statusCode = 401;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: "unauthorized" }));
-}
-
-function okJson(res: http.ServerResponse, body: any) {
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify(body));
-}
-
 function normalizeRemoteAddress(addr: string | undefined): string {
   if (!addr) return "";
   if (addr === "::1") return "127.0.0.1";
@@ -109,13 +86,6 @@ function isInternalAddress(addr: string): boolean {
   if (lower.startsWith("fc") || lower.startsWith("fd")) return true;
   if (lower.startsWith("fe80")) return true;
   return false;
-}
-
-async function readJson(req: http.IncomingMessage): Promise<any> {
-  const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(Buffer.from(c));
-  const raw = Buffer.concat(chunks).toString("utf-8") || "{}";
-  return JSON.parse(raw);
 }
 
 function toStrList(val: any): string[] {

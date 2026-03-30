@@ -4,27 +4,9 @@ import { FeishuWebhook } from "../channels/feishuWebhook.js";
 import type { IntegrationContext } from "./context.js";
 import { dispatchMessageEvent } from "./dispatch.js";
 import { fromFeishu } from "./message_event.js";
+import { readJson, badRequest, okJson } from "../../core/http_helpers.js";
 
 type FeishuWebhookHandler = (req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>;
-
-async function readJson(req: http.IncomingMessage): Promise<any> {
-  const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(Buffer.from(c));
-  const raw = Buffer.concat(chunks).toString("utf-8") || "{}";
-  return JSON.parse(raw);
-}
-
-function badRequest(res: http.ServerResponse, msg: string) {
-  res.statusCode = 400;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: msg }));
-}
-
-function okJson(res: http.ServerResponse, body: any) {
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify(body));
-}
 
 export type FeishuWebhookRuntime = {
   enabled: boolean;
